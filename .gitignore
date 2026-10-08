@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# 작업 진행 메모 (커밋하지 않는다)
+TASKS.md
+
+# Petdex 등에서 받은 남의 펫 (다시 받을 수 있다)
+pets-downloaded/
+
+# 펫 만들기 작업 폴더
+runs/

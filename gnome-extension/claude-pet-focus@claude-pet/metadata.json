@@ -1,0 +1,6 @@
+{
+  "uuid": "claude-pet-focus@claude-pet",
+  "name": "Claude Pet Focus",
+  "description": "claude-pet(~/.claude/pet) 이 D-Bus 로 요청하면 제목이 같은 창을 앞으로 올린다.",
+  "shell-version": ["46"]
+}

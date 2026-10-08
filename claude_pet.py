@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""Claude Code 세션마다 펫을 한 마리씩 바탕화면 위에 띄운다 (Codex 펫 형식 스프라이트).
+
+hooks/claude-pet-hook.sh 가 쓰는 세션별 상태 파일을 감시해 펫의 애니메이션과 말풍선을 바꾼다.
+펫들은 처음 생긴 세션부터 오른쪽 아래에서 왼쪽으로 한 줄로 선다.
+GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWayland(xcb)로 띄운다.
+
+    python3 ~/.claude/pet/claude_pet.py
+
+왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인
+마우스 올림: 그 세션의 컨텍스트와 계정 5시간·주간 사용량 카드 (상태줄 중계 hooks/claude-pet-statusline.sh 필요)
+드래그: 줄 전체 이동 / 오른쪽 클릭: 이 세션의 펫(펫 다시 읽기), 크기, 접기, 자동 실행, 종료
+
+접기: 손이 필요한 세션(확인 필요 > 오류 > 다 했어요) 하나만 세우고 나머지 수는 배지로 단다.
+그런 세션이 없으면 가장 오래된 세션 펫에 상태 요약을 달고, 클릭하면 펼친다.
+"""
+
+import fcntl
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+from PIL import Image  # noqa: E402
+from PyQt5.QtCore import QFileSystemWatcher, QObject, QPoint, QRect, QRectF, Qt, QTimer  # noqa: E402
+from PyQt5.QtDBus import QDBus, QDBusConnection, QDBusMessage  # noqa: E402
+from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QImage, QPainter,  # noqa: E402
+                         QPainterPath, QPen, QPixmap, QPolygonF, QRegion)
+from PyQt5.QtWidgets import QAction, QActionGroup, QApplication, QMenu, QWidget  # noqa: E402
+
+import petcore  # noqa: E402
+
+APP_DIR = Path(__file__).resolve().parent
+# 직접 만든 펫, Petdex 등에서 받은 펫(git 제외), Codex 펫 순서로 찾는다. 같은 id 는 앞 폴더가 이긴다.
+PET_SEARCH_DIRS = [APP_DIR / "pets", APP_DIR / "pets-downloaded",
+                   Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser() / "pets"]
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "claude-pet"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DISABLED_FLAG = CONFIG_DIR / "disabled"  # 있으면 훅이 새 세션에서 펫을 띄우지 않는다
+
+SCALES = {"작게": 0.35, "보통": 0.5, "크게": 0.7}
+ROW_GAP = 6
+BUBBLE_MAX_W = 200
+BUBBLE_PAD = 7
+BUBBLE_TAIL = 8
+BUBBLE_W_STEP = 16  # 경과 시간 글자 폭이 바뀔 때마다 옆 펫들이 흔들리지 않게 폭을 이 단위로 올린다
+NAME_MAX_W = 130
+SUMMARY_MAX_W = 240  # 접힌 요약 펫의 이름표 ("작업 중 2 · 백그라운드 1")
+MAX_SAVED_ASSIGNMENTS = 100
+DBUS_TIMEOUT_MS = 1000
+HOVER_DELAY_MS = 350  # 펫 위를 스쳐 지나갈 때는 카드를 띄우지 않는다
+CARD_PAD = 10
+CARD_BAR_W = 90
+CARD_BAR_H = 8
+CARD_TITLE_MAX_W = 320
+
+# 상태별 말풍선 (배경, 테두리)
+BUBBLE_COLORS = {
+    "running": ("#FFFFFF", "#8A8A8A"),
+    "waiting": ("#FFF4C2", "#C08A00"),
+    "done": ("#E2F6E3", "#2F8F4E"),
+    "error": ("#FDE2E1", "#C53030"),
+    "background": ("#E3EFFD", "#2B6CB0"),
+}
+
+def usage_color(percent):
+    """사용량 막대 색: 50% 미만 초록, 80% 미만 노랑, 그 이상 빨강."""
+    if percent < 50:
+        return "#48BB78"
+    if percent < 80:
+        return "#ECC94B"
+    return "#F56565"
+
+
+# 펫 이미지가 없을 때 그리는 얼굴
+FALLBACK_FACES = {"idle": "-.-", "running": "o.o", "waiting": "?.?", "done": "^.^", "error": "x.x",
+                  "background": "o.-"}
+
+
+def load_config():
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(config):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CONFIG_FILE)
+    except OSError as err:
+        print(f"claude-pet: 설정 저장 실패: {err}", file=sys.stderr)
+
+
+def acquire_single_instance(state_dir):
+    """펫 프로그램은 하나만 띄운다. 훅도 같은 pet.lock 으로 떠 있는지 확인한다."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock = open(state_dir / "pet.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    return lock
+
+
+def load_frames(sprite_path, scale):
+    """아틀라스를 애니메이션별 QPixmap 목록으로 자른다. PyQt5 는 WebP 를 못 읽어서 Pillow 로 연다."""
+    with Image.open(sprite_path) as im:
+        if im.size != (petcore.ATLAS_W, petcore.ATLAS_H):
+            raise ValueError(f"아틀라스 크기가 {im.size}, 기대값 {(petcore.ATLAS_W, petcore.ATLAS_H)}")
+        rgba = im.convert("RGBA")
+    width, height = rgba.size
+    atlas = QImage(rgba.tobytes("raw", "RGBA"), width, height, width * 4, QImage.Format_RGBA8888).copy()
+    target_w, target_h = round(petcore.CELL_W * scale), round(petcore.CELL_H * scale)
+    frames = {}
+    for name in petcore.ANIMATIONS:
+        frames[name] = [
+            QPixmap.fromImage(atlas.copy(*rect)).scaled(
+                target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            for rect in petcore.frame_rects(name)
+        ]
+    return frames
+
+
+class Desktop:
+    """D-Bus 로 Terminator 창 제목을 묻고, GNOME 확장(claude-pet-focus)에 그 창을 올려 달라고 한다."""
+
+    EXTENSION = ("org.gnome.Shell", "/org/gnome/Shell/Extensions/ClaudePet",
+                 "org.gnome.Shell.Extensions.ClaudePet")
+    TERMINATOR_PREFIX = "net.tenshu.Terminator2"  # 뒤에 디스플레이 이름 해시가 붙는다
+
+    def __init__(self):
+        self.bus = QDBusConnection.sessionBus()
+        self._terminator = None
+
+    def _call(self, service, path, interface, method, *args):
+        message = QDBusMessage.createMethodCall(service, path, interface, method)
+        message.setArguments(list(args))
+        reply = self.bus.call(message, QDBus.Block, DBUS_TIMEOUT_MS)
+        if reply.type() != QDBusMessage.ReplyMessage:
+            return None
+        return reply.arguments()
+
+    def terminator_title(self, terminal_uuid):
+        """그 터미널이 들어 있는 Terminator 창의 지금 제목. 못 얻으면 빈 문자열."""
+        if not terminal_uuid:
+            return ""
+        for _ in range(2):  # Terminator 가 다시 떴으면 서비스 이름을 새로 찾는다
+            if not self._terminator:
+                names = self.bus.interface().registeredServiceNames().value() or []
+                self._terminator = next((n for n in names if n.startswith(self.TERMINATOR_PREFIX)), "")
+                if not self._terminator:
+                    return ""
+            args = self._call(self._terminator, "/net/tenshu/Terminator2", self._terminator,
+                              "get_window_title", terminal_uuid)
+            if args:
+                return str(args[0])
+            self._terminator = None
+        return ""
+
+    def activate(self, window_title):
+        """창을 올렸으면 True. 확장이 아직 안 켜졌거나 창을 못 찾으면 False."""
+        title = petcore.clean_title(window_title)
+        if not title:
+            return False
+        args = self._call(*self.EXTENSION, "ActivateWindow", title)
+        return bool(args) and int(args[0]) > 0
+
+
+class PetWindow(QWidget):
+    """세션 하나의 펫: 말풍선, 펫, 이름표. 배치와 클릭 처리는 PetManager 가 한다."""
+
+    def __init__(self, manager, session_id):
+        # 포커스를 받는 창이면 GNOME 이 포커스를 막고 "준비됨" 알림(DEMANDS_ATTENTION)을 띄운다
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                         | Qt.NoDropShadowWindowHint | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowTitle("Claude Pet")
+        self.setFont(QFont(self.font().family(), 10))
+        self.name_font = QFont(self.font().family(), 9)
+        self.badge_font = QFont(self.font().family(), 8, QFont.Bold)
+
+        self.manager = manager
+        self.session_id = session_id
+        self.has_pet = False
+        self.pet_id = None
+        self.frames = None
+        self.pet_size = (0, 0)
+        self.state = "idle"
+        self.bubble = ""
+        self.name = ""
+        self.badge = ""  # 접혔을 때 뒤에 기다리는 세션 수 (+2)
+        self.name_max_w = NAME_MAX_W
+
+        self.animation = ""
+        self.oneshot = None  # 한 번만 재생하고 상태 애니메이션으로 돌아갈 것 (클릭 시 점프)
+        self.frame_index = 0
+        self.anim_timer = QTimer(self, singleShot=True, timeout=self.next_frame)
+
+        self.pet_rect = self.bubble_rect = self.name_rect = self.badge_rect = QRect()
+        self.set_animation(petcore.STATE_ANIMATION[self.state])
+
+    # ---- 내용 / 크기 -------------------------------------------------------
+
+    def set_pet(self, pet_id, frames, pet_size):
+        self.has_pet = True
+        self.pet_id = pet_id
+        self.frames = frames
+        self.pet_size = pet_size
+        self.relayout()
+
+    def set_view(self, state, bubble, name, badge="", name_max_w=NAME_MAX_W):
+        """상태를 반영한다. 창 크기가 바뀌었으면 True (줄을 다시 세워야 한다)."""
+        if state != self.state:
+            self.state = state
+            self.oneshot = None
+            self.set_animation(petcore.STATE_ANIMATION[state])
+        view = (bubble, name, badge, name_max_w)
+        if view == (self.bubble, self.name, self.badge, self.name_max_w):
+            return False
+        self.bubble, self.name, self.badge, self.name_max_w = view
+        old = self.size_hint_
+        self.relayout()
+        self.update()
+        return self.size_hint_ != old
+
+    def relayout(self):
+        """창 안에서 말풍선·펫·이름표 자리를 정하고 창 크기(size_hint_)를 계산한다."""
+        pet_w, pet_h = self.pet_size
+        if self.bubble:
+            text = QFontMetrics(self.font()).boundingRect(
+                QRect(0, 0, BUBBLE_MAX_W - 2 * BUBBLE_PAD, 1000), Qt.TextWordWrap, self.bubble)
+            bubble_w = -(-(text.width() + 2 * BUBBLE_PAD) // BUBBLE_W_STEP) * BUBBLE_W_STEP
+            bubble_w = min(bubble_w, BUBBLE_MAX_W)
+            bubble_h = text.height() + 2 * BUBBLE_PAD
+        else:
+            bubble_w = bubble_h = 0
+        name_metrics = QFontMetrics(self.name_font)
+        self.name_text = name_metrics.elidedText(self.name, Qt.ElideRight, self.name_max_w)
+        name_w = name_metrics.horizontalAdvance(self.name_text) + 10 if self.name_text else 0
+        name_h = name_metrics.height() + 2 if self.name_text else 0
+
+        width = max(pet_w, bubble_w, name_w)
+        top = bubble_h + BUBBLE_TAIL if self.bubble else 0
+        self.bubble_rect = QRect((width - bubble_w) // 2, 0, bubble_w, bubble_h)
+        self.pet_rect = QRect((width - pet_w) // 2, top, pet_w, pet_h)
+        self.name_rect = QRect((width - name_w) // 2, top + pet_h + 2, name_w, name_h)
+        self.size_hint_ = (width, top + pet_h + 2 + name_h)
+        if self.badge:  # 펫 오른쪽 위 모서리 (펫 영역 안이라 창 마스크에 이미 들어 있다)
+            badge_metrics = QFontMetrics(self.badge_font)
+            badge_h = badge_metrics.height() + 4
+            badge_w = max(badge_h, badge_metrics.horizontalAdvance(self.badge) + 10)
+            self.badge_rect = QRect(self.pet_rect.right() - badge_w + 1, self.pet_rect.top() + 2,
+                                    badge_w, badge_h)
+
+    size_hint_ = (0, 0)
+
+    def place(self, right, bottom):
+        """창의 오른쪽 아래 모서리를 (right, bottom) 에 맞춘다."""
+        width, height = self.size_hint_
+        self.setGeometry(right - width, bottom - height, width, height)
+        # 투명한 빈 곳은 클릭이 아래 창으로 가게 말풍선·펫·이름표 영역만 남긴다
+        region = QRegion(self.pet_rect).united(QRegion(self.name_rect))
+        if self.bubble:
+            region = region.united(QRegion(self.bubble_rect.adjusted(0, 0, 0, BUBBLE_TAIL)))
+        self.setMask(region)
+
+    # ---- 애니메이션 --------------------------------------------------------
+
+    def current_animation(self):
+        return self.oneshot or self.animation
+
+    def set_animation(self, name):
+        if name == self.animation:
+            return
+        self.animation = name
+        if self.oneshot is None:
+            self.frame_index = 0
+            self.anim_timer.stop()
+            self.schedule_frame()
+        self.update()
+
+    def play_jump(self):
+        self.oneshot = "jumping"
+        self.frame_index = 0
+        self.anim_timer.stop()
+        self.schedule_frame()
+        self.update()
+
+    def schedule_frame(self):
+        durations = petcore.ANIMATIONS[self.current_animation()][1]
+        self.anim_timer.start(durations[self.frame_index % len(durations)])
+
+    def next_frame(self):
+        count = len(petcore.ANIMATIONS[self.current_animation()][1])
+        self.frame_index += 1
+        if self.frame_index >= count:
+            self.frame_index = 0
+            self.oneshot = None
+        self.schedule_frame()
+        self.update()
+
+    # ---- 그리기 ------------------------------------------------------------
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        if self.bubble:
+            self.paint_bubble(painter)
+        if self.frames:
+            frames = self.frames[self.current_animation()]
+            painter.drawPixmap(self.pet_rect.topLeft(), frames[self.frame_index % len(frames)])
+        else:
+            self.paint_fallback(painter)
+        if self.name_text:
+            self.paint_name(painter)
+        if self.badge:
+            self.paint_badge(painter)
+
+    def paint_bubble(self, painter):
+        fill, border = BUBBLE_COLORS.get(self.state, BUBBLE_COLORS["running"])
+        rect = QRectF(self.bubble_rect).adjusted(1, 1, -1, -1)
+        tail_x = int(min(max(self.pet_rect.center().x(), rect.left() + 14), rect.right() - 14))
+        bottom = int(rect.bottom())
+        path = QPainterPath()
+        path.addRoundedRect(rect, 8, 8)
+        tail = QPainterPath()
+        tail.addPolygon(QPolygonF([QPoint(tail_x - 7, bottom - 1), QPoint(tail_x + 7, bottom - 1),
+                                   QPoint(tail_x, bottom + BUBBLE_TAIL - 1)]))
+        painter.setPen(QPen(QColor(border), 1.5))
+        painter.setBrush(QColor(fill))
+        painter.drawPath(path.united(tail))
+        painter.setPen(QColor("#222222"))
+        painter.drawText(self.bubble_rect.adjusted(BUBBLE_PAD, BUBBLE_PAD, -BUBBLE_PAD, -BUBBLE_PAD),
+                         Qt.TextWordWrap | Qt.AlignCenter, self.bubble)
+
+    def paint_name(self, painter):
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(30, 30, 30, 170))
+        painter.drawRoundedRect(QRectF(self.name_rect), 6, 6)
+        painter.setFont(self.name_font)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(self.name_rect, Qt.AlignCenter, self.name_text)
+
+    def paint_badge(self, painter):
+        rect = QRectF(self.badge_rect).adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
+        painter.setBrush(QColor("#E8590C"))
+        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+        painter.setFont(self.badge_font)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(self.badge_rect, Qt.AlignCenter, self.badge)
+
+    def paint_fallback(self, painter):
+        rect = QRectF(self.pet_rect).adjusted(6, 6, -6, -6)
+        painter.setPen(QPen(QColor("#555555"), 2))
+        painter.setBrush(QColor("#FFE9C7"))
+        painter.drawEllipse(rect)
+        painter.setPen(QColor("#333333"))
+        painter.setFont(QFont(self.font().family(), max(8, int(rect.height() / 5)), QFont.Bold))
+        painter.drawText(rect, Qt.AlignCenter, FALLBACK_FACES.get(self.state, "-.-"))
+
+    # ---- 마우스: 관리자에게 넘긴다 -------------------------------------------
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.manager.drag_begin(event.globalPos())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self.manager.drag_move(event.globalPos())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and not self.manager.drag_end():
+            self.manager.on_click(self.session_id)
+
+    def contextMenuEvent(self, event):
+        self.manager.show_menu(self.session_id, event.globalPos())
+
+    def enterEvent(self, _event):
+        self.manager.hover_enter(self.session_id)
+
+    def leaveEvent(self, _event):
+        self.manager.hover_leave(self.session_id)
+
+
+class UsageCard(QWidget):
+    """펫에 마우스를 올리면 그 펫 위에 뜨는 카드: 세션 제목·상태, 컨텍스트, 계정 5시간·주간 사용량."""
+
+    def __init__(self):
+        # 카드가 마우스를 가로채면 펫에서 leave 가 와서 깜빡이므로 입력을 통과시킨다
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                         | Qt.NoDropShadowWindowHint | Qt.WindowDoesNotAcceptFocus
+                         | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowTitle("Claude Pet Usage")
+        family = self.font().family()
+        self.title_font = QFont(family, 10, QFont.Bold)
+        self.text_font = QFont(family, 9)
+        self.note_font = QFont(family, 8)
+        self.content = None
+        self.title_text = ""
+        self.label_w = self.pct_w = self.line_h = 0
+
+    def set_content(self, title, subtitle, rows, note):
+        content = (title, subtitle, tuple(rows), note)
+        if content == self.content:
+            return
+        self.content = content
+        title_metrics = QFontMetrics(self.title_font)
+        text_metrics = QFontMetrics(self.text_font)
+        self.title_text = title_metrics.elidedText(title, Qt.ElideRight, CARD_TITLE_MAX_W)
+        self.label_w = max(text_metrics.horizontalAdvance(label) for label, _, _ in rows)
+        self.pct_w = text_metrics.horizontalAdvance("100%")
+        detail_w = max(text_metrics.horizontalAdvance(detail) for _, _, detail in rows)
+        row_w = self.label_w + 8 + CARD_BAR_W + 6 + self.pct_w + 8 + detail_w
+        width = max(title_metrics.horizontalAdvance(self.title_text),
+                    text_metrics.horizontalAdvance(subtitle),
+                    QFontMetrics(self.note_font).horizontalAdvance(note), row_w)
+        self.line_h = text_metrics.height() + 3
+        height = (title_metrics.height() + text_metrics.height() + 6 + len(rows) * self.line_h
+                  + (QFontMetrics(self.note_font).height() + 2 if note else 0))
+        self.resize(width + 2 * CARD_PAD, height + 2 * CARD_PAD)
+        self.update()
+
+    def show_above(self, window):
+        """펫 창 위 가운데에 띄운다. 화면 밖으로 나가지 않게 맞춘다."""
+        pet = window.geometry()
+        screen = QApplication.screenAt(pet.center()) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = min(max(pet.center().x() - self.width() // 2, area.left() + 4), area.right() - self.width() - 4)
+        y = max(pet.top() - self.height() - 6, area.top() + 4)
+        self.move(x, y)
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+
+    def paintEvent(self, _event):
+        if not self.content:
+            return
+        _, subtitle, rows, note = self.content
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        painter.setBrush(QColor(28, 28, 32, 235))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+
+        x, y = CARD_PAD, CARD_PAD
+        title_metrics = QFontMetrics(self.title_font)
+        painter.setFont(self.title_font)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(x, y + title_metrics.ascent(), self.title_text)
+        y += title_metrics.height()
+
+        text_metrics = QFontMetrics(self.text_font)
+        painter.setFont(self.text_font)
+        painter.setPen(QColor("#B8B8C0"))
+        painter.drawText(x, y + text_metrics.ascent(), subtitle)
+        y += text_metrics.height() + 6
+
+        for label, percent, detail in rows:
+            baseline = y + text_metrics.ascent()
+            painter.setPen(QColor("#E8E8EC"))
+            painter.drawText(x, baseline, label)
+            bar_x = x + self.label_w + 8
+            bar = QRectF(bar_x, y + (text_metrics.height() - CARD_BAR_H) / 2, CARD_BAR_W, CARD_BAR_H)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 45))
+            painter.drawRoundedRect(bar, CARD_BAR_H / 2, CARD_BAR_H / 2)
+            if percent is not None and percent > 0:
+                filled = QRectF(bar)
+                filled.setWidth(max(CARD_BAR_H, CARD_BAR_W * min(percent, 100) / 100))
+                painter.setBrush(QColor(usage_color(percent)))
+                painter.drawRoundedRect(filled, CARD_BAR_H / 2, CARD_BAR_H / 2)
+            pct_x = bar_x + CARD_BAR_W + 6
+            painter.setPen(QColor("#FFFFFF"))
+            painter.drawText(QRect(pct_x, y, self.pct_w, text_metrics.height()), Qt.AlignRight | Qt.AlignVCenter,
+                             petcore.format_percent(percent) if percent is not None else "-")
+            painter.setPen(QColor("#B8B8C0"))
+            painter.drawText(pct_x + self.pct_w + 8, baseline, detail)
+            y += self.line_h
+
+        if note:
+            painter.setFont(self.note_font)
+            painter.setPen(QColor("#9A9AA2"))
+            painter.drawText(x, y + 2 + QFontMetrics(self.note_font).ascent(), note)
+
+
+class PetManager(QObject):
+    """상태 파일을 읽어 세션마다 PetWindow 를 만들고 지우며, 한 줄로 세운다."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = load_config()
+        self.state_dir = petcore.state_dir()
+        self.desktop = Desktop()
+        self.titles = petcore.TitleReader()
+        self.pets = petcore.find_pets(PET_SEARCH_DIRS)
+        self.frames_cache = {}
+        self.windows = {}  # session_id -> PetWindow
+        self.order = []
+        self.sessions = {}
+        self.acked = {}  # session_id -> 확인한 상태의 ts
+        self.view_states = {}  # session_id -> 지금 보이는 상태 (접혀서 안 보이는 세션도)
+        self.titles_by_sid = {}
+        self.folded_summary = False  # 접혔는데 손이 필요한 세션이 없어 요약 펫을 세웠는지
+        self.card = UsageCard()
+        self.hover_sid = None
+        self.hover_timer = QTimer(self, singleShot=True, interval=HOVER_DELAY_MS, timeout=self.update_card)
+        saved = self.config.get("assignments")
+        self.assignments = ({k: v for k, v in saved.items() if isinstance(k, str) and isinstance(v, str)}
+                            if isinstance(saved, dict) else {})
+        self.anchor = self.initial_anchor()  # 줄의 오른쪽 아래 모서리
+        self.drag_origin = None
+        self.dragged = False
+        self.warned_extension = False
+
+        self.watcher = QFileSystemWatcher([str(self.state_dir)], self)
+        self.watcher.directoryChanged.connect(self.refresh)
+        self.tick = QTimer(self, interval=1000, timeout=self.refresh)
+        self.tick.start()
+        self.refresh()
+
+    # ---- 설정 --------------------------------------------------------------
+
+    def folded(self):
+        return self.config.get("folded") is True
+
+    def scale(self):
+        value = self.config.get("scale")
+        return value if value in SCALES.values() else SCALES["보통"]
+
+    def default_anchor(self):
+        area = QApplication.primaryScreen().availableGeometry()
+        return QPoint(area.right() - 20, area.bottom() - 10)
+
+    def initial_anchor(self):
+        saved = self.config.get("row_anchor")
+        if (isinstance(saved, list) and len(saved) == 2 and all(isinstance(v, int) for v in saved)
+                and QApplication.screenAt(QPoint(*saved)) is not None):
+            return QPoint(*saved)
+        return self.default_anchor()
+
+    def save(self):
+        if len(self.assignments) > MAX_SAVED_ASSIGNMENTS:
+            keep = list(self.assignments.items())[-MAX_SAVED_ASSIGNMENTS:]
+            self.assignments = dict(keep)
+        self.config["assignments"] = self.assignments
+        self.config["row_anchor"] = [self.anchor.x(), self.anchor.y()]
+        save_config(self.config)
+
+    # ---- 펫 이미지 ---------------------------------------------------------
+
+    def pet_frames(self, pet_id):
+        """(frames, pet_size). 이미지가 없거나 깨졌으면 frames 는 None (대체 얼굴을 그린다)."""
+        if pet_id not in self.frames_cache:
+            pet = next((p for p in self.pets if p["id"] == pet_id), None)
+            frames = None
+            if pet:
+                try:
+                    frames = load_frames(pet["sprite"], self.scale())
+                except (OSError, ValueError) as err:
+                    print(f"claude-pet: {pet['sprite']} 를 읽지 못함: {err}", file=sys.stderr)
+            self.frames_cache[pet_id] = frames
+        frames = self.frames_cache[pet_id]
+        if frames:
+            first = frames["idle"][0]
+            return frames, (first.width(), first.height())
+        side = round(150 * self.scale())
+        return None, (side, side)
+
+    # ---- 상태 --------------------------------------------------------------
+
+    def refresh(self, *_):
+        now = int(time.time() * 1000)
+        sessions = {}
+        for sid, session in petcore.load_sessions(self.state_dir).items():
+            if petcore.is_alive(session):
+                sessions[sid] = session
+            else:  # 터미널을 그냥 닫아 SessionEnd 없이 끝난 세션
+                (self.state_dir / f"{sid}.json").unlink(missing_ok=True)
+                (petcore.usage_dir() / f"{sid}.json").unlink(missing_ok=True)
+        self.sessions = sessions
+
+        views = petcore.session_views(sessions, now, self.acked)
+        self.view_states = {sid: state for sid, state, _ in views}
+        # 펫 배정은 접혀서 안 보이는 세션까지 해 둬야 펼쳤을 때 펫이 바뀌지 않는다
+        assigned = petcore.assign_pets([sid for sid, _, _ in views], [p["id"] for p in self.pets],
+                                       self.assignments)
+        if any(self.assignments.get(sid) != pet for sid, pet in assigned.items()):
+            self.assignments.update(assigned)
+            self.save()
+
+        badges, summaries = {}, {}
+        self.folded_summary = False
+        if self.folded():
+            picked = petcore.folded_view(views, sessions)
+            views = []
+            if picked:
+                sid, state, bubble, more, summary = picked
+                views = [(sid, state, bubble)]
+                badges[sid] = f"+{more}" if more else ""
+                if summary:
+                    summaries[sid] = summary
+                    self.folded_summary = True
+        order = [sid for sid, _, _ in views]
+
+        needs_layout = order != self.order
+        for sid in [s for s in self.windows if s not in order]:
+            window = self.windows.pop(sid)
+            window.close()
+            window.deleteLater()
+            needs_layout = True
+
+        for sid, state, bubble in views:
+            session = sessions[sid]
+            window = self.windows.get(sid)
+            if window is None:
+                window = self.windows[sid] = PetWindow(self, sid)
+                needs_layout = True
+            pet_id = assigned.get(sid)
+            if not window.has_pet or window.pet_id != pet_id:
+                window.set_pet(pet_id, *self.pet_frames(pet_id))
+                needs_layout = True
+            title = self.titles.title(session.get("transcript")) or petcore.session_name(session)
+            self.titles_by_sid[sid] = title
+            name, name_max_w = (summaries[sid], SUMMARY_MAX_W) if sid in summaries else (title, NAME_MAX_W)
+            if window.set_view(state, bubble, name, badges.get(sid, ""), name_max_w):
+                needs_layout = True
+
+        self.order = order
+        if needs_layout:
+            self.layout()
+        if self.card.isVisible():
+            self.update_card()
+
+    def layout(self):
+        """처음 생긴 세션이 줄의 오른쪽 끝, 새 세션일수록 왼쪽. 모두 같은 바닥선에 선다."""
+        screen = QApplication.screenAt(self.anchor) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        tallest = max((self.windows[sid].size_hint_[1] for sid in self.order), default=0)
+        self.anchor = QPoint(min(max(self.anchor.x(), area.left() + 50), area.right() + 1),
+                             min(max(self.anchor.y(), area.top() + tallest), area.bottom() + 1))
+        right = self.anchor.x()
+        for sid in self.order:
+            window = self.windows[sid]
+            window.place(right, self.anchor.y())
+            if not window.isVisible():
+                window.show()
+            right -= window.size_hint_[0] + ROW_GAP
+
+    # ---- 마우스 ------------------------------------------------------------
+
+    def hover_enter(self, sid):
+        self.hover_sid = sid
+        self.hover_timer.start()
+
+    def hover_leave(self, sid):
+        if self.hover_sid == sid:
+            self.hide_card()
+
+    def hide_card(self):
+        self.hover_sid = None
+        self.hover_timer.stop()
+        self.card.hide()
+
+    def update_card(self):
+        """마우스를 올린 펫의 카드를 채워 그 펫 위에 띄운다 (떠 있는 동안 매초 다시 채운다)."""
+        sid = self.hover_sid
+        window = self.windows.get(sid)
+        session = self.sessions.get(sid)
+        if window is None or session is None or self.drag_origin is not None:
+            self.card.hide()
+            return
+        now = int(time.time() * 1000)
+        usage = petcore.load_usage(petcore.usage_dir())
+        rows, note = petcore.usage_rows(usage.get(sid), petcore.account_limits(usage), now)
+        state = self.view_states.get(sid, session["state"])
+        subtitle = f"{petcore.session_name(session)} · {petcore.STATE_LABELS.get(state, state)}"
+        self.card.set_content(self.titles_by_sid.get(sid) or petcore.session_name(session), subtitle, rows, note)
+        self.card.show_above(window)
+
+    def drag_begin(self, pos):
+        self.hide_card()
+        self.drag_origin = (pos, QPoint(self.anchor))
+        self.dragged = False
+
+    def drag_move(self, pos):
+        if self.drag_origin is None:
+            return
+        start, anchor = self.drag_origin
+        delta = pos - start
+        if delta.manhattanLength() > 4:
+            self.dragged = True
+        if self.dragged:
+            self.anchor = anchor + delta
+            self.layout()
+
+    def drag_end(self):
+        """드래그였으면 True (클릭으로 치지 않는다)."""
+        dragged = self.dragged
+        if dragged:
+            self.save()
+        self.drag_origin = None
+        self.dragged = False
+        return dragged
+
+    def on_click(self, sid):
+        session = self.sessions.get(sid)
+        window = self.windows.get(sid)
+        if session is None or window is None:
+            return
+        if self.folded() and self.folded_summary:  # 기다리는 세션이 없을 때 요약 펫은 펼치기 단추
+            self.set_folded(False)
+            return
+        if session["state"] in ("done", "error"):
+            self.acked[sid] = session["ts"]
+        window.play_jump()
+        title = self.desktop.terminator_title(session.get("terminator_uuid"))
+        if not self.desktop.activate(title) and not self.warned_extension:
+            self.warned_extension = True
+            print("claude-pet: 창을 올리지 못함 (GNOME 확장 claude-pet-focus 가 켜져 있는지, "
+                  f"Terminator 창 제목 '{title}')", file=sys.stderr)
+        self.refresh()
+
+    # ---- 메뉴 --------------------------------------------------------------
+
+    def show_menu(self, sid, pos):
+        self.hide_card()
+        menu = QMenu()
+
+        pet_menu = menu.addMenu("이 세션의 펫")
+        pet_group = QActionGroup(pet_menu)
+        if not self.pets:
+            pet_menu.addAction("펫 없음 (pets/, pets-downloaded/, ~/.codex/pets)").setEnabled(False)
+        window = self.windows.get(sid)
+        for pet in self.pets:
+            action = QAction(pet["name"], pet_menu, checkable=True,
+                             checked=window is not None and pet["id"] == window.pet_id)
+            action.triggered.connect(lambda _=False, pid=pet["id"]: self.choose_pet(sid, pid))
+            pet_group.addAction(action)
+            pet_menu.addAction(action)
+        pet_menu.addSeparator()
+        pet_menu.addAction("펫 다시 읽기", self.reload_pets)
+
+        size_menu = menu.addMenu("크기")
+        size_group = QActionGroup(size_menu)
+        for label, value in SCALES.items():
+            action = QAction(label, size_menu, checkable=True, checked=value == self.scale())
+            action.triggered.connect(lambda _=False, v=value: self.choose_scale(v))
+            size_group.addAction(action)
+            size_menu.addAction(action)
+
+        fold = QAction("접기 (기다리는 세션만 보기)", menu, checkable=True, checked=self.folded())
+        fold.triggered.connect(self.set_folded)
+        menu.addAction(fold)
+        menu.addAction("줄 위치 처음으로", self.reset_anchor)
+        menu.addSeparator()
+        autostart = QAction("새 Claude 세션에서 자동 실행", menu, checkable=True,
+                            checked=not DISABLED_FLAG.exists())
+        autostart.triggered.connect(self.set_autostart)
+        menu.addAction(autostart)
+        menu.addAction("종료", QApplication.quit)
+        menu.exec_(pos)
+
+    def choose_pet(self, sid, pet_id):
+        self.pets = petcore.find_pets(PET_SEARCH_DIRS)  # 새로 받은 펫도 보이게
+        self.assignments.pop(sid, None)
+        self.assignments[sid] = pet_id  # 맨 뒤로 보내 오래 남게 한다
+        self.save()
+        window = self.windows.get(sid)
+        if window:
+            window.set_pet(pet_id, *self.pet_frames(pet_id))
+            self.layout()
+
+    def reload_pets(self):
+        """펫 폴더를 다시 읽는다. 새로 넣거나 고친 펫을 앱을 다시 켜지 않고 볼 수 있다."""
+        self.pets = petcore.find_pets(PET_SEARCH_DIRS)
+        self.frames_cache.clear()
+        for window in self.windows.values():
+            window.has_pet = False  # refresh 에서 이미지를 새로 읽는다
+        self.refresh()
+
+    def choose_scale(self, value):
+        self.config["scale"] = value
+        self.frames_cache.clear()
+        for window in self.windows.values():
+            window.set_pet(window.pet_id, *self.pet_frames(window.pet_id))
+        self.layout()
+        self.save()
+
+    def set_folded(self, folded):
+        self.config["folded"] = bool(folded)
+        self.hide_card()
+        self.save()
+        self.refresh()
+
+    def reset_anchor(self):
+        self.anchor = self.default_anchor()
+        self.layout()
+        self.save()
+
+    def set_autostart(self, enabled):
+        try:
+            if enabled:
+                DISABLED_FLAG.unlink(missing_ok=True)
+            else:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                DISABLED_FLAG.touch()
+        except OSError as err:
+            print(f"claude-pet: 자동 실행 설정 실패: {err}", file=sys.stderr)
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    lock = acquire_single_instance(petcore.state_dir())
+    if lock is None:
+        print("claude-pet: 이미 실행 중", file=sys.stderr)
+        return 0
+    app = QApplication(sys.argv)
+    # 세션이 하나도 없으면 창이 없지만, 새 세션을 기다려야 하므로 꺼지지 않는다 (종료는 메뉴에서)
+    app.setQuitOnLastWindowClosed(False)
+    manager = PetManager()  # noqa: F841  (app 이 도는 동안 살아 있어야 한다)
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
