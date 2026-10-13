@@ -92,15 +92,23 @@ write_state() {
     return
   fi
 
-  local since=$ts created=$ts old_seq="" old_state="" old_since="" old_created=""
+  local since=$ts created=$ts prompt_ts=0 tmp="$file.tmp.$$"
+  local old_seq="" old_state="" old_since="" old_created="" old_prompt=""
   if [ -f "$file" ]; then
-    IFS=$US read -r old_seq old_state old_since old_created < <(
-      jq -r '[.seq, .state, .since, .created] | map(. // "" | tostring) | join("\u001f")' "$file" 2>/dev/null
+    IFS=$US read -r old_seq old_state old_since old_created old_prompt < <(
+      jq -r '[.seq, .state, .since, .created, .prompt_ts] | map(. // "" | tostring) | join("\u001f")' \
+        "$file" 2>/dev/null
     )
     # 펫 줄의 순서는 세션이 처음 생긴 시각으로 고정한다
     [[ $old_created =~ ^[0-9]+$ ]] && created=$old_created
-    # 더 나중에 시작한 이벤트가 이미 썼으면 그대로 둔다
+    # 마지막으로 프롬프트를 보낸 시각 (펫의 "나중에 이어서 볼게" 표시는 새 프롬프트가 오면 풀린다)
+    [[ $old_prompt =~ ^[0-9]+$ ]] && prompt_ts=$old_prompt
+    # 더 나중에 시작한 이벤트가 이미 썼으면 그대로 둔다. 늦게 끝난 프롬프트 이벤트라도 프롬프트 시각은 남긴다.
     if [[ $old_seq =~ ^[0-9]+$ ]] && (( old_seq > seq )); then
+      if [ "$event" = UserPromptSubmit ] && (( ts > prompt_ts )); then
+        jq --argjson p "$ts" '.prompt_ts = $p' "$file" >"$tmp" 2>/dev/null && mv -f "$tmp" "$file"
+        rm -f "$tmp"
+      fi
       return
     fi
     # 압축(compact) 뒤 SessionStart 는 작업 중에도 오므로 기존 상태를 지운다고 보지 않는다
@@ -114,14 +122,15 @@ write_state() {
       since=$old_since
     fi
   fi
+  [ "$event" = UserPromptSubmit ] && prompt_ts=$ts
 
-  local tmp="$file.tmp.$$"
   jq -n --arg seq "$seq" --argjson ts "$ts" --argjson since "$since" --argjson created "$created" \
         --arg state "$state" --arg cwd "$cwd" --arg tool "$tool" --arg event "$event" \
         --arg claude_pid "$claude_pid" --arg claude_start "$claude_start" \
         --arg terminator_uuid "${TERMINATOR_UUID:-}" --arg transcript "$transcript" \
         --argjson bg_tasks "$bg_tasks" --arg bg_desc "$bg_desc" --argjson crons "$crons" \
-        '{seq: $seq, ts: $ts, since: $since, created: $created, state: $state, cwd: $cwd,
+        --argjson prompt_ts "$prompt_ts" \
+        '{seq: $seq, ts: $ts, since: $since, created: $created, prompt_ts: $prompt_ts, state: $state, cwd: $cwd,
           tool: $tool, event: $event, claude_pid: $claude_pid, claude_start: $claude_start,
           terminator_uuid: $terminator_uuid, transcript: $transcript,
           bg_tasks: $bg_tasks, bg_desc: $bg_desc, crons: $crons}' \

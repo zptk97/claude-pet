@@ -9,7 +9,11 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 
 왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인
 마우스 올림: 그 세션의 컨텍스트와 계정 5시간·주간 사용량 카드 (상태줄 중계 hooks/claude-pet-statusline.sh 필요)
-드래그: 줄 전체 이동 / 오른쪽 클릭: 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기, 자동 실행, 종료
+드래그: 줄 전체 이동 / 오른쪽 클릭: 나중에 이어서 볼게, 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기,
+자동 실행, 종료
+
+나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
+그 펫을 클릭해 돌아가거나, 그 세션에 새 프롬프트를 보내거나, 표시 지우기를 누르면 풀린다.
 
 접기: 손이 필요한 세션(확인 필요 > 오류 > 다 했어요) 하나만 세우고 나머지 수는 배지로 단다.
 그런 세션이 없으면 가장 오래된 세션 펫에 상태 요약을 달고, 클릭하면 펼친다.
@@ -68,7 +72,9 @@ BUBBLE_COLORS = {
     "done": ("#E2F6E3", "#2F8F4E"),
     "error": ("#FDE2E1", "#C53030"),
     "background": ("#E3EFFD", "#2B6CB0"),
+    "marked": ("#EFE4FB", "#7B3FC4"),  # 나중에 이어서 볼게
 }
+MARK_COLOR = "#7B3FC4"
 
 def usage_color(percent):
     """사용량 막대 색: 50% 미만 초록, 80% 미만 노랑, 그 이상 빨강."""
@@ -235,6 +241,8 @@ class PetWindow(QWidget):
         self.bubble = ""
         self.name = ""
         self.badge = ""  # 접혔을 때 뒤에 기다리는 세션 수 (+2)
+        self.bubble_style = "idle"  # 말풍선 색 (보통 상태와 같고, 나중에 이어서 볼 세션이면 marked)
+        self.marked = False  # 나중에 이어서 볼게 책갈피
         self.name_max_w = NAME_MAX_W
 
         self.animation = ""
@@ -254,12 +262,16 @@ class PetWindow(QWidget):
         self.pet_size = pet_size
         self.relayout()
 
-    def set_view(self, state, bubble, name, badge="", name_max_w=NAME_MAX_W):
+    def set_view(self, state, bubble, name, badge="", name_max_w=NAME_MAX_W, bubble_style=None, marked=False):
         """상태를 반영한다. 창 크기가 바뀌었으면 True (줄을 다시 세워야 한다)."""
         if state != self.state:
             self.state = state
             self.oneshot = None
             self.set_animation(petcore.STATE_ANIMATION[state])
+        look = (bubble_style or state, marked)
+        if look != (self.bubble_style, self.marked):
+            self.bubble_style, self.marked = look
+            self.update()
         view = (bubble, name, badge, name_max_w)
         if view == (self.bubble, self.name, self.badge, self.name_max_w):
             return False
@@ -361,9 +373,11 @@ class PetWindow(QWidget):
             self.paint_name(painter)
         if self.badge:
             self.paint_badge(painter)
+        if self.marked:
+            self.paint_mark(painter)
 
     def paint_bubble(self, painter):
-        fill, border = BUBBLE_COLORS.get(self.state, BUBBLE_COLORS["running"])
+        fill, border = BUBBLE_COLORS.get(self.bubble_style, BUBBLE_COLORS["running"])
         rect = QRectF(self.bubble_rect).adjusted(1, 1, -1, -1)
         tail_x = int(min(max(self.pet_rect.center().x(), rect.left() + 14), rect.right() - 14))
         bottom = int(rect.bottom())
@@ -386,6 +400,15 @@ class PetWindow(QWidget):
         painter.setFont(self.name_font)
         painter.setPen(QColor("#FFFFFF"))
         painter.drawText(self.name_rect, Qt.AlignCenter, self.name_text)
+
+    def paint_mark(self, painter):
+        """펫 왼쪽 위 보라색 책갈피 (펫 영역 안이라 창 마스크에 이미 들어 있다)."""
+        x, y = self.pet_rect.left() + 3, self.pet_rect.top() + 1
+        w, h = 12, 18
+        painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
+        painter.setBrush(QColor(MARK_COLOR))
+        painter.drawPolygon(QPolygonF([QPoint(x, y), QPoint(x + w, y), QPoint(x + w, y + h),
+                                       QPoint(x + w // 2, y + h - 5), QPoint(x, y + h)]))
 
     def paint_badge(self, painter):
         rect = QRectF(self.badge_rect).adjusted(1, 1, -1, -1)
@@ -549,6 +572,7 @@ class PetManager(QObject):
         self.order = []
         self.sessions = {}
         self.acked = {}  # session_id -> 확인한 상태의 ts
+        self.marks = petcore.load_marks(petcore.marks_file())  # 나중에 이어서 볼게 {session_id: {"set_at"}}
         self.view_states = {}  # session_id -> 지금 보이는 상태 (접혀서 안 보이는 세션도)
         self.titles_by_sid = {}
         self.folded_summary = False  # 접혔는데 손이 필요한 세션이 없어 요약 펫을 세웠는지
@@ -646,6 +670,10 @@ class PetManager(QObject):
                 (self.state_dir / f"{sid}.json").unlink(missing_ok=True)
                 (petcore.usage_dir() / f"{sid}.json").unlink(missing_ok=True)
         self.sessions = sessions
+        marks = petcore.active_marks(self.marks, sessions)  # 끝난 세션, 새 프롬프트가 온 세션은 풀린다
+        if marks != self.marks:
+            self.marks = marks
+            self.save_marks()
 
         views = petcore.session_views(sessions, now, self.acked)
         self.view_states = {sid: state for sid, state, _ in views}
@@ -659,7 +687,7 @@ class PetManager(QObject):
         badges, summaries = {}, {}
         self.folded_summary = False
         if self.folded():
-            picked = petcore.folded_view(views, sessions)
+            picked = petcore.folded_view(views, sessions, self.marks)
             views = []
             if picked:
                 sid, state, bubble, more, summary = picked
@@ -690,7 +718,9 @@ class PetManager(QObject):
             title = self.titles.title(session.get("transcript")) or petcore.session_name(session)
             self.titles_by_sid[sid] = title
             name, name_max_w = (summaries[sid], SUMMARY_MAX_W) if sid in summaries else (title, NAME_MAX_W)
-            if window.set_view(state, bubble, name, badges.get(sid, ""), name_max_w):
+            marked = sid in self.marks
+            bubble, style = petcore.marked_bubble(state, bubble) if marked else (bubble, state)
+            if window.set_view(state, bubble, name, badges.get(sid, ""), name_max_w, style, marked):
                 needs_layout = True
 
         self.order = order
@@ -780,6 +810,8 @@ class PetManager(QObject):
             return
         if session["state"] in ("done", "error"):
             self.acked[sid] = session["ts"]
+        if self.marks.pop(sid, None) is not None:  # 돌아왔으니 이어서 볼 표시를 푼다
+            self.save_marks()
         window.play_jump()
         title = self.desktop.terminator_title(session.get("terminator_uuid"))
         if not self.desktop.activate(title) and not self.warned_extension:
@@ -793,6 +825,12 @@ class PetManager(QObject):
     def show_menu(self, sid, pos):
         self.hide_card()
         menu = QMenu()
+
+        if sid in self.marks:
+            menu.addAction("표시 지우기", lambda: self.set_mark(sid, False))
+        else:
+            menu.addAction("나중에 이어서 볼게", lambda: self.set_mark(sid, True))
+        menu.addSeparator()
 
         # 아이콘이 있는 체크 항목은 Qt 가 체크 표시 대신 아이콘 테두리로만 보여줘서,
         # 지금 펫은 굵은 글씨와 ✓ 로 표시한다
@@ -880,6 +918,23 @@ class PetManager(QObject):
         if window:
             window.set_pet(pet_id, *self.pet_frames(pet_id))
             self.layout()
+
+    def set_mark(self, sid, marked):
+        if marked:
+            self.marks[sid] = {"set_at": int(time.time() * 1000)}
+        else:
+            self.marks.pop(sid, None)
+        self.save_marks()
+        self.refresh()
+        window = self.windows.get(sid)
+        if marked and window is not None:
+            window.play_jump()
+
+    def save_marks(self):
+        try:
+            petcore.save_marks(petcore.marks_file(), self.marks)
+        except OSError as err:
+            print(f"claude-pet: 이어서 볼 표시 저장 실패: {err}", file=sys.stderr)
 
     def set_pet_enabled(self, pet_id, enabled, toggles=()):
         """펫을 켜거나 끈다. 끈 펫을 쓰던 세션은 refresh 에서 켜진 펫으로 다시 배정된다."""

@@ -152,6 +152,28 @@ class HookTest(unittest.TestCase):
         self.fire("PreToolUse", tool_name="Bash")
         self.assertEqual(self.state()["state"], "done")
 
+    def test_records_last_prompt_time(self):
+        self.fire("SessionStart", source="startup")
+        self.assertEqual(self.state()["prompt_ts"], 0)
+        self.fire("UserPromptSubmit", prompt="1")
+        first = self.state()
+        self.assertEqual(first["prompt_ts"], first["ts"])
+        self.fire("PreToolUse", tool_name="Bash")
+        self.fire("Stop")
+        self.assertEqual(self.state()["prompt_ts"], first["prompt_ts"], "다른 이벤트는 프롬프트 시각을 유지한다")
+        self.fire("UserPromptSubmit", prompt="2")
+        self.assertGreater(self.state()["prompt_ts"], first["prompt_ts"])
+
+    def test_late_prompt_event_still_records_prompt_time(self):
+        self.fire("Stop")
+        data = self.state()
+        data["seq"] = str(int(data["seq"]) + 10**15)  # 더 나중에 시작한 이벤트가 이미 쓴 것처럼
+        self.state_file.write_text(json.dumps(data))
+        self.fire("UserPromptSubmit", prompt="hi")
+        s = self.state()
+        self.assertEqual((s["state"], s["seq"]), ("done", data["seq"]), "상태는 그대로")
+        self.assertGreater(s["prompt_ts"], data["ts"], "프롬프트 시각만 남긴다")
+
     def test_unsafe_session_id_is_ignored(self):
         self.fire("UserPromptSubmit", sid="../escape")
         run = Path(self.env["XDG_RUNTIME_DIR"])

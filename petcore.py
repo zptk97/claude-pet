@@ -122,6 +122,7 @@ def load_sessions(directory):
             data["ts"] = int(data.get("ts", 0))
             data["since"] = int(data.get("since", data["ts"]))
             data["created"] = int(data.get("created", data["ts"]))
+            data["prompt_ts"] = int(data.get("prompt_ts") or 0)
         except (TypeError, ValueError):
             continue
         sessions[path.stem] = data
@@ -416,23 +417,83 @@ def usage_rows(usage, limits, now_ms):
 
 # ---- 펫 접기 ------------------------------------------------------------------
 
-# 손이 필요한 상태, 앞일수록 먼저 보여준다
-ATTENTION_ORDER = ("waiting", "error", "done")
+# 손이 필요한 정도, 앞일수록 먼저 보여준다 ("marked" 는 "나중에 이어서 볼게" 로 표시한 세션)
+ATTENTION_ORDER = ("waiting", "error", "marked", "done")
 
 
-def folded_view(views, sessions):
+def folded_view(views, sessions, marks=None):
     """접힌 줄에 세울 펫 하나: (session_id, state, 말풍선, 뒤에 기다리는 세션 수, 요약). 세션이 없으면 None.
 
-    손이 필요한 세션이 있으면 확인 필요 > 오류 > 다 했어요, 같은 종류는 오래 기다린 순으로 하나를 고른다.
+    손이 필요한 세션이 있으면 확인 필요 > 오류 > 이어서 볼 세션 > 다 했어요,
+    같은 종류는 오래 기다린 순(이어서 볼 세션은 먼저 표시한 순)으로 하나를 고른다.
     없으면 가장 오래된 세션을 쉬는 모습으로 세우고 다른 상태를 요약해 이름표에 쓴다.
     """
     if not views:
         return None
-    attention = [v for v in views if v[1] in ATTENTION_ORDER]
+    marks = marks or {}
+
+    def rank(view):
+        sid, state, _ = view
+        if state in URGENT_STATES:
+            return ATTENTION_ORDER.index(state), sessions[sid]["ts"], sid
+        if sid in marks:
+            return ATTENTION_ORDER.index("marked"), marks[sid]["set_at"], sid
+        if state == "done":
+            return ATTENTION_ORDER.index("done"), sessions[sid]["ts"], sid
+        return None
+
+    attention = [(rank(v), v) for v in views if rank(v) is not None]
     if attention:
-        sid, state, bubble = min(attention, key=lambda v: (
-            ATTENTION_ORDER.index(v[1]), sessions[v[0]]["ts"], v[0]))
+        sid, state, bubble = min(attention)[1]
         return sid, state, bubble, len(attention) - 1, ""
     counts = Counter(state for _, state, _ in views)
     parts = [f"{STATE_LABELS[s]} {counts[s]}" for s in ("running", "background") if counts[s]]
     return views[0][0], "idle", "", 0, " · ".join(parts) or "모두 쉬는 중"
+
+
+# ---- 나중에 이어서 볼게 ------------------------------------------------------
+
+MARK_TEXT = "이어서 봐 주세요!"
+# 이 상태의 말풍선이 더 급해서 표시 말풍선으로 덮지 않는다 (책갈피만 단다)
+URGENT_STATES = ("waiting", "error")
+
+
+def marks_file():
+    return state_dir() / "reminders.json"
+
+
+def load_marks(path):
+    """표시한 세션들 {session_id: {"set_at": ms}}. 파일이 없거나 깨졌으면 빈 dict."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    marks = {}
+    for sid, mark in data.items():
+        set_at = mark.get("set_at") if isinstance(mark, dict) else None
+        if isinstance(set_at, int) and not isinstance(set_at, bool):
+            marks[sid] = {"set_at": set_at}
+    return marks
+
+
+def save_marks(path, marks):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(marks), encoding="utf-8")
+    tmp.replace(path)
+
+
+def active_marks(marks, sessions):
+    """세션이 끝났거나, 표시한 뒤 그 세션에 새 프롬프트가 왔으면(돌아와서 이어 했으면) 표시를 뺀다."""
+    return {sid: mark for sid, mark in marks.items()
+            if sid in sessions and sessions[sid].get("prompt_ts", 0) <= mark["set_at"]}
+
+
+def marked_bubble(state, bubble):
+    """표시한 세션의 말풍선 (문구, 말풍선 색 이름). 확인 필요·오류면 그 말풍선을 그대로 쓴다."""
+    if state in URGENT_STATES:
+        return bubble, state
+    return (f"{MARK_TEXT}\n{bubble}" if bubble else MARK_TEXT), "marked"

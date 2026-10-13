@@ -365,11 +365,64 @@ class FoldTest(unittest.TestCase):
         self.assertEqual(self.fold(*rows, ("f", "waiting", 9))[:2], ("f", "waiting"))
         self.assertEqual(self.fold(("a", "done", 1)), ("a", "done", "a-bubble", 0, ""))
 
+    def test_marked_session_comes_after_waiting_and_error(self):
+        rows = [("a", "done", 1), ("b", "running", 2), ("c", "idle", 3), ("d", "error", 4)]
+        sessions = {sid: session(state, age_ms=NOW - ts) for sid, state, ts in rows}
+        views = [(sid, state, f"{sid}-bubble") for sid, state, _ in rows]
+        marks = {"b": {"set_at": 9}, "c": {"set_at": 5}}
+        self.assertEqual(petcore.folded_view(views, sessions, marks)[:4], ("d", "error", "d-bubble", 3))
+        views = views[:3]  # 오류 세션이 없으면 먼저 표시한 c, 그다음 b, 마지막 다 했어요 a
+        self.assertEqual(petcore.folded_view(views, sessions, marks)[:4], ("c", "idle", "c-bubble", 2))
+        self.assertEqual(petcore.folded_view(views, sessions, {})[:4], ("a", "done", "a-bubble", 0))
+
     def test_summary_when_nothing_waits(self):
         rows = [("a", "idle", 1), ("b", "running", 2), ("c", "background", 3), ("d", "running", 4)]
         self.assertEqual(self.fold(*rows), ("a", "idle", "", 0, "작업 중 2 · 백그라운드 1"))
         self.assertEqual(self.fold(("a", "idle", 1)), ("a", "idle", "", 0, "모두 쉬는 중"))
         self.assertIsNone(petcore.folded_view([], {}))
+
+
+class MarkTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "reminders.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_save_and_load(self):
+        self.assertEqual(petcore.load_marks(self.path), {})  # 아직 없는 파일
+        petcore.save_marks(self.path, {"a": {"set_at": 5}})
+        self.assertEqual(petcore.load_marks(self.path), {"a": {"set_at": 5}})
+        self.path.write_text(json.dumps({"a": {"set_at": 5}, "b": {"set_at": "x"}, "c": 3, "d": {"set_at": True}}))
+        self.assertEqual(petcore.load_marks(self.path), {"a": {"set_at": 5}})
+        self.path.write_text("[1]")
+        self.assertEqual(petcore.load_marks(self.path), {})
+        self.path.write_text("{")
+        self.assertEqual(petcore.load_marks(self.path), {})
+
+    def test_mark_clears_on_new_prompt_or_session_end(self):
+        marks = {"kept": {"set_at": 100}, "prompted": {"set_at": 100}, "ended": {"set_at": 100}}
+        sessions = {"kept": {"prompt_ts": 90}, "prompted": {"prompt_ts": 150}, "other": {"prompt_ts": 0}}
+        self.assertEqual(petcore.active_marks(marks, sessions), {"kept": {"set_at": 100}})
+
+    def test_marked_bubble(self):
+        self.assertEqual(petcore.marked_bubble("idle", ""), ("이어서 봐 주세요!", "marked"))
+        self.assertEqual(petcore.marked_bubble("done", "다 했어요! (2분 13초)"),
+                         ("이어서 봐 주세요!\n다 했어요! (2분 13초)", "marked"))
+        # 확인 필요·오류는 그 말풍선이 더 급하다
+        self.assertEqual(petcore.marked_bubble("waiting", "확인이 필요해요!"), ("확인이 필요해요!", "waiting"))
+        self.assertEqual(petcore.marked_bubble("error", "오류로 멈췄어요"), ("오류로 멈췄어요", "error"))
+
+    def test_load_sessions_reads_prompt_time(self):
+        d = Path(self.tmp.name) / "state"
+        d.mkdir()
+        (d / "new.json").write_text(json.dumps({"state": "idle", "ts": 5, "prompt_ts": 3}))
+        (d / "old.json").write_text(json.dumps({"state": "idle", "ts": 5}))  # prompt_ts 를 남기기 전 hook
+        self.path.write_text(json.dumps({"x": {"set_at": 1}}))  # 같은 폴더의 표시 파일은 세션이 아니다
+        (d / "reminders.json").write_text(self.path.read_text())
+        sessions = petcore.load_sessions(d)
+        self.assertEqual({k: v["prompt_ts"] for k, v in sessions.items()}, {"new": 3, "old": 0})
 
 
 if __name__ == "__main__":
