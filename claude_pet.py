@@ -9,7 +9,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 
 왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인
 마우스 올림: 그 세션의 컨텍스트와 계정 5시간·주간 사용량 카드 (상태줄 중계 hooks/claude-pet-statusline.sh 필요)
-드래그: 줄 전체 이동 / 오른쪽 클릭: 이 세션의 펫(펫 다시 읽기), 크기, 접기, 자동 실행, 종료
+드래그: 줄 전체 이동 / 오른쪽 클릭: 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기, 자동 실행, 종료
 
 접기: 손이 필요한 세션(확인 필요 > 오류 > 다 했어요) 하나만 세우고 나머지 수는 배지로 단다.
 그런 세션이 없으면 가장 오래된 세션 펫에 상태 요약을 달고, 클릭하면 펼친다.
@@ -26,11 +26,12 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PIL import Image  # noqa: E402
-from PyQt5.QtCore import QFileSystemWatcher, QObject, QPoint, QRect, QRectF, Qt, QTimer  # noqa: E402
+from PyQt5.QtCore import QFileSystemWatcher, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer  # noqa: E402
 from PyQt5.QtDBus import QDBus, QDBusConnection, QDBusMessage  # noqa: E402
-from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QImage, QPainter,  # noqa: E402
+from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QIcon, QImage, QPainter,  # noqa: E402
                          QPainterPath, QPen, QPixmap, QPolygonF, QRegion)
-from PyQt5.QtWidgets import QAction, QActionGroup, QApplication, QMenu, QWidget  # noqa: E402
+from PyQt5.QtWidgets import (QAction, QActionGroup, QApplication, QCheckBox, QMenu,  # noqa: E402
+                             QProxyStyle, QStyle, QWidget, QWidgetAction)
 
 import petcore  # noqa: E402
 
@@ -51,6 +52,7 @@ BUBBLE_W_STEP = 16  # 경과 시간 글자 폭이 바뀔 때마다 옆 펫들이
 NAME_MAX_W = 130
 SUMMARY_MAX_W = 240  # 접힌 요약 펫의 이름표 ("작업 중 2 · 백그라운드 1")
 MAX_SAVED_ASSIGNMENTS = 100
+MENU_ICON_SIZE = 24
 DBUS_TIMEOUT_MS = 1000
 HOVER_DELAY_MS = 350  # 펫 위를 스쳐 지나갈 때는 카드를 띄우지 않는다
 CARD_PAD = 10
@@ -128,6 +130,31 @@ def load_frames(sprite_path, scale):
             for rect in petcore.frame_rects(name)
         ]
     return frames
+
+
+def load_icon(sprite_path):
+    """메뉴에 붙일 작은 그림: 쉬는 모습 첫 프레임에서 투명한 여백을 잘라낸다. 못 읽으면 빈 아이콘."""
+    try:
+        with Image.open(sprite_path) as im:
+            cell = im.crop((0, 0, petcore.CELL_W, petcore.CELL_H)).convert("RGBA")
+    except OSError:
+        return QIcon()
+    bbox = cell.getbbox()
+    if bbox:
+        cell = cell.crop(bbox)
+    image = QImage(cell.tobytes("raw", "RGBA"), cell.width, cell.height, cell.width * 4,
+                   QImage.Format_RGBA8888).copy()
+    return QIcon(QPixmap.fromImage(image).scaled(MENU_ICON_SIZE, MENU_ICON_SIZE, Qt.KeepAspectRatio,
+                                                 Qt.SmoothTransformation))
+
+
+class MenuIconStyle(QProxyStyle):
+    """메뉴 아이콘을 MENU_ICON_SIZE 로 키운다 (Qt5 QMenu 는 스타일시트의 icon-size 를 따르지 않는다)."""
+
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric == QStyle.PM_SmallIconSize:
+            return MENU_ICON_SIZE
+        return super().pixelMetric(metric, option, widget)
 
 
 class Desktop:
@@ -507,6 +534,8 @@ class PetManager(QObject):
         self.titles = petcore.TitleReader()
         self.pets = petcore.find_pets(PET_SEARCH_DIRS)
         self.frames_cache = {}
+        self.icon_cache = {}
+        self.menu_icon_style = MenuIconStyle()  # 메뉴보다 오래 살아야 해서 들고 있는다
         self.windows = {}  # session_id -> PetWindow
         self.order = []
         self.sessions = {}
@@ -551,6 +580,15 @@ class PetManager(QObject):
             return QPoint(*saved)
         return self.default_anchor()
 
+    def disabled_pets(self):
+        saved = self.config.get("disabled_pets")
+        return [p for p in saved if isinstance(p, str)] if isinstance(saved, list) else []
+
+    def enabled_pets(self):
+        """자동 배정과 '이 세션의 펫' 에 쓰는 켜진 펫들 (모두 꺼져 있으면 전체)."""
+        ids = petcore.enabled_pet_ids([p["id"] for p in self.pets], self.disabled_pets())
+        return [p for p in self.pets if p["id"] in ids]
+
     def save(self):
         if len(self.assignments) > MAX_SAVED_ASSIGNMENTS:
             keep = list(self.assignments.items())[-MAX_SAVED_ASSIGNMENTS:]
@@ -560,6 +598,11 @@ class PetManager(QObject):
         save_config(self.config)
 
     # ---- 펫 이미지 ---------------------------------------------------------
+
+    def pet_icon(self, pet):
+        if pet["id"] not in self.icon_cache:
+            self.icon_cache[pet["id"]] = load_icon(pet["sprite"])
+        return self.icon_cache[pet["id"]]
 
     def pet_frames(self, pet_id):
         """(frames, pet_size). 이미지가 없거나 깨졌으면 frames 는 None (대체 얼굴을 그린다)."""
@@ -595,7 +638,7 @@ class PetManager(QObject):
         views = petcore.session_views(sessions, now, self.acked)
         self.view_states = {sid: state for sid, state, _ in views}
         # 펫 배정은 접혀서 안 보이는 세션까지 해 둬야 펼쳤을 때 펫이 바뀌지 않는다
-        assigned = petcore.assign_pets([sid for sid, _, _ in views], [p["id"] for p in self.pets],
+        assigned = petcore.assign_pets([sid for sid, _, _ in views], [p["id"] for p in self.enabled_pets()],
                                        self.assignments)
         if any(self.assignments.get(sid) != pet for sid, pet in assigned.items()):
             self.assignments.update(assigned)
@@ -739,19 +782,41 @@ class PetManager(QObject):
         self.hide_card()
         menu = QMenu()
 
+        # 아이콘이 있는 체크 항목은 Qt 가 체크 표시 대신 아이콘 테두리로만 보여줘서,
+        # 지금 펫은 굵은 글씨와 ✓ 로 표시한다
         pet_menu = menu.addMenu("이 세션의 펫")
-        pet_group = QActionGroup(pet_menu)
+        pet_menu.setStyle(self.menu_icon_style)
         if not self.pets:
             pet_menu.addAction("펫 없음 (pets/, pets-downloaded/, ~/.codex/pets)").setEnabled(False)
         window = self.windows.get(sid)
-        for pet in self.pets:
-            action = QAction(pet["name"], pet_menu, checkable=True,
-                             checked=window is not None and pet["id"] == window.pet_id)
+        for pet in self.enabled_pets():
+            current = window is not None and pet["id"] == window.pet_id
+            action = QAction(self.pet_icon(pet), pet["name"] + ("  ✓" if current else ""), pet_menu)
+            if current:
+                font = action.font()
+                font.setBold(True)
+                action.setFont(font)
             action.triggered.connect(lambda _=False, pid=pet["id"]: self.choose_pet(sid, pid))
-            pet_group.addAction(action)
             pet_menu.addAction(action)
         pet_menu.addSeparator()
         pet_menu.addAction("펫 다시 읽기", self.reload_pets)
+
+        # 체크 상자 위젯은 눌러도 메뉴가 닫히지 않아 여러 펫을 연달아 켜고 끌 수 있다
+        toggle_menu = menu.addMenu("펫 켜고 끄기")
+        disabled = set(self.disabled_pets())
+        toggles = []
+        for pet in self.pets:
+            box = QCheckBox(pet["name"])
+            box.setIcon(self.pet_icon(pet))
+            box.setIconSize(QSize(MENU_ICON_SIZE, MENU_ICON_SIZE))
+            box.setChecked(pet["id"] not in disabled)
+            box.setStyleSheet("QCheckBox { padding: 3px 12px 3px 8px; }")
+            box.toggled.connect(lambda on, pid=pet["id"]: self.set_pet_enabled(pid, on, toggles))
+            item = QWidgetAction(toggle_menu)
+            item.setDefaultWidget(box)
+            toggle_menu.addAction(item)
+            toggles.append(box)
+        self.lock_last_enabled(toggles)
 
         size_menu = menu.addMenu("크기")
         size_group = QActionGroup(size_menu)
@@ -783,10 +848,30 @@ class PetManager(QObject):
             window.set_pet(pet_id, *self.pet_frames(pet_id))
             self.layout()
 
+    def set_pet_enabled(self, pet_id, enabled, toggles=()):
+        """펫을 켜거나 끈다. 끈 펫을 쓰던 세션은 refresh 에서 켜진 펫으로 다시 배정된다."""
+        disabled = set(self.disabled_pets())
+        if enabled:
+            disabled.discard(pet_id)
+        else:
+            disabled.add(pet_id)
+        self.config["disabled_pets"] = sorted(disabled)
+        self.save()
+        self.lock_last_enabled(toggles)
+        self.refresh()
+
+    @staticmethod
+    def lock_last_enabled(toggles):
+        """켜진 펫이 하나만 남으면 그 체크 상자는 끌 수 없게 흐리게 한다."""
+        last_one = sum(box.isChecked() for box in toggles) <= 1
+        for box in toggles:
+            box.setEnabled(not (last_one and box.isChecked()))
+
     def reload_pets(self):
         """펫 폴더를 다시 읽는다. 새로 넣거나 고친 펫을 앱을 다시 켜지 않고 볼 수 있다."""
         self.pets = petcore.find_pets(PET_SEARCH_DIRS)
         self.frames_cache.clear()
+        self.icon_cache.clear()
         for window in self.windows.values():
             window.has_pet = False  # refresh 에서 이미지를 새로 읽는다
         self.refresh()

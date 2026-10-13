@@ -283,6 +283,12 @@ def session_views(sessions, now_ms, acked=None):
     return views
 
 
+def enabled_pet_ids(pet_ids, disabled):
+    """켜진 펫 id 들 (순서 유지). 모두 꺼져 있으면 펫이 사라지지 않게 전체를 돌려준다."""
+    disabled = set(disabled or ())
+    return [p for p in pet_ids if p not in disabled] or list(pet_ids)
+
+
 def assign_pets(session_ids, pet_ids, assignments):
     """세션마다 펫을 정한다. 기존 배정은 유지하고, 새 세션은 지금 가장 적게 쓰인 펫을 받는다.
 

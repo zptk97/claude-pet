@@ -190,6 +190,17 @@ class AssignTest(unittest.TestCase):
             counts[pet] = counts.get(pet, 0) + 1
         self.assertEqual(sorted(counts.values()), [2, 2, 3])
 
+    def test_enabled_pet_ids(self):
+        self.assertEqual(petcore.enabled_pet_ids(self.PETS, ["dog", "deleted-pet"]), ["cat", "fox"])
+        self.assertEqual(petcore.enabled_pet_ids(self.PETS, None), self.PETS)
+        self.assertEqual(petcore.enabled_pet_ids(self.PETS, self.PETS), self.PETS)  # 모두 꺼지면 전체
+        self.assertEqual(petcore.enabled_pet_ids([], ["cat"]), [])
+
+    def test_disabled_pet_is_reassigned(self):
+        enabled = petcore.enabled_pet_ids(self.PETS, ["fox"])
+        result = petcore.assign_pets(["a", "b"], enabled, {"a": "fox", "b": "cat"})
+        self.assertEqual(result, {"a": "dog", "b": "cat"})
+
     def test_deterministic_and_empty(self):
         self.assertEqual(petcore.assign_pets(["x", "y"], self.PETS, {}),
                          petcore.assign_pets(["x", "y"], self.PETS, {}))
