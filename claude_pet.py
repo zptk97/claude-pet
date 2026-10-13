@@ -26,7 +26,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PIL import Image  # noqa: E402
-from PyQt5.QtCore import QFileSystemWatcher, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer  # noqa: E402
+from PyQt5.QtCore import (QFileSystemWatcher, QObject, QPoint, QRect, QRectF, QSize, Qt,  # noqa: E402
+                          QTimer, pyqtSlot)
 from PyQt5.QtDBus import QDBus, QDBusConnection, QDBusMessage  # noqa: E402
 from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QIcon, QImage, QPainter,  # noqa: E402
                          QPainterPath, QPen, QPixmap, QPolygonF, QRegion)
@@ -200,6 +201,14 @@ class Desktop:
             return False
         args = self._call(*self.EXTENSION, "ActivateWindow", title)
         return bool(args) and int(args[0]) > 0
+
+    def watch_clicks(self, enabled):
+        """켜 두면 화면 어디를 누르든 확장이 Clicked(x, y) 신호로 알려 준다. 예전 확장이거나 없으면 아무 일 없다."""
+        self._call(*self.EXTENSION, "WatchClicks", bool(enabled))
+
+    def connect_clicked(self, slot):
+        service, path, interface = self.EXTENSION
+        return self.bus.connect(service, path, interface, "Clicked", slot)
 
 
 class PetWindow(QWidget):
@@ -554,6 +563,9 @@ class PetManager(QObject):
         self.dragged = False
         self.warned_extension = False
 
+        # XWayland 메뉴는 다른 창 클릭을 받지 못해서, 메뉴가 열린 동안 확장이 알려 주는 클릭으로 닫는다
+        self.desktop.connect_clicked(self.on_screen_click)
+
         self.watcher = QFileSystemWatcher([str(self.state_dir)], self)
         self.watcher.directoryChanged.connect(self.refresh)
         self.tick = QTimer(self, interval=1000, timeout=self.refresh)
@@ -836,7 +848,28 @@ class PetManager(QObject):
         autostart.triggered.connect(self.set_autostart)
         menu.addAction(autostart)
         menu.addAction("종료", QApplication.quit)
-        menu.exec_(pos)
+        self.desktop.watch_clicks(True)
+        try:
+            menu.exec_(pos)
+        finally:
+            self.desktop.watch_clicks(False)
+
+    @pyqtSlot(QDBusMessage)
+    def on_screen_click(self, message):
+        """메뉴가 열린 동안 메뉴·펫 밖을 누르면 메뉴를 닫는다 (메뉴·펫 위 클릭은 Qt 가 처리한다)."""
+        args = message.arguments()
+        if len(args) != 2 or QApplication.activePopupWidget() is None:
+            return
+        point = QPoint(int(args[0]), int(args[1]))
+        for widget in QApplication.topLevelWidgets():
+            if (widget.isVisible() and isinstance(widget, (QMenu, PetWindow))
+                    and widget.geometry().contains(point)):
+                return
+        for _ in range(10):  # 하위 메뉴까지 차례로 닫는다
+            popup = QApplication.activePopupWidget()
+            if popup is None:
+                break
+            popup.close()
 
     def choose_pet(self, sid, pet_id):
         self.pets = petcore.find_pets(PET_SEARCH_DIRS)  # 새로 받은 펫도 보이게

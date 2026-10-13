@@ -25,7 +25,7 @@ petcore.py         Qt 없는 로직: 상태 계산, 말풍선 문구, 펫 배정
 hooks/
   claude-pet-hook.sh        Claude Code hook → 세션별 상태 파일, 새 세션에서 펫 자동 실행
   claude-pet-statusline.sh  상태줄 중계 → 컨텍스트·사용량 파일 (원래 상태줄 출력은 그대로)
-gnome-extension/claude-pet-focus@claude-pet/   펫 클릭 시 창을 올려 주는 GNOME Shell 확장
+gnome-extension/claude-pet-focus@claude-pet/   펫 클릭 시 창 올리기, 메뉴 밖 클릭 알리기 (GNOME Shell 확장)
 pets/              직접 만든 펫
 pets-downloaded/   Petdex 등에서 받은 펫 (git 제외)
 tools/             펫 만들기 도구 (docs/making-pets.md)
@@ -59,6 +59,10 @@ install.sh         설치·점검
    ```bash
    gnome-extensions enable claude-pet-focus@claude-pet   # 다시 로그인한 뒤
    ```
+
+   확장이 없으면 펫 클릭으로 창을 올리지 못하고, 펫 메뉴도 다른 창을 눌러서는 닫히지 않는다
+   (GNOME 은 XWayland 창이 화면 전체 클릭을 잡지 못하게 막아서, 확장이 클릭 위치를 알려 준다).
+   확장 코드를 바꾼 뒤에도 다시 로그인해야 새 코드가 적용된다.
 
 5. 새 Claude Code 세션을 열면 펫이 뜬다. 직접 띄우려면 `python3 ~/.claude/pet/claude_pet.py`.
 
