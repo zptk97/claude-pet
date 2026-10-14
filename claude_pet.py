@@ -2,6 +2,7 @@
 """Claude Code 세션마다 펫을 한 마리씩 바탕화면 위에 띄운다 (Codex 펫 형식 스프라이트).
 
 hooks/claude-pet-hook.sh 가 쓰는 세션별 상태 파일을 감시해 펫의 애니메이션과 말풍선을 바꾼다.
+작업 중 말풍선 첫 줄에는 Claude 가 마지막으로 남긴 말이나 생각을 Haiku(claude -p)로 한 줄 요약해 둔다 (메뉴에서 끌 수 있다).
 펫들은 처음 생긴 세션부터 오른쪽 아래에서 왼쪽으로 한 줄로 선다.
 GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWayland(xcb)로 띄운다.
 
@@ -10,7 +11,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인
 마우스 올림: 그 세션의 컨텍스트와 계정 5시간·주간 사용량 카드 (상태줄 중계 hooks/claude-pet-statusline.sh 필요)
 드래그: 줄 전체 이동 / 오른쪽 클릭: 나중에 이어서 볼게, 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기,
-자동 실행, 종료
+작업 요약 켜고 끄기, 자동 실행, 종료
 
 나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
 그 펫을 클릭해 돌아가거나, 그 세션에 새 프롬프트를 보내거나, 표시 지우기를 누르면 풀린다.
@@ -22,6 +23,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 import fcntl
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -30,7 +32,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PIL import Image  # noqa: E402
-from PyQt5.QtCore import (QFileSystemWatcher, QObject, QPoint, QRect, QRectF, QSize, Qt,  # noqa: E402
+from PyQt5.QtCore import (QFileSystemWatcher, QObject, QPoint, QProcess, QRect, QRectF, QSize, Qt,  # noqa: E402
                           QTimer, pyqtSlot)
 from PyQt5.QtDBus import QDBus, QDBusConnection, QDBusMessage  # noqa: E402
 from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QIcon, QImage, QPainter,  # noqa: E402
@@ -64,6 +66,8 @@ CARD_PAD = 10
 CARD_BAR_W = 90
 CARD_BAR_H = 8
 CARD_TITLE_MAX_W = 320
+GIST_TIMEOUT_MS = 30_000
+GIST_MAX_FAILURES = 3  # 요약이 연달아 이만큼 실패하면 (로그인 문제 등) 다시 시도하지 않는다
 
 # 상태별 말풍선 (배경, 테두리)
 BUBBLE_COLORS = {
@@ -555,6 +559,91 @@ class UsageCard(QWidget):
             painter.drawText(x, y + 2 + QFontMetrics(self.note_font).ascent(), note)
 
 
+class Gister(QObject):
+    """Claude 가 남긴 말이나 생각을 Haiku(claude -p)로 한 줄 요약한다. 세션마다 요청은 하나만 돌리고,
+    도는 동안 새 말이 오면 끝난 뒤 가장 새 말만 이어서 요약한다. 요약이 오면 on_done() 을 부른다."""
+
+    def __init__(self, parent, on_done):
+        super().__init__(parent)
+        self.on_done = on_done
+        self.claude = shutil.which("claude") or str(Path("~/.local/bin/claude").expanduser())
+        self.gists = {}    # session_id -> (말, 요약). 요약이 실패했으면 요약은 ""
+        self.running = {}  # session_id -> (QProcess, 말)
+        self.wanted = {}   # session_id -> 다음에 요약할 가장 새 말
+        self.failures = 0
+        self.stopped = False
+        self.enabled = True  # 메뉴에서 끄면 Haiku 를 부르지 않고 말의 끝 문장만 보여준다
+
+    def gist(self, sid, said):
+        """지금 보여줄 요약. 새 말이면 요약을 요청하고, 올 때까지는 지난 요약(없으면 말의 끝 문장)을 보여준다."""
+        if not said:
+            self.gists.pop(sid, None)
+            self.wanted.pop(sid, None)
+            return ""
+        last = self.gists.get(sid)
+        if last and last[0] == said:
+            return last[1] or petcore.gist_fallback(said)
+        if self.stopped or not self.enabled or not petcore.needs_gist(said):
+            return petcore.gist_fallback(said)
+        self.wanted[sid] = said
+        self.start(sid)
+        return last[1] if last and last[1] else petcore.gist_fallback(said)
+
+    def forget(self, sids):
+        """sids 에 없는(끝난) 세션의 요약을 버린다. 돌고 있는 요청은 끝나게 둔다."""
+        for table in (self.gists, self.wanted):
+            for sid in [s for s in table if s not in sids]:
+                del table[sid]
+
+    def start(self, sid):
+        if self.stopped or sid in self.running or sid not in self.wanted:
+            return
+        said = self.wanted.pop(sid)
+        args, stdin = petcore.gist_command(said, self.claude)
+        proc = QProcess(self)
+        proc.setProgram(args[0])
+        proc.setArguments(args[1:])
+        proc.setWorkingDirectory(str(Path.home()))
+        proc.started.connect(lambda: (proc.write(stdin.encode("utf-8")), proc.closeWriteChannel()))
+        proc.finished.connect(lambda code, status: self.finished(sid, code, status))
+        proc.errorOccurred.connect(lambda error: self.failed_to_start(sid, error))
+        QTimer(proc, singleShot=True, interval=GIST_TIMEOUT_MS, timeout=proc.kill).start()
+        self.running[sid] = (proc, said)
+        proc.start()
+
+    def finished(self, sid, code, status):
+        proc, said = self.running.pop(sid)
+        gist = ""
+        if status == QProcess.NormalExit and code == 0:
+            gist = petcore.clean_gist(bytes(proc.readAllStandardOutput()).decode("utf-8", "replace"))
+        if gist:
+            self.failures = 0
+        else:
+            err = " ".join(bytes(proc.readAllStandardError()).decode("utf-8", "replace").split())
+            print(f"claude-pet: 요약 실패 (exit {code}): {err[-300:]}", file=sys.stderr)
+            self.failures += 1
+            if self.failures >= GIST_MAX_FAILURES:
+                self.stop(f"요약이 {self.failures}번 연달아 실패함")
+        self.gists[sid] = (said, gist)
+        proc.deleteLater()
+        self.start(sid)
+        self.on_done()
+
+    def failed_to_start(self, sid, error):
+        if error != QProcess.FailedToStart:  # 그 밖의 오류는 finished 로 온다
+            return
+        proc, said = self.running.pop(sid)
+        self.gists[sid] = (said, "")
+        proc.deleteLater()
+        self.stop(f"요약용 claude 를 띄우지 못함: {self.claude}")
+
+    def stop(self, reason):
+        """요약을 끈다. 말풍선에는 Claude 가 남긴 말의 끝 문장을 보여준다."""
+        self.stopped = True
+        self.wanted.clear()
+        print(f"claude-pet: {reason}. 요약을 끄고 말의 끝 문장을 보여줍니다.", file=sys.stderr)
+
+
 class PetManager(QObject):
     """상태 파일을 읽어 세션마다 PetWindow 를 만들고 지우며, 한 줄로 세운다."""
 
@@ -563,7 +652,9 @@ class PetManager(QObject):
         self.config = load_config()
         self.state_dir = petcore.state_dir()
         self.desktop = Desktop()
-        self.titles = petcore.TitleReader()
+        self.transcripts = petcore.TranscriptReader()
+        self.gister = Gister(self, self.refresh)
+        self.gister.enabled = self.gist_enabled()
         self.pets = petcore.find_pets(PET_SEARCH_DIRS)
         self.frames_cache = {}
         self.icon_cache = {}
@@ -600,6 +691,9 @@ class PetManager(QObject):
 
     def folded(self):
         return self.config.get("folded") is True
+
+    def gist_enabled(self):
+        return self.config.get("gist") is not False
 
     def scale(self):
         value = self.config.get("scale")
@@ -675,7 +769,14 @@ class PetManager(QObject):
             self.marks = marks
             self.save_marks()
 
-        views = petcore.session_views(sessions, now, self.acked)
+        # 작업 중인 세션은 Claude 가 마지막으로 남긴 말이나 생각의 요약을 말풍선 첫 줄에 둔다
+        gists = {}
+        for sid, session in sessions.items():
+            if petcore.effective_state(session, now, self.acked.get(sid)) == "running":
+                _, said = self.transcripts.read(session.get("transcript"))
+                gists[sid] = self.gister.gist(sid, said)
+        self.gister.forget(sessions)
+        views = petcore.session_views(sessions, now, self.acked, gists)
         self.view_states = {sid: state for sid, state, _ in views}
         # 펫 배정은 접혀서 안 보이는 세션까지 해 둬야 펼쳤을 때 펫이 바뀌지 않는다
         assigned = petcore.assign_pets([sid for sid, _, _ in views], [p["id"] for p in self.enabled_pets()],
@@ -715,7 +816,7 @@ class PetManager(QObject):
             if not window.has_pet or window.pet_id != pet_id:
                 window.set_pet(pet_id, *self.pet_frames(pet_id))
                 needs_layout = True
-            title = self.titles.title(session.get("transcript")) or petcore.session_name(session)
+            title = self.transcripts.read(session.get("transcript"))[0] or petcore.session_name(session)
             self.titles_by_sid[sid] = title
             name, name_max_w = (summaries[sid], SUMMARY_MAX_W) if sid in summaries else (title, NAME_MAX_W)
             marked = sid in self.marks
@@ -880,6 +981,9 @@ class PetManager(QObject):
         fold.triggered.connect(self.set_folded)
         menu.addAction(fold)
         menu.addAction("줄 위치 처음으로", self.reset_anchor)
+        gist = QAction("작업 요약 (Haiku 로 말풍선 요약)", menu, checkable=True, checked=self.gist_enabled())
+        gist.triggered.connect(self.set_gist)
+        menu.addAction(gist)
         menu.addSeparator()
         autostart = QAction("새 Claude 세션에서 자동 실행", menu, checkable=True,
                             checked=not DISABLED_FLAG.exists())
@@ -975,6 +1079,12 @@ class PetManager(QObject):
     def set_folded(self, folded):
         self.config["folded"] = bool(folded)
         self.hide_card()
+        self.save()
+        self.refresh()
+
+    def set_gist(self, enabled):
+        self.config["gist"] = bool(enabled)
+        self.gister.enabled = bool(enabled)
         self.save()
         self.refresh()
 

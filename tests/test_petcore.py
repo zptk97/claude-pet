@@ -20,6 +20,22 @@ def session(state, age_ms=0, since_ago_ms=None, cwd="/home/u/rc_sw", tool="", cr
             "created": created if created is not None else ts}
 
 
+def entry_line(entry):
+    """기록 파일 한 줄 (Claude Code 처럼 공백 없이 쓴다)."""
+    return json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+
+
+def said_line(text, sidechain=False):
+    """기록 파일에서 Claude 가 남긴 말 한 줄."""
+    return entry_line({"type": "assistant", "isSidechain": sidechain,
+                       "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+
+
+def prompt_line(text):
+    """기록 파일에서 사용자가 보낸 프롬프트 한 줄."""
+    return entry_line({"type": "user", "message": {"role": "user", "content": text}})
+
+
 class AtlasTest(unittest.TestCase):
     def test_row_frame_counts_match_codex_spec(self):
         counts = [len(petcore.ANIMATIONS[name][1]) for name in sorted(
@@ -134,6 +150,15 @@ class TextTest(unittest.TestCase):
         for s, state, expected in cases:
             self.assertEqual(petcore.status_text(s, state, NOW), expected)
 
+    def test_running_text_puts_gist_first(self):
+        s = session("running", since_ago_ms=83_000, tool="Bash")
+        self.assertEqual(petcore.status_text(s, "running", NOW, "NYU 로봇 실행 시작"),
+                         "NYU 로봇 실행 시작\nBash 실행 중 · 1분 23초")
+        self.assertEqual(petcore.status_text(session("waiting"), "waiting", NOW, "무시됨"), "확인이 필요해요!")
+        sessions = {"a": s}
+        self.assertEqual(petcore.session_views(sessions, NOW, gists={"a": "요약"})[0][2],
+                         "요약\nBash 실행 중 · 1분 23초")
+
     def test_background_texts(self):
         def bg(tasks, desc="", crons=0):
             return {**session("background", since_ago_ms=754_000),
@@ -238,25 +263,56 @@ class FilesTest(unittest.TestCase):
         pets = petcore.find_pets([self.root / "a", self.root / "b"])
         self.assertEqual([p["name"] for p in pets], ["First"])
 
-    def test_title_reader_follows_appends(self):
+    def test_transcript_title_follows_appends(self):
         path = self.root / "t.jsonl"
-        reader = petcore.TitleReader()
-        self.assertEqual(reader.title(str(path)), "")  # 아직 없는 파일
+        reader = petcore.TranscriptReader()
+        self.assertEqual(reader.read(str(path)), ("", ""))  # 아직 없는 파일
         path.write_text('{"type":"user"}\n{"type":"ai-title","aiTitle":"첫 제목"}\n{"type":"assi')
-        self.assertEqual(reader.title(str(path)), "첫 제목")
+        self.assertEqual(reader.read(str(path))[0], "첫 제목")
         with path.open("a") as f:  # 반쯤 쓰인 줄이 이어서 완성된다
             f.write('stant"}\n{"type":"ai-title","aiTitle":"새 제목"}\nnot json "aiTitle"\n')
-        self.assertEqual(reader.title(str(path)), "새 제목")
+        self.assertEqual(reader.read(str(path))[0], "새 제목")
         path.write_text('{"aiTitle":"다시"}\n')  # 더 짧게 새로 쓰였다
-        self.assertEqual(reader.title(str(path)), "다시")
-        self.assertEqual(reader.title(""), "")
+        self.assertEqual(reader.read(str(path))[0], "다시")
+        self.assertEqual(reader.read(""), ("", ""))
 
-    def test_title_reader_reads_in_chunks(self):
+    def test_transcript_reads_in_chunks(self):
         path = self.root / "big.jsonl"
-        path.write_text("x" * 50 + "\n" + '{"aiTitle":"끝"}\n')
-        reader = petcore.TitleReader()
+        path.write_text("x" * 50 + "\n" + '{"aiTitle":"끝"}\n' + said_line("말도 끝") + "\n")
+        reader = petcore.TranscriptReader()
         reader.CHUNK = 7  # 줄이 여러 조각으로 나뉘어도 맞게 읽는지
-        self.assertEqual(reader.title(str(path)), "끝")
+        self.assertEqual(reader.read(str(path)), ("끝", "말도 끝"))
+
+    def test_transcript_said_is_last_text_of_this_turn(self):
+        path = self.root / "s.jsonl"
+        reader = petcore.TranscriptReader()
+
+        def append(*lines):
+            with path.open("a") as f:
+                f.write("".join(line + "\n" for line in lines))
+            return reader.read(str(path))[1]
+
+        self.assertEqual(append(prompt_line("해 줘"), said_line("문서를 고칩니다.")), "문서를 고칩니다.")
+        # 도구 호출, 도구 결과(안에 text 가 있어도), 빈 생각, 서브에이전트의 말은 바꾸지 않는다
+        self.assertEqual(append(
+            entry_line({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "echo '\"type\":\"text\"'"}}]}}),
+            entry_line({"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": [{"type": "text", "text": "결과"}]}]}}),
+            entry_line({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "", "signature": "x"}]}}),
+            said_line("서브에이전트의 말", sidechain=True),
+        ), "문서를 고칩니다.")
+        # 말 없이 생각만 남겨도 따라간다
+        self.assertEqual(append(entry_line({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "테스트 로그를 확인해야겠다", "signature": "x"}]}})),
+            "테스트 로그를 확인해야겠다")
+        self.assertEqual(append(said_line("로봇 실행을 시작합니다.")), "로봇 실행을 시작합니다.")
+        # 턴이 끝나도 남긴다 (턴이 끝난 뒤 백그라운드 서브에이전트가 일하면 그 말이 지금 하는 일이다)
+        self.assertEqual(append(said_line("서브에이전트 셋이 기록을 읽고 있어요."), entry_line(
+            {"type": "system", "subtype": "turn_duration", "durationMs": 5})), "서브에이전트 셋이 기록을 읽고 있어요.")
+        # 새 프롬프트가 오면 지운다
+        self.assertEqual(append(prompt_line("다른 일")), "")
 
     def test_load_sessions_skips_bad_files(self):
         d = self.root / "state"
@@ -269,6 +325,40 @@ class FilesTest(unittest.TestCase):
         sessions = petcore.load_sessions(d)
         self.assertEqual(list(sessions), ["good"])
         self.assertEqual((sessions["good"]["since"], sessions["good"]["created"]), (1, 5))
+
+
+class GistTest(unittest.TestCase):
+    def test_short_said_is_shown_as_is(self):
+        self.assertFalse(petcore.needs_gist("**테스트**를 돌립니다."))
+        self.assertEqual(petcore.gist_fallback("**테스트**를 돌립니다."), "테스트를 돌립니다.")
+
+    def test_fallback_is_last_sentence(self):
+        said = ("문서를 고쳤습니다. 이제 로봇이 비었으니 `NYU` 100장 로봇 실행을 시작합니다.\n"
+                "- 남은 시간은 약 10분입니다.")
+        self.assertTrue(petcore.needs_gist(said))
+        self.assertEqual(petcore.gist_fallback(said), "남은 시간은 약 10분입니다.")
+        long_sentence = "로봇 NYU 100장 실행은 약 10분 남았고 PC ADE 2,000장 평가는 좀 더 지켜보겠습니다."
+        self.assertEqual(len(petcore.gist_fallback(long_sentence)), petcore.GIST_MAX)
+        self.assertTrue(petcore.gist_fallback(long_sentence).endswith("…"))
+
+    def test_clean_gist(self):
+        self.assertEqual(petcore.clean_gist('\n "NYU 100장 로봇 실행 시작."\n'), "NYU 100장 로봇 실행 시작")
+        self.assertEqual(petcore.clean_gist("`--effort low` 옵션으로 재실험 중"), "--effort low 옵션으로 재실험 중")
+        self.assertEqual(petcore.clean_gist("파일 내용 확인 중\n\n<invoke name=\"bash\">"), "파일 내용 확인 중")
+        self.assertEqual(petcore.clean_gist('<invoke name="bash">'), "")
+        self.assertEqual(petcore.clean_gist("  \n"), "")
+        self.assertEqual(len(petcore.clean_gist("가" * 50)), petcore.GIST_MAX)
+
+    def test_gist_command_keeps_hooks_and_history_off(self):
+        args, stdin = petcore.gist_command("말" * 2000, "/bin/claude")
+        self.assertEqual(args[:2], ["/bin/claude", "-p"])
+        self.assertEqual(args[args.index("--setting-sources") + 1], "")  # 사용자 설정(훅)을 읽지 않는다
+        self.assertEqual(json.loads(args[args.index("--settings") + 1]), {"disableAllHooks": True})
+        self.assertEqual(args[args.index("--tools") + 1], "")
+        for flag in ("--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--model") + 1], "haiku")
+        self.assertEqual(stdin, "<말>" + "말" * petcore.GIST_INPUT_MAX + "</말>")  # 긴 말은 끝부분만
 
 
 class UsageTest(unittest.TestCase):
