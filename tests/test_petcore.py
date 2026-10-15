@@ -515,5 +515,63 @@ class MarkTest(unittest.TestCase):
         self.assertEqual({k: v["prompt_ts"] for k, v in sessions.items()}, {"new": 3, "old": 0})
 
 
+
+def drag(shake, xs, start_ms=0, step_ms=16):
+    """커서를 xs 를 따라 step_ms 간격으로 옮긴다. 마지막 시각(ms)을 돌려준다."""
+    t = start_ms
+    for x in xs:
+        shake.add(x, t)
+        t += step_ms
+    return t - step_ms
+
+
+class PlayTest(unittest.TestCase):
+    def test_turns_need_real_swings(self):
+        shake = petcore.Shake()
+        drag(shake, [0, 5, -5, 8, -3, 2])  # 손 떨림
+        self.assertEqual(shake.turns, [])
+        shake = petcore.Shake()
+        swing = list(range(0, 61, 10)) + list(range(50, -1, -10))
+        now = drag(shake, swing * 3)  # 0→60→0 을 세 번: 오른쪽·왼쪽 바꾸기가 다섯 번
+        self.assertEqual(len(shake.turns), 5)
+        self.assertEqual(shake.recent(now), 5)
+        self.assertEqual(shake.recent(now + petcore.SHAKE_WINDOW_MS + 200), 0)  # 흔들기를 멈추면 가라앉는다
+        self.assertEqual(shake.most, 5)  # 놓을 때 쓰는 가장 세게 흔든 정도는 남는다
+
+    def test_held_pose(self):
+        shake = petcore.Shake()
+        self.assertEqual(petcore.held_pose(shake, 0), ("jumping", None))
+        now = drag(shake, range(0, 100, 10))
+        self.assertEqual(petcore.held_pose(shake, now), ("running-right", None))
+        self.assertEqual(petcore.held_pose(shake, now + petcore.HEADING_MS + 1), ("jumping", None))  # 멈추면 매달린다
+        now = drag(shake, range(90, 0, -10), now + 16)
+        self.assertEqual(petcore.held_pose(shake, now), ("running-left", None))
+        now = drag(shake, (list(range(0, 61, 10)) + list(range(50, -1, -10))) * 3, now + 16)
+        self.assertEqual(petcore.held_pose(shake, now), ("failed", "어지러워요!"))
+
+    def test_release_reaction(self):
+        gentle = petcore.Shake()
+        drag(gentle, range(0, 100, 10))
+        self.assertEqual(petcore.release_reaction(gentle)[:2], ("waving", "또 해 주세요!"))
+        rough = petcore.Shake()
+        now = drag(rough, (list(range(0, 61, 10)) + list(range(50, -1, -10))) * 3)
+        rough.add(0, now + 5000)  # 한참 들고 있다가 놓아도 세게 흔든 건 기억한다
+        self.assertEqual(petcore.release_reaction(rough)[:2], ("failed", "흑흑…"))
+
+
+class LayoutTest(unittest.TestCase):
+    SIZES = {"a": (100, 150), "b": (120, 200), "c": (80, 150)}
+
+    def test_row_from_anchor_to_the_left(self):
+        spots = petcore.layout_spots(["a", "b", "c"], self.SIZES, (1000, 700), 6)
+        self.assertEqual(spots, {"a": (900, 550), "b": (774, 500), "c": (688, 550)})
+
+    def test_moved_pet_stands_on_its_foot_and_leaves_the_row(self):
+        spots = petcore.layout_spots(["a", "b", "c"], self.SIZES, (1000, 700), 6, {"a": [300, 400]})
+        self.assertEqual(spots["a"], (250, 250))  # 발밑 가운데가 (300, 400)
+        self.assertEqual(spots["b"], (880, 500))  # 안 옮긴 펫들이 줄 오른쪽 끝부터 빈칸을 채운다
+        self.assertEqual(spots["c"], (794, 550))
+
+
 if __name__ == "__main__":
     unittest.main()

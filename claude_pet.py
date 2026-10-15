@@ -10,7 +10,8 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 
 왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인
 마우스 올림: 그 세션의 컨텍스트와 계정 5시간·주간 사용량 카드 (상태줄 중계 hooks/claude-pet-statusline.sh 필요)
-드래그: 줄 전체 이동 / 오른쪽 클릭: 나중에 이어서 볼게, 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기,
+드래그: 줄 전체 이동 (펫 따로 움직이기를 켜면 그 펫만) / 휠 버튼 드래그: 펫을 들고 흔들기, 놓으면 자리로 돌아와 웃거나 운다
+오른쪽 클릭: 나중에 이어서 볼게, 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기, 펫 따로 움직이기,
 작업 요약 켜고 끄기, 자동 실행, 종료
 
 나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
@@ -32,8 +33,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PIL import Image  # noqa: E402
-from PyQt5.QtCore import (QFileSystemWatcher, QObject, QPoint, QProcess, QRect, QRectF, QSize, Qt,  # noqa: E402
-                          QTimer, pyqtSlot)
+from PyQt5.QtCore import (QAbstractAnimation, QEasingCurve, QFileSystemWatcher, QObject, QPoint,  # noqa: E402
+                          QProcess, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, pyqtSlot)
 from PyQt5.QtDBus import QDBus, QDBusConnection, QDBusMessage  # noqa: E402
 from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QIcon, QImage, QPainter,  # noqa: E402
                          QPainterPath, QPen, QPixmap, QPolygonF, QRegion)
@@ -67,6 +68,8 @@ CARD_BAR_W = 90
 CARD_BAR_H = 8
 CARD_TITLE_MAX_W = 320
 GIST_TIMEOUT_MS = 30_000
+RETURN_MS = 450    # 휠로 들었다 놓은 펫이 자리로 돌아가는 시간
+HELD_TICK_MS = 100  # 들고 가만히 있어도 이 간격으로 동작(버둥거림·어지러움)을 다시 고른다
 GIST_MAX_FAILURES = 3  # 요약이 연달아 이만큼 실패하면 (로그인 문제 등) 다시 시도하지 않는다
 
 # 상태별 말풍선 (배경, 테두리)
@@ -242,7 +245,8 @@ class PetWindow(QWidget):
         self.frames = None
         self.pet_size = (0, 0)
         self.state = "idle"
-        self.bubble = ""
+        self.bubble = ""  # 보이는 말풍선 (장난치는 동안은 play_bubble, 아니면 status_bubble)
+        self.status_bubble = ""
         self.name = ""
         self.badge = ""  # 접혔을 때 뒤에 기다리는 세션 수 (+2)
         self.bubble_style = "idle"  # 말풍선 색 (보통 상태와 같고, 나중에 이어서 볼 세션이면 marked)
@@ -253,6 +257,18 @@ class PetWindow(QWidget):
         self.oneshot = None  # 한 번만 재생하고 상태 애니메이션으로 돌아갈 것 (클릭 시 점프)
         self.frame_index = 0
         self.anim_timer = QTimer(self, singleShot=True, timeout=self.next_frame)
+
+        # 휠로 들고 장난치기
+        self.play_animation = None  # 장난치는 동안의 동작 (상태 애니메이션보다 앞선다)
+        self.play_bubble = None     # 장난치는 동안의 말풍선 (None 이면 상태 말풍선)
+        self.held = None            # 들고 있으면 [커서와 펫 왼쪽 위의 차이, petcore.Shake, 마지막 커서 자리]
+        self.reaction = None        # 놓은 뒤 자리로 돌아와서 할 (동작, 말풍선, ms)
+        self.home = QPoint()        # 줄이나 따로 놓은 자리 (창 왼쪽 위)
+        self.back = QPropertyAnimation(self, b"pos", self, duration=RETURN_MS,
+                                       easingCurve=QEasingCurve(QEasingCurve.OutBack))
+        self.back.finished.connect(self.react)
+        self.held_timer = QTimer(self, interval=HELD_TICK_MS, timeout=self.follow)
+        self.react_timer = QTimer(self, singleShot=True, timeout=self.end_play)
 
         self.pet_rect = self.bubble_rect = self.name_rect = self.badge_rect = QRect()
         self.set_animation(petcore.STATE_ANIMATION[self.state])
@@ -277,13 +293,21 @@ class PetWindow(QWidget):
             self.bubble_style, self.marked = look
             self.update()
         view = (bubble, name, badge, name_max_w)
-        if view == (self.bubble, self.name, self.badge, self.name_max_w):
+        if view == (self.status_bubble, self.name, self.badge, self.name_max_w):
             return False
-        self.bubble, self.name, self.badge, self.name_max_w = view
+        self.status_bubble, self.name, self.badge, self.name_max_w = view
+        return self.refit()
+
+    def refit(self):
+        """보일 말풍선을 정하고 창 크기를 다시 잰다. 크기가 바뀌었으면 True (줄을 다시 세워야 한다)."""
+        self.bubble = self.play_bubble if self.play_bubble is not None else self.status_bubble
         old = self.size_hint_
         self.relayout()
         self.update()
-        return self.size_hint_ != old
+        changed = self.size_hint_ != old
+        if changed and self.playing():  # 들고 있거나 돌아가는 중에는 줄 배치가 크기를 맞춰 주지 않는다
+            self.place(self.x(), self.y())
+        return changed
 
     def relayout(self):
         """창 안에서 말풍선·펫·이름표 자리를 정하고 창 크기(size_hint_)를 계산한다."""
@@ -316,10 +340,18 @@ class PetWindow(QWidget):
 
     size_hint_ = (0, 0)
 
-    def place(self, right, bottom):
-        """창의 오른쪽 아래 모서리를 (right, bottom) 에 맞춘다."""
+    def set_home(self, left, top):
+        """줄이나 따로 놓은 자리 (창 왼쪽 위). 들고 있거나 돌아가는 중이 아니면 바로 옮긴다."""
+        self.home = QPoint(left, top)
+        if self.back.state() == QAbstractAnimation.Running:
+            self.back.setEndValue(self.home)
+        elif self.held is None:
+            self.place(left, top)
+
+    def place(self, left, top):
+        """창 왼쪽 위를 (left, top) 에 두고 창 크기와 클릭 영역을 맞춘다."""
         width, height = self.size_hint_
-        self.setGeometry(right - width, bottom - height, width, height)
+        self.setGeometry(left, top, width, height)
         # 투명한 빈 곳은 클릭이 아래 창으로 가게 말풍선·펫·이름표 영역만 남긴다
         region = QRegion(self.pet_rect).united(QRegion(self.name_rect))
         if self.bubble:
@@ -329,13 +361,13 @@ class PetWindow(QWidget):
     # ---- 애니메이션 --------------------------------------------------------
 
     def current_animation(self):
-        return self.oneshot or self.animation
+        return self.oneshot or self.play_animation or self.animation
 
     def set_animation(self, name):
         if name == self.animation:
             return
         self.animation = name
-        if self.oneshot is None:
+        if self.oneshot is None and self.play_animation is None:
             self.frame_index = 0
             self.anim_timer.stop()
             self.schedule_frame()
@@ -361,6 +393,72 @@ class PetWindow(QWidget):
         self.schedule_frame()
         self.update()
 
+    # ---- 휠로 들고 장난치기 ---------------------------------------------------
+
+    def playing(self):
+        """들고 있거나 자리로 돌아가는 중인지 (그동안은 줄 배치가 이 창을 옮기지 않는다)."""
+        return self.held is not None or self.back.state() == QAbstractAnimation.Running
+
+    def set_play(self, animation, bubble):
+        """장난치는 동안의 동작과 말풍선. None 이면 상태대로 돌아간다. 창 크기가 바뀌었으면 True."""
+        if animation != self.play_animation:
+            self.play_animation = animation
+            if self.oneshot is None:
+                self.frame_index = 0
+                self.anim_timer.stop()
+                self.schedule_frame()
+        if bubble == self.play_bubble:
+            self.update()
+            return False
+        self.play_bubble = bubble
+        return self.refit()
+
+    def grab_begin(self, pos):
+        self.back.stop()
+        self.react_timer.stop()
+        self.oneshot = None
+        shake = petcore.Shake()
+        shake.add(pos.x(), int(time.time() * 1000))
+        self.held = [pos - self.pos() - self.pet_rect.topLeft(), shake, pos]
+        self.held_timer.start()
+        self.follow()
+
+    def grab_move(self, pos):
+        self.held[1].add(pos.x(), int(time.time() * 1000))
+        self.held[2] = pos
+        self.follow()
+
+    def follow(self):
+        """커서를 따라가며 흔든 정도에 맞는 동작을 보인다. 펫이 커서 아래 그대로 있게 펫 자리를 기준으로 옮긴다."""
+        if self.held is None:
+            return
+        offset, shake, pos = self.held
+        self.set_play(*petcore.held_pose(shake, int(time.time() * 1000)))
+        top_left = pos - offset - self.pet_rect.topLeft()
+        self.place(top_left.x(), top_left.y())
+
+    def grab_end(self):
+        shake = self.held[1]
+        self.held = None
+        self.held_timer.stop()
+        self.reaction = petcore.release_reaction(shake)
+        self.back.setStartValue(self.pos())
+        self.back.setEndValue(self.home)
+        self.back.start()
+        self.set_play("jumping", None)
+        self.manager.layout()  # 말풍선이 상태로 돌아와 크기가 바뀌었으면 돌아갈 자리를 다시 잰다
+
+    def react(self):
+        """자리로 돌아오면 웃거나 운다."""
+        animation, bubble, ms = self.reaction
+        self.set_play(animation, bubble)
+        self.manager.layout()
+        self.react_timer.start(ms)
+
+    def end_play(self):
+        self.set_play(None, None)
+        self.manager.layout()
+
     # ---- 그리기 ------------------------------------------------------------
 
     def paintEvent(self, _event):
@@ -381,7 +479,8 @@ class PetWindow(QWidget):
             self.paint_mark(painter)
 
     def paint_bubble(self, painter):
-        fill, border = BUBBLE_COLORS.get(self.bubble_style, BUBBLE_COLORS["running"])
+        style = "running" if self.play_bubble is not None else self.bubble_style
+        fill, border = BUBBLE_COLORS.get(style, BUBBLE_COLORS["running"])
         rect = QRectF(self.bubble_rect).adjusted(1, 1, -1, -1)
         tail_x = int(min(max(self.pet_rect.center().x(), rect.left() + 14), rect.right() - 14))
         bottom = int(rect.bottom())
@@ -435,16 +534,24 @@ class PetWindow(QWidget):
     # ---- 마우스: 관리자에게 넘긴다 -------------------------------------------
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.manager.drag_begin(event.globalPos())
+        if event.button() == Qt.LeftButton and self.held is None:
+            self.manager.drag_begin(self.session_id, event.globalPos())
+        elif event.button() == Qt.MiddleButton and self.manager.drag_origin is None and self.held is None:
+            self.manager.hide_card()
+            self.grab_begin(event.globalPos())
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton:
+        if self.held is not None:
+            self.grab_move(event.globalPos())
+        elif event.buttons() & Qt.LeftButton:
             self.manager.drag_move(event.globalPos())
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and not self.manager.drag_end():
-            self.manager.on_click(self.session_id)
+        if event.button() == Qt.MiddleButton and self.held is not None:
+            self.grab_end()
+        elif event.button() == Qt.LeftButton and self.manager.drag_origin is not None:
+            if not self.manager.drag_end():
+                self.manager.on_click(self.session_id)
 
     def contextMenuEvent(self, event):
         self.manager.show_menu(self.session_id, event.globalPos())
@@ -674,6 +781,7 @@ class PetManager(QObject):
         self.assignments = ({k: v for k, v in saved.items() if isinstance(k, str) and isinstance(v, str)}
                             if isinstance(saved, dict) else {})
         self.anchor = self.initial_anchor()  # 줄의 오른쪽 아래 모서리
+        self.positions = self.initial_positions()  # 따로 움직이기에서 옮긴 펫의 발밑 가운데 {session_id: [x, y]}
         self.drag_origin = None
         self.dragged = False
         self.warned_extension = False
@@ -695,6 +803,10 @@ class PetManager(QObject):
     def gist_enabled(self):
         return self.config.get("gist") is not False
 
+    def free_layout(self):
+        """펫 따로 움직이기. 접혀 있으면 한 마리만 보이므로 줄 자리에 세운다."""
+        return self.config.get("free") is True and not self.folded()
+
     def scale(self):
         value = self.config.get("scale")
         return value if value in SCALES.values() else SCALES["보통"]
@@ -709,6 +821,14 @@ class PetManager(QObject):
                 and QApplication.screenAt(QPoint(*saved)) is not None):
             return QPoint(*saved)
         return self.default_anchor()
+
+    def initial_positions(self):
+        saved = self.config.get("positions")
+        if not isinstance(saved, dict):
+            return {}
+        return {sid: list(foot) for sid, foot in saved.items()
+                if isinstance(foot, list) and len(foot) == 2 and all(isinstance(v, int) for v in foot)
+                and QApplication.screenAt(QPoint(foot[0], foot[1] - 1)) is not None}
 
     def disabled_pets(self):
         saved = self.config.get("disabled_pets")
@@ -725,6 +845,8 @@ class PetManager(QObject):
             self.assignments = dict(keep)
         self.config["assignments"] = self.assignments
         self.config["row_anchor"] = [self.anchor.x(), self.anchor.y()]
+        self.positions = {sid: foot for sid, foot in self.positions.items() if sid in self.sessions}
+        self.config["positions"] = self.positions
         save_config(self.config)
 
     # ---- 펫 이미지 ---------------------------------------------------------
@@ -831,19 +953,22 @@ class PetManager(QObject):
             self.update_card()
 
     def layout(self):
-        """처음 생긴 세션이 줄의 오른쪽 끝, 새 세션일수록 왼쪽. 모두 같은 바닥선에 선다."""
+        """처음 생긴 세션이 줄의 오른쪽 끝, 새 세션일수록 왼쪽. 모두 같은 바닥선에 선다.
+        펫 따로 움직이기에서 옮긴 펫은 옮긴 자리에 서고, 안 옮긴 펫들이 줄에 남는다.
+        휠로 들고 있거나 돌아가는 중인 펫은 자리만 알려 주고 옮기지 않는다."""
         screen = QApplication.screenAt(self.anchor) or QApplication.primaryScreen()
         area = screen.availableGeometry()
         tallest = max((self.windows[sid].size_hint_[1] for sid in self.order), default=0)
         self.anchor = QPoint(min(max(self.anchor.x(), area.left() + 50), area.right() + 1),
                              min(max(self.anchor.y(), area.top() + tallest), area.bottom() + 1))
-        right = self.anchor.x()
+        sizes = {sid: self.windows[sid].size_hint_ for sid in self.order}
+        positions = self.positions if self.free_layout() else {}
+        spots = petcore.layout_spots(self.order, sizes, (self.anchor.x(), self.anchor.y()), ROW_GAP, positions)
         for sid in self.order:
             window = self.windows[sid]
-            window.place(right, self.anchor.y())
+            window.set_home(*spots[sid])
             if not window.isVisible():
                 window.show()
-            right -= window.size_hint_[0] + ROW_GAP
 
     # ---- 마우스 ------------------------------------------------------------
 
@@ -865,7 +990,7 @@ class PetManager(QObject):
         sid = self.hover_sid
         window = self.windows.get(sid)
         session = self.sessions.get(sid)
-        if window is None or session is None or self.drag_origin is not None:
+        if window is None or session is None or self.drag_origin is not None or window.playing():
             self.card.hide()
             return
         now = int(time.time() * 1000)
@@ -876,21 +1001,36 @@ class PetManager(QObject):
         self.card.set_content(self.titles_by_sid.get(sid) or petcore.session_name(session), subtitle, rows, note)
         self.card.show_above(window)
 
-    def drag_begin(self, pos):
+    def drag_begin(self, sid, pos):
+        """왼쪽 드래그 시작. 펫 따로 움직이기면 그 펫만, 아니면 줄 전체를 옮긴다."""
         self.hide_card()
-        self.drag_origin = (pos, QPoint(self.anchor))
+        window = self.windows.get(sid)
+        if self.free_layout() and window is not None:
+            width, height = window.size_hint_
+            self.drag_origin = (pos, sid, QPoint(window.home.x() + width // 2, window.home.y() + height))
+        else:
+            self.drag_origin = (pos, None, QPoint(self.anchor))
         self.dragged = False
 
     def drag_move(self, pos):
         if self.drag_origin is None:
             return
-        start, anchor = self.drag_origin
+        start, sid, origin = self.drag_origin
         delta = pos - start
         if delta.manhattanLength() > 4:
             self.dragged = True
-        if self.dragged:
-            self.anchor = anchor + delta
-            self.layout()
+        if not self.dragged:
+            return
+        if sid is None:
+            self.anchor = origin + delta
+        elif sid in self.windows:
+            # 펫 발밑 가운데를 커서가 있는 화면 안에 둔다
+            area = (QApplication.screenAt(pos) or QApplication.primaryScreen()).availableGeometry()
+            height = self.windows[sid].size_hint_[1]
+            foot = origin + delta
+            self.positions[sid] = [min(max(foot.x(), area.left()), area.right()),
+                                   min(max(foot.y(), area.top() + height), area.bottom() + 1)]
+        self.layout()
 
     def drag_end(self):
         """드래그였으면 True (클릭으로 치지 않는다)."""
@@ -980,7 +1120,13 @@ class PetManager(QObject):
         fold = QAction("접기 (기다리는 세션만 보기)", menu, checkable=True, checked=self.folded())
         fold.triggered.connect(self.set_folded)
         menu.addAction(fold)
-        menu.addAction("줄 위치 처음으로", self.reset_anchor)
+        free = QAction("펫 따로 움직이기", menu, checkable=True, checked=self.config.get("free") is True)
+        free.triggered.connect(self.set_free)
+        menu.addAction(free)
+        if self.free_layout():
+            menu.addAction("다시 줄 세우기", self.line_up)
+        else:
+            menu.addAction("줄 위치 처음으로", self.reset_anchor)
         gist = QAction("작업 요약 (Haiku 로 말풍선 요약)", menu, checkable=True, checked=self.gist_enabled())
         gist.triggered.connect(self.set_gist)
         menu.addAction(gist)
@@ -1081,6 +1227,18 @@ class PetManager(QObject):
         self.hide_card()
         self.save()
         self.refresh()
+
+    def set_free(self, enabled):
+        self.config["free"] = bool(enabled)
+        self.hide_card()
+        self.save()
+        self.layout()
+
+    def line_up(self):
+        """따로 옮긴 펫들을 모두 줄로 되돌린다."""
+        self.positions.clear()
+        self.save()
+        self.layout()
 
     def set_gist(self, enabled):
         self.config["gist"] = bool(enabled)

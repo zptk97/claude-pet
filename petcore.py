@@ -588,3 +588,90 @@ def marked_bubble(state, bubble):
     if state in URGENT_STATES:
         return bubble, state
     return (f"{MARK_TEXT}\n{bubble}" if bubble else MARK_TEXT), "marked"
+
+
+# ---- 휠로 들고 장난치기 ---------------------------------------------------------
+
+SHAKE_MIN_PX = 30       # 방향을 바꾼 것으로 치려면 이만큼은 갔다가 돌아와야 한다 (손 떨림은 무시)
+SHAKE_WINDOW_MS = 1500  # 이 시간 안에 방향을 바꾼 횟수로 흔든 정도를 센다
+DIZZY_TURNS = 4         # 이만큼 바꾸면 어지러워한다
+HEADING_MS = 200        # 이 시간 동안 움직인 쪽을 끄는 방향으로 본다 (그보다 오래 멈추면 매달려 있다)
+HEADING_MIN_PX = 8
+
+
+class Shake:
+    """들고 있는 펫을 좌우로 흔든 정도와 끄는 방향 (커서 x 만 본다)."""
+
+    def __init__(self):
+        self.turns = []    # 방향을 바꾼 시각 (ms)
+        self.most = 0      # 들고 있는 동안 SHAKE_WINDOW_MS 안에 가장 많이 바꾼 횟수
+        self.direction = 0  # 지금 가는 쪽 (-1 왼쪽, 1 오른쪽, 0 아직 모름)
+        self.edge = None   # 지금 가는 쪽으로 가장 멀리 간 x (가는 쪽을 모르면 처음 x)
+        self.samples = []  # 최근 HEADING_MS 동안의 (ms, x)
+
+    def add(self, x, now_ms):
+        self.samples = [(t, sx) for t, sx in self.samples if now_ms - t <= HEADING_MS] + [(now_ms, x)]
+        if self.edge is None:
+            self.edge = x
+        elif self.direction == 0:
+            if abs(x - self.edge) >= SHAKE_MIN_PX:
+                self.direction = 1 if x > self.edge else -1
+                self.edge = x
+        elif (x - self.edge) * self.direction > 0:
+            self.edge = x
+        elif abs(x - self.edge) >= SHAKE_MIN_PX:
+            self.direction = -self.direction
+            self.edge = x
+            self.turns.append(now_ms)
+        self.most = max(self.most, self.recent(now_ms))
+
+    def recent(self, now_ms):
+        """최근 SHAKE_WINDOW_MS 안에 방향을 바꾼 횟수."""
+        return sum(1 for t in self.turns if now_ms - t <= SHAKE_WINDOW_MS)
+
+    def heading(self, now_ms):
+        """최근 HEADING_MS 동안 끈 쪽 (-1, 0, 1)."""
+        recent = [x for t, x in self.samples if now_ms - t <= HEADING_MS]
+        if len(recent) < 2 or abs(recent[-1] - recent[0]) < HEADING_MIN_PX:
+            return 0
+        return 1 if recent[-1] > recent[0] else -1
+
+
+def held_pose(shake, now_ms):
+    """들고 있는 펫의 (동작, 말풍선). 말풍선이 None 이면 상태 말풍선을 그대로 둔다.
+    세게 흔들면 어지러워하고, 끄는 동안은 그쪽으로 달리고, 가만히 들고 있으면 버둥거린다."""
+    if shake.recent(now_ms) >= DIZZY_TURNS:
+        return "failed", "어지러워요!"
+    heading = shake.heading(now_ms)
+    if heading:
+        return ("running-right" if heading > 0 else "running-left"), None
+    return "jumping", None
+
+
+def release_reaction(shake):
+    """놓아서 자리로 돌아온 뒤의 (동작, 말풍선, 보여줄 ms). 세게 흔들었으면 울고, 아니면 웃는다."""
+    if shake.most >= DIZZY_TURNS:
+        return "failed", "흑흑…", 2500
+    return "waving", "또 해 주세요!", 2000
+
+
+# ---- 펫 자리 (줄, 따로 움직이기) --------------------------------------------------
+
+def layout_spots(order, sizes, anchor, gap, positions=None):
+    """펫 창들의 왼쪽 위 자리 {session_id: (x, y)}.
+
+    줄은 anchor(줄의 오른쪽 아래)에서 처음 생긴 세션부터 왼쪽으로 선다.
+    positions 는 따로 움직이기에서 옮긴 펫의 발밑 가운데 {session_id: (x, y)} 이다.
+    옮긴 펫은 그 자리에 서고 줄 칸을 차지하지 않는다 (안 옮긴 펫들이 줄에서 빈칸을 채운다).
+    """
+    positions = positions or {}
+    spots, right = {}, anchor[0]
+    for sid in order:
+        width, height = sizes[sid]
+        foot = positions.get(sid)
+        if foot:
+            spots[sid] = (foot[0] - width // 2, foot[1] - height)
+        else:
+            spots[sid] = (right - width, anchor[1] - height)
+            right -= width + gap
+    return spots
