@@ -660,6 +660,22 @@ def release_reaction(shake):
     return "waving", "또 해 주세요!", 2000
 
 
+# ---- 연타 ------------------------------------------------------------------------
+
+RAPID_CLICKS = 5        # RAPID_CLICK_MS 안에 이만큼 누르면 화를 낸다
+RAPID_CLICK_MS = 2000
+# (동작, 말풍선, 보여줄 ms)
+ANGRY = ("failed", "그만 눌러요!", 2000)
+
+
+def rapid_clicks(times, now_ms):
+    """누른 시각을 더해 (남길 최근 시각들, 화낼지). 화내면 처음부터 다시 센다."""
+    times = [t for t in times if now_ms - t <= RAPID_CLICK_MS] + [now_ms]
+    if len(times) >= RAPID_CLICKS:
+        return [], True
+    return times, False
+
+
 # ---- 펫 자리 (줄, 따로 움직이기) --------------------------------------------------
 
 def layout_spots(order, sizes, anchor, gap, positions=None):

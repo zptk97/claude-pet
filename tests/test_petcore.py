@@ -573,6 +573,24 @@ class PlayTest(unittest.TestCase):
         rough.add(0, now + 5000)  # 한참 들고 있다가 놓아도 세게 흔든 건 기억한다
         self.assertEqual(petcore.release_reaction(rough)[:2], ("failed", "흑흑…"))
 
+    def test_rapid_clicks(self):
+        times, angry = [], False
+        for i in range(petcore.RAPID_CLICKS - 1):
+            times, angry = petcore.rapid_clicks(times, i * 300)
+            self.assertFalse(angry)
+        times, angry = petcore.rapid_clicks(times, 1300)
+        self.assertTrue(angry)
+        self.assertEqual(times, [])  # 화내고 나면 처음부터 다시 센다
+        edge = []
+        for t in (0, 500, 1000, 1500):
+            edge, _ = petcore.rapid_clicks(edge, t)
+        self.assertTrue(petcore.rapid_clicks(edge, petcore.RAPID_CLICK_MS)[1])  # 첫 클릭부터 딱 2초까지는 센다
+        self.assertFalse(petcore.rapid_clicks(edge, petcore.RAPID_CLICK_MS + 1)[1])
+        slow = []
+        for i in range(10):  # 천천히 누르면 화내지 않는다
+            slow, angry = petcore.rapid_clicks(slow, i * (petcore.RAPID_CLICK_MS // 2 + 100))
+            self.assertFalse(angry)
+
 
 class LayoutTest(unittest.TestCase):
     SIZES = {"a": (100, 150), "b": (120, 200), "c": (80, 150)}

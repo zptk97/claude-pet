@@ -8,7 +8,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 
     python3 ~/.claude/pet/claude_pet.py
 
-왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인
+왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인, 연타하면 화낸다
 마우스 올림: 그 세션의 컨텍스트와 계정 5시간·주간 사용량 카드 (상태줄 중계 hooks/claude-pet-statusline.sh 필요)
 드래그: 줄 전체 이동 (펫 따로 움직이기를 켜면 그 펫만) / 휠 버튼 드래그: 펫을 들고 흔들기, 놓으면 자리로 돌아와 웃거나 운다
 오른쪽 클릭: 나중에 이어서 볼게, 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기, 펫 따로 움직이기,
@@ -270,6 +270,7 @@ class PetWindow(QWidget):
         self.held_timer = QTimer(self, interval=HELD_TICK_MS, timeout=self.follow)
         self.react_timer = QTimer(self, singleShot=True, timeout=self.end_play)
         self.drag_animation = None  # 왼쪽 드래그로 옮기는 동안 끄는 쪽으로 달리는 동작 (장난보다 뒤)
+        self.clicks = []            # 최근 클릭 시각 (연타하면 화낸다)
 
         self.pet_rect = self.bubble_rect = self.name_rect = self.badge_rect = QRect()
         self.mask_region = QRegion()
@@ -397,6 +398,14 @@ class PetWindow(QWidget):
         self.schedule_frame()
         self.update()
 
+    def poke(self):
+        """클릭하면 점프한다. 빠르게 여러 번 누르면 화낸다."""
+        self.clicks, angry = petcore.rapid_clicks(self.clicks, int(time.time() * 1000))
+        if angry:
+            self.show_reaction(*petcore.ANGRY)
+        else:
+            self.play_jump()
+
     def schedule_frame(self):
         durations = petcore.ANIMATIONS[self.current_animation()][1]
         self.anim_timer.start(durations[self.frame_index % len(durations)])
@@ -467,7 +476,11 @@ class PetWindow(QWidget):
 
     def react(self):
         """자리로 돌아오면 웃거나 운다."""
-        animation, bubble, ms = self.reaction
+        self.show_reaction(*self.reaction)
+
+    def show_reaction(self, animation, bubble, ms):
+        """동작과 말풍선을 ms 동안 보이고 상태대로 돌아간다."""
+        self.oneshot = None
         self.set_play(animation, bubble)
         self.manager.layout()
         self.react_timer.start(ms)
@@ -1093,7 +1106,7 @@ class PetManager(QObject):
             self.acked[sid] = session["ts"]
         if self.marks.pop(sid, None) is not None:  # 돌아왔으니 이어서 볼 표시를 푼다
             self.save_marks()
-        window.play_jump()
+        window.poke()
         title = self.desktop.terminator_title(session.get("terminator_uuid"))
         if not self.desktop.activate(title) and not self.warned_extension:
             self.warned_extension = True
