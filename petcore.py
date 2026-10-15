@@ -758,7 +758,7 @@ def changed_states(old, new):
     return {sid: (old[sid], state) for sid, state in new.items() if sid in old and old[sid] != state}
 
 
-# ---- 펫끼리 ------------------------------------------------------------------------
+# ---- 펫끼리, 던지기 ----------------------------------------------------------------
 
 NEIGHBOR_PX = 400       # 이 거리 안의 가장 가까운 펫이 다 한 일을 축하하고 오류를 위로한다
 GREET_PETS = 3          # 펫 폭의 이만큼 안에 깬 채 쉬는 펫이 있으면 산책 대신 가끔 인사하러 간다
@@ -768,6 +768,18 @@ BESIDE = 0.85           # 옆에 설 때 두 펫 가운데 사이를 두 펫 폭
 CHEER = ("jumping", "잘했어!", 1500)
 CONSOLE = ("waving", "괜찮아요?", 2000)
 HELLO = ("waving", "안녕!", 1500)
+
+THROW_MIN_SPEED = 1200  # 휠 버튼으로 든 펫을 이보다 빠르게(px/s) 놓으면 던진다
+THROW_MAX_SPEED = 4000
+VELOCITY_MS = 80        # 놓기 직전 이만큼 동안 움직인 것으로 속도를 잰다
+MIN_SPAN_MS = 16        # 잡자마자 놓아도 이만큼은 걸린 것으로 친다 (짧은 떨림이 빠르게 재지지 않게)
+FLING_GRAVITY = 2400    # px/s²
+FLING_BOUNCE = 0.55     # 벽·바닥에 튕기면 남는 속도
+FLING_FRICTION = 3.0    # 바닥에서 미끄러질 때 줄어드는 정도 (1/s)
+FLING_REST_SPEED = 60   # 바닥에서 이보다 느리면 멈춘다 (px/s)
+FLING_MAX_MS = 5000     # 그래도 이만큼 지나면 멈춘다
+WHEE = "으아아!"
+OUCH = ("failed", "아야!", 1000)
 
 
 def nearest(spots, sid, max_px, candidates):
@@ -790,6 +802,61 @@ def beside_dx(my_x, my_w, their_x, their_w):
     gap = BESIDE * (my_w + their_w) / 2
     target = their_x - gap if my_x <= their_x else their_x + gap
     return round(target - my_x)
+
+
+def release_velocity(samples, now_ms):
+    """놓을 때 (vx, vy) px/s. samples 는 [(ms, x, y)] 이고 마지막이 놓은 자리다.
+    VELOCITY_MS 이상 앞선 자리 중 가장 가까운 것부터 놓은 때까지 재서, 놓기 직전 손 떨림이나 멈췄다 놓기는
+    빠르게 치지 않는다. 너무 빠르면 THROW_MAX_SPEED 로 줄인다."""
+    if len(samples) < 2:
+        return 0.0, 0.0
+    start, end = samples[0], samples[-1]
+    for sample in samples:
+        if sample[0] <= now_ms - VELOCITY_MS:
+            start = sample
+    dt = max(now_ms - start[0], MIN_SPAN_MS) / 1000
+    vx, vy = (end[1] - start[1]) / dt, (end[2] - start[2]) / dt
+    speed = math.hypot(vx, vy)
+    if speed > THROW_MAX_SPEED:
+        vx, vy = vx * THROW_MAX_SPEED / speed, vy * THROW_MAX_SPEED / speed
+    return vx, vy
+
+
+def is_throw(velocity):
+    """놓을 때 속도 (vx, vy) 가 던지기인지."""
+    return math.hypot(*velocity) >= THROW_MIN_SPEED
+
+
+def fling_bounds(area, pet_w, pet_top, window_h):
+    """던진 펫 그림 왼쪽 위가 갈 수 있는 (왼쪽, 위, 오른쪽, 바닥). 네 벽 모두 화면 가장자리이고, 바닥은 이름표까지
+    화면 안에 들어오는 높이다. area 는 화면 (왼쪽, 위, 오른쪽 끝 + 1, 아래 끝 + 1), pet_top 은 창 안에서 펫 그림 위."""
+    left, top, right, bottom = area
+    return left, top, right - pet_w, bottom - (window_h - pet_top)
+
+
+def fling_step(x, y, vx, vy, dt, bounds):
+    """던진 펫 한 걸음 → (x, y, vx, vy, 멈췄는지). bounds 는 펫 그림 왼쪽 위가 갈 수 있는 (왼쪽, 위, 오른쪽, 바닥).
+    중력으로 떨어지며 벽·천장·바닥에 튕기고, 바닥에서는 미끄러지다 선다."""
+    left, top, right, floor = bounds
+    vy += FLING_GRAVITY * dt
+    x += vx * dt
+    y += vy * dt
+    # 벽 쪽으로 가고 있을 때만 튕긴다 (벽 밖에서 안쪽으로 던졌으면 제자리에 맞추기만 한다)
+    if x < left:
+        x, vx = left, (-vx * FLING_BOUNCE if vx < 0 else vx)
+    elif x > right:
+        x, vx = right, (-vx * FLING_BOUNCE if vx > 0 else vx)
+    if y < top:
+        y, vy = top, (-vy * FLING_BOUNCE if vy < 0 else vy)
+    if y >= floor:
+        y = floor
+        if vy > 0:
+            vy = -vy * FLING_BOUNCE
+            if -vy < FLING_REST_SPEED * 3:  # 작게 튀는 건 그만 튄다
+                vy = 0.0
+        if vy == 0:
+            vx *= math.exp(-FLING_FRICTION * dt)
+    return x, y, vx, vy, y >= floor and vy == 0 and abs(vx) < FLING_REST_SPEED
 
 
 # ---- 펫 자리 (줄, 따로 움직이기) --------------------------------------------------

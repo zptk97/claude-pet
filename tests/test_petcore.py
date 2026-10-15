@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 import tempfile
@@ -659,6 +660,61 @@ class NeighborTest(unittest.TestCase):
         self.assertEqual(petcore.beside_dx(500, 100, 1000, 100), 1000 - gap - 500)  # 왼쪽에서 다가가 왼쪽 옆에
         self.assertEqual(petcore.beside_dx(1500, 100, 1000, 100), 1000 + gap - 1500)  # 오른쪽에서 오면 오른쪽 옆에
         self.assertEqual(petcore.beside_dx(1000 - 110, 100, 1000, 100), 110 - gap)  # 줄에서 바로 옆이면 한 걸음
+
+
+class ThrowTest(unittest.TestCase):
+    BOUNDS = (0, 0, 1000, 500)  # 왼쪽, 위, 오른쪽, 바닥
+
+    def test_release_velocity(self):
+        samples = [(0, 0, 0), (100, 50, 0), (150, 100, 20), (200, 200, 40)]
+        vx, vy = petcore.release_velocity(samples, 200)
+        self.assertAlmostEqual(vx, 1500)  # 80ms 이상 앞선 가장 가까운 자리(100ms)부터 놓은 때까지
+        self.assertAlmostEqual(vy, 400)
+        self.assertEqual(petcore.release_velocity([(0, 0, 0)], 0), (0.0, 0.0))
+        fast = petcore.release_velocity([(0, 0, 0), (10, 1000, 0)], 10)
+        self.assertAlmostEqual(math.hypot(*fast), petcore.THROW_MAX_SPEED)
+
+    def test_jitter_or_stop_before_release_is_not_a_throw(self):
+        jitter = [(0, 500, 500), (998, 500, 500), (1000, 504, 500)]  # 가만히 들고 있다가 놓을 때 4px 떨림
+        self.assertFalse(petcore.is_throw(petcore.release_velocity(jitter, 1000)))
+        stopped = [(t, 30 * t // 20, 0) for t in range(0, 401, 20)] + [(460, 600, 0)]  # 1500px/s 로 끌다 멈춰 60ms 뒤 놓기
+        self.assertFalse(petcore.is_throw(petcore.release_velocity(stopped, 460)))
+        flick = [(t, 30 * t // 20, 0) for t in range(0, 401, 20)]  # 끌던 그대로 놓기
+        self.assertTrue(petcore.is_throw(petcore.release_velocity(flick, 400)))
+
+    def test_fling_inward_from_past_the_wall_keeps_speed(self):
+        x, _, vx, _, _ = petcore.fling_step(-48, 400, 1300, 0, 0.016, self.BOUNDS)  # 반쯤 벽 밖에서 안쪽으로
+        self.assertEqual((x, vx), (0, 1300))  # 자리만 맞추고 속도는 그대로
+        self.assertTrue(petcore.is_throw((petcore.THROW_MIN_SPEED, 0)))
+        self.assertFalse(petcore.is_throw((300, 400)))
+
+    def test_fling_bounds_are_screen_edges(self):
+        # 화면 (1080, 379)~(3000, 1459), 펫 그림 96 폭, 창 안 42px 아래에서 시작, 창 높이 166 (말풍선 42 + 펫 104 + 이름표 20)
+        # 바닥에 서면 창 아래 끝(이름표)이 화면 아래 끝에 닿는다: 1335 - 42 + 166 = 1459
+        self.assertEqual(petcore.fling_bounds((1080, 379, 3000, 1459), 96, 42, 166), (1080, 379, 2904, 1335))
+
+    def run_fling(self, x, y, vx, vy, dt=0.016):
+        path = []
+        for _ in range(int(petcore.FLING_MAX_MS / 1000 / dt)):
+            x, y, vx, vy, rested = petcore.fling_step(x, y, vx, vy, dt, self.BOUNDS)
+            path.append((x, y))
+            if rested:
+                return path, True
+        return path, False
+
+    def test_fling_falls_bounces_and_rests_on_floor(self):
+        path, rested = self.run_fling(500, 300, 0, -1500)
+        self.assertTrue(rested)
+        self.assertEqual(path[-1][1], 500)  # 바닥에 선다
+        self.assertEqual(min(y for _, y in path), 0)  # 위로 세게 던지면 천장에 닿는다
+        self.assertTrue(all(0 <= y <= 500 for _, y in path))
+
+    def test_fling_bounces_off_walls(self):
+        path, rested = self.run_fling(900, 500, 3000, 0)
+        self.assertTrue(rested)
+        self.assertTrue(all(0 <= x <= 1000 for x, _ in path))
+        self.assertIn(1000, [x for x, _ in path])  # 오른쪽 벽에 닿았다가
+        self.assertLess(path[-1][0], 1000)  # 튕겨 나와 선다
 
 
 class MotionTest(unittest.TestCase):

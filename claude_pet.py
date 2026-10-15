@@ -10,7 +10,8 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 
 왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인, 연타하면 화낸다
 마우스 올림: 그 세션의 컨텍스트와 계정 5시간·주간 사용량 카드 (상태줄 중계 hooks/claude-pet-statusline.sh 필요)
-드래그: 줄 전체 이동 (펫 따로 움직이기를 켜면 그 펫만) / 휠 버튼 드래그: 펫을 들고 흔들기, 놓으면 자리로 돌아와 웃거나 운다
+드래그: 줄 전체 이동 (펫 따로 움직이기를 켜면 그 펫만) / 휠 버튼 드래그: 펫을 들고 흔들기, 놓으면 자리로 돌아와 웃거나 운다,
+휙 놓으면 날아가 튕기다가 달려 돌아온다
 휠 굴리기: 쓰다듬기 (하트가 떠오르고, 빠르게 굴리면 좋아한다)
 오른쪽 클릭: 나중에 이어서 볼게, 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기, 펫 따로 움직이기,
 펫이 혼자 움직이기, 작업 요약 켜고 끄기, 자동 실행, 종료
@@ -85,6 +86,8 @@ ENTER_SPEED = 260   # 등장·퇴장 때 달리는 속도 (px/s)
 RUN_OFF_PETS = 3    # 등장·퇴장 때 펫 폭의 몇 배만큼 달리는지 (화면의 넓은 쪽으로)
 WALK_SPEED = 90     # 산책할 때 걷는 속도 (px/s)
 VISIT_SPEED = 160   # 옆 펫을 찾아갈 때 (위로, 인사) 달리는 속도 (px/s)
+FLING_TICK_MS = 16  # 던진 펫을 옮기는 간격
+TRACK_MS = 300      # 휠 버튼으로 든 펫의 커서 자리를 이만큼 남긴다 (던진 속도를 잰다)
 SLEEP_SLOWDOWN = 2  # 조는 동안 쉬는 동작을 이만큼 느리게
 WHEEL_NOTCH = 120   # 휠 한 칸 (angleDelta)
 EFFECT_TICK_MS = 33
@@ -389,6 +392,13 @@ class PetWindow(QWidget):
         self.touched_ms = 0         # 마지막 클릭·쓰다듬기 (쉬는 시간을 여기서부터 다시 센다)
         self.next_wander_ms = None  # 다음 산책 시각 (산책할 수 없으면 None)
         self.wander_timer = QTimer(self, singleShot=True, timeout=self.come_back)
+        # 휠 버튼으로 들었다 빠르게 놓으면 던진다
+        self.track = []             # 든 동안 커서 자리 [(ms, x, y)]
+        self.flight = None          # 날고 있으면 [펫 그림 왼쪽 위 x, y, vx, vy, 던진 시각 ms]
+        self.fling_timer = QTimer(self, interval=FLING_TICK_MS, timeout=self.fling_tick)
+        self.fling_last = 0.0
+        self.fling_area = QRect()   # 던진 펫의 벽 (모니터 사이 빈 곳을 지날 때 쓰는 마지막 화면)
+        self.return_timer = QTimer(self, singleShot=True, timeout=self.run_home)
         self.wheel_acc = 0          # 한 칸이 안 된 휠 양 (터치패드는 조금씩 온다)
         self.strokes = []           # 최근 쓰다듬은 시각
         self.effects = None         # 하트·색종이를 그리는 EffectLayer (처음 쓸 때 만든다)
@@ -499,7 +509,7 @@ class PetWindow(QWidget):
             target, relative = self.walk_target
             if relative:
                 self.walk.setEndValue(self.home + target + self.pet_rect.topLeft())
-        elif self.held is None:
+        elif self.held is None and self.flight is None:
             spot = self.home + self.offset
             self.place(spot.x(), spot.y())
 
@@ -549,7 +559,7 @@ class PetWindow(QWidget):
         now = int(time.time() * 1000)
         self.touch(now)
         self.clicks, angry = petcore.rapid_clicks(self.clicks, now)
-        if angry:
+        if angry and self.flight is None:  # 날고 있으면 뛰기만 한다
             self.show_reaction(*petcore.ANGRY)
         else:
             self.play_jump()
@@ -577,8 +587,9 @@ class PetWindow(QWidget):
     # ---- 휠로 들고 장난치기 ---------------------------------------------------
 
     def playing(self):
-        """들고 있거나, 자리로 돌아가거나, 혼자 걸어가는 중인지 (그동안은 줄 배치가 이 창을 옮기지 않는다)."""
-        return self.held is not None or self.back.state() == QAbstractAnimation.Running or self.walking()
+        """들고 있거나, 날고 있거나, 자리로 돌아가거나, 혼자 걸어가는 중인지 (그동안은 줄 배치가 이 창을 옮기지 않는다)."""
+        return (self.held is not None or self.flight is not None or self.back.state() == QAbstractAnimation.Running
+                or self.walking())
 
     def set_play(self, animation, bubble):
         """장난치는 동안의 동작과 말풍선. None 이면 상태대로 돌아간다. 창 크기가 바뀌었으면 True."""
@@ -595,20 +606,24 @@ class PetWindow(QWidget):
         return self.refit()
 
     def grab_begin(self, pos):
-        self.touch(int(time.time() * 1000))
-        self.stop_walk()
+        now = int(time.time() * 1000)
+        self.touch(now)
+        self.stop_walk()  # 날고 있었으면 공중에서 잡는다
         self.back.stop()
         self.react_timer.stop()
         self.oneshot = None
         shake = petcore.Shake()
-        shake.add(pos.x(), int(time.time() * 1000))
+        shake.add(pos.x(), now)
+        self.track = [(now, pos.x(), pos.y())]
         self.held = [pos - self.pos() - self.pet_rect.topLeft(), shake, pos]
         self.held_timer.start()
         self.follow()
 
     def grab_move(self, pos):
-        self.held[1].add(pos.x(), int(time.time() * 1000))
+        now = int(time.time() * 1000)
+        self.held[1].add(pos.x(), now)
         self.held[2] = pos
+        self.track = [sample for sample in self.track if now - sample[0] <= TRACK_MS] + [(now, pos.x(), pos.y())]
         self.follow()
 
     def follow(self):
@@ -621,10 +636,16 @@ class PetWindow(QWidget):
         self.place(top_left.x(), top_left.y())
 
     def grab_end(self):
-        shake = self.held[1]
+        _, shake, pos = self.held
         self.held = None
         self.held_timer.stop()
         self.reaction = petcore.release_reaction(shake)
+        now = int(time.time() * 1000)
+        velocity = petcore.release_velocity(self.track + [(now, pos.x(), pos.y())], now)
+        # 세게 흔드는 중에 놓으면 던지지 않고 지금처럼 통통 돌아와 운다
+        if petcore.is_throw(velocity) and shake.recent(now) < petcore.DIZZY_TURNS:
+            self.fling(velocity)
+            return
         self.back.setStartValue(self.pos() + self.pet_rect.topLeft())
         self.back.setEndValue(self.home + self.pet_rect.topLeft())
         self.back.start()
@@ -634,6 +655,52 @@ class PetWindow(QWidget):
     def react(self):
         """자리로 돌아오면 웃거나 운다."""
         self.show_reaction(*self.reaction)
+
+    def fling(self, velocity):
+        """던지면 날아가 벽·바닥에 튕기다가 서서 `아야!` 하고, 자리로 달려 돌아와 웃거나 운다."""
+        at = self.pos() + self.pet_rect.topLeft()
+        self.fling_last = time.monotonic()
+        self.flight = [float(at.x()), float(at.y()), *velocity, self.fling_last]
+        self.fling_area = self.manager.screen_area(at + self.pet_rect.center() - self.pet_rect.topLeft())
+        self.fling_timer.start()
+        self.set_play("jumping", petcore.WHEE)
+        self.manager.layout()  # 말풍선이 바뀌어 창 크기가 달라졌으면 다른 펫 자리를 다시 잰다
+
+    def fling_tick(self):
+        """던진 펫 한 걸음. 벽은 지금 펫이 있는 화면 가장자리 (모니터 사이 빈 곳이면 마지막 화면)."""
+        now = time.monotonic()
+        dt, self.fling_last = min(0.05, now - self.fling_last), now
+        x, y, vx, vy, thrown = self.flight
+        screen = QApplication.screenAt(QPoint(round(x), round(y)) + self.pet_rect.center() - self.pet_rect.topLeft())
+        if screen is not None:
+            self.fling_area = screen.availableGeometry()
+        area = self.fling_area
+        bounds = petcore.fling_bounds((area.left(), area.top(), area.right() + 1, area.bottom() + 1),
+                                      self.pet_rect.width(), self.pet_rect.top(), self.size_hint_[1])
+        x, y, vx, vy, rested = petcore.fling_step(x, y, vx, vy, dt, bounds)
+        self.flight = [x, y, vx, vy, thrown]
+        self.move(QPoint(round(x), round(y)) - self.pet_rect.topLeft())
+        if rested or now - thrown > petcore.FLING_MAX_MS / 1000:
+            self.land()
+
+    def land(self):
+        """바닥에 서면 `아야!` 하고, 조금 뒤 자리로 달려 돌아간다."""
+        self.fling_timer.stop()
+        self.flight = None
+        self.offset = self.pos() - self.home  # 줄이 다시 서도 떨어진 자리에 있는다
+        animation, bubble, ms = petcore.OUCH
+        self.show_reaction(animation, bubble, ms)
+        self.return_timer.start(ms)
+
+    def run_home(self):
+        """던져진 뒤 자리로 달려 돌아와 웃거나 운다."""
+        self.walk_to(QPoint(), ENTER_SPEED, then=self.react)
+
+    def stop_flight(self):
+        """날기와 돌아가기 예약을 그만둔다 (잡거나, 줄을 끌거나, 퇴장할 때)."""
+        self.fling_timer.stop()
+        self.return_timer.stop()
+        self.flight = None
 
     def show_reaction(self, animation, bubble, ms):
         """동작과 말풍선을 ms 동안 보이고 상태대로 돌아간다."""
@@ -693,7 +760,7 @@ class PetWindow(QWidget):
         self.touch(now)
         self.effect("heart", HEART_COUNT)
         self.strokes, happy = petcore.pet_strokes(self.strokes, now)
-        if happy and self.held is None:
+        if happy and self.held is None and self.flight is None:
             self.show_reaction(*petcore.PETTED)
 
     def celebrate(self):
@@ -761,15 +828,15 @@ class PetWindow(QWidget):
 
     def stop_walk(self):
         """혼자 걷기를 그만두고 자리로 돌아갈 준비를 한다 (줄을 끌거나 펫을 들 때). 옮기는 건 부른 쪽이 한다."""
-        walking = self.walking()
+        if self.walking() or self.flight is not None:
+            self.set_play(None, None)  # 아직 움직이는 중이라 말풍선이 바뀌어도 펫이 제자리에 있다
         self.walk.stop()
         self.wander_timer.stop()
+        self.stop_flight()
         self.fade.stop()
         self.setWindowOpacity(1.0)
         self.walk_target = self.walk_then = self.walk_pose = None
         self.offset = QPoint()
-        if walking:
-            self.set_play(None, None)
 
     def enter(self, area):
         """줄에 처음 설 때: 화면의 넓은 쪽에서 서서히 나타나며 자리로 달려와 인사한다."""
@@ -786,13 +853,15 @@ class PetWindow(QWidget):
         self.back.stop()
         self.react_timer.stop()
         self.wander_timer.stop()
+        flying = self.flight is not None
+        self.stop_flight()
         self.sleeping = False  # 깨는 점프 없이 (줄에서 빠져서 idle_play 가 더는 보지 않는다)
         self.oneshot = None
         animation, bubble, ms = petcore.BYE
         self.set_play(animation, bubble)  # 달리는 동안에도 이 말풍선을 달아서 창 크기가 그대로다
         left = petcore.run_off_left(self.x(), self.size_hint_[0], (area.left(), area.right() + 1),
                                     self.pet_size[0] * RUN_OFF_PETS)
-        target = QPoint(left, self.y())
+        target = QPoint(left, self.home.y() if flying else self.y())  # 날던 펫은 땅(자기 줄)으로 내려가며 달린다
         self.leave_timer.timeout.connect(
             lambda: self.walk_to(target, ENTER_SPEED, then=then, relative=False, fade="out", bubble=bubble))
         self.leave_timer.start(ms)
