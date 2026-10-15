@@ -337,6 +337,12 @@ class PetWindow(QWidget):
             badge_w = max(badge_h, badge_metrics.horizontalAdvance(self.badge) + 10)
             self.badge_rect = QRect(self.pet_rect.right() - badge_w + 1, self.pet_rect.top() + 2,
                                     badge_w, badge_h)
+        # 투명한 빈 곳은 클릭이 아래 창으로 가게 말풍선·펫·이름표 영역만 남긴다.
+        # 창 크기가 그대로여도 말풍선·이름표 폭은 바뀔 수 있어서 자리를 잴 때마다 다시 만든다.
+        region = QRegion(self.pet_rect).united(QRegion(self.name_rect))
+        if self.bubble:
+            region = region.united(QRegion(self.bubble_rect.adjusted(0, 0, 0, BUBBLE_TAIL)))
+        self.setMask(region)
 
     size_hint_ = (0, 0)
 
@@ -349,14 +355,9 @@ class PetWindow(QWidget):
             self.place(left, top)
 
     def place(self, left, top):
-        """창 왼쪽 위를 (left, top) 에 두고 창 크기와 클릭 영역을 맞춘다."""
+        """창 왼쪽 위를 (left, top) 에 두고 창 크기를 맞춘다."""
         width, height = self.size_hint_
         self.setGeometry(left, top, width, height)
-        # 투명한 빈 곳은 클릭이 아래 창으로 가게 말풍선·펫·이름표 영역만 남긴다
-        region = QRegion(self.pet_rect).united(QRegion(self.name_rect))
-        if self.bubble:
-            region = region.united(QRegion(self.bubble_rect.adjusted(0, 0, 0, BUBBLE_TAIL)))
-        self.setMask(region)
 
     # ---- 애니메이션 --------------------------------------------------------
 
