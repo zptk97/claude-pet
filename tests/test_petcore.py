@@ -592,6 +592,24 @@ class PlayTest(unittest.TestCase):
             self.assertFalse(angry)
 
 
+class MotionTest(unittest.TestCase):
+    AREA = (1000, 3000)  # 화면 왼쪽 x, 오른쪽 끝 x + 1
+
+    def test_new_sessions(self):
+        sessions = {"old": session("idle", created=NOW - 60_000), "new": session("idle", created=NOW - 1000),
+                    "seen": session("idle", created=NOW - 1000)}
+        self.assertEqual(petcore.new_sessions(sessions, {"seen"}, NOW - 10_000), {"new"})
+
+    def test_run_off_toward_wider_side(self):
+        self.assertEqual(petcore.run_off_left(2600, 100, self.AREA, 300), 2300)  # 오른쪽 아래 줄: 왼쪽이 넓다
+        self.assertEqual(petcore.run_off_left(1300, 100, self.AREA, 200), 1500)
+        self.assertEqual(petcore.run_off_left(1950, 100, self.AREA, 300), 2250)  # 양쪽이 같으면 오른쪽
+
+    def test_run_off_stays_on_screen(self):
+        self.assertEqual(petcore.run_off_left(1000, 100, (1000, 1250), 300), 1150)  # 넓은 쪽도 좁으면 화면 끝까지만
+        self.assertEqual(petcore.run_off_left(1000, 250, (1000, 1250), 300), 1000)  # 자리가 없으면 제자리
+
+
 class LayoutTest(unittest.TestCase):
     SIZES = {"a": (100, 150), "b": (120, 200), "c": (80, 150)}
 

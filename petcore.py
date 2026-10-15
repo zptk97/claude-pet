@@ -660,12 +660,16 @@ def release_reaction(shake):
     return "waving", "또 해 주세요!", 2000
 
 
-# ---- 연타 ------------------------------------------------------------------------
+# ---- 연타, 등장·퇴장 -------------------------------------------------------------
 
 RAPID_CLICKS = 5        # RAPID_CLICK_MS 안에 이만큼 누르면 화를 낸다
 RAPID_CLICK_MS = 2000
 # (동작, 말풍선, 보여줄 ms)
 ANGRY = ("failed", "그만 눌러요!", 2000)
+GREET = ("waving", "안녕하세요!", 1500)  # 새 세션 펫이 자리로 달려와서
+BYE = ("waving", "수고했어요!", 1200)    # 끝난 세션 펫이 달려 나가기 전에
+# 펫 프로그램이 켜지기 이만큼 전에 생긴 세션도 새 세션으로 본다 (훅이 상태 파일을 쓰고 펫을 띄운다)
+ENTER_GRACE_MS = 10_000
 
 
 def rapid_clicks(times, now_ms):
@@ -674,6 +678,23 @@ def rapid_clicks(times, now_ms):
     if len(times) >= RAPID_CLICKS:
         return [], True
     return times, False
+
+
+def new_sessions(sessions, known, since_ms):
+    """지난번에 없던 세션 중 since_ms 뒤에 생긴 것 (달려오며 나타난다)."""
+    return {sid for sid, session in sessions.items() if sid not in known and session["created"] >= since_ms}
+
+
+def run_off_left(left, width, area, distance):
+    """등장·퇴장 때 달릴 곳의 창 왼쪽 x. 화면에서 자리가 더 넓은 쪽으로 distance 만큼 가되 화면 안에 머문다
+    (모니터가 여럿이면 화면 밖이 옆 모니터라서 밖으로 나가지 않고 서서히 사라진다).
+    줄은 화면 구석에서 넓은 쪽으로 자라므로 새 펫이 다른 펫들을 가로지르지 않는다.
+    area 는 (화면 왼쪽 x, 화면 오른쪽 끝 x + 1)."""
+    room_left = left - area[0]
+    room_right = area[1] - (left + width)
+    if room_right >= room_left:
+        return left + max(0, min(distance, room_right))
+    return left - max(0, min(distance, room_left))
 
 
 # ---- 펫 자리 (줄, 따로 움직이기) --------------------------------------------------
