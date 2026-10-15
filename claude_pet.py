@@ -272,6 +272,7 @@ class PetWindow(QWidget):
         self.drag_animation = None  # 왼쪽 드래그로 옮기는 동안 끄는 쪽으로 달리는 동작 (장난보다 뒤)
 
         self.pet_rect = self.bubble_rect = self.name_rect = self.badge_rect = QRect()
+        self.mask_region = QRegion()
         self.set_animation(petcore.STATE_ANIMATION[self.state])
 
     # ---- 내용 / 크기 -------------------------------------------------------
@@ -308,6 +309,8 @@ class PetWindow(QWidget):
         changed = self.size_hint_ != old
         if changed and self.playing():  # 들고 있거나 돌아가는 중에는 줄 배치가 크기를 맞춰 주지 않는다
             self.place(self.x(), self.y())
+        elif not changed:  # 창 크기가 그대로면 다시 놓이지 않으니 말풍선·이름표가 바뀐 자리만 반영한다
+            self.setMask(self.mask_region)
         return changed
 
     def relayout(self):
@@ -338,12 +341,11 @@ class PetWindow(QWidget):
             badge_w = max(badge_h, badge_metrics.horizontalAdvance(self.badge) + 10)
             self.badge_rect = QRect(self.pet_rect.right() - badge_w + 1, self.pet_rect.top() + 2,
                                     badge_w, badge_h)
-        # 투명한 빈 곳은 클릭이 아래 창으로 가게 말풍선·펫·이름표 영역만 남긴다.
-        # 창 크기가 그대로여도 말풍선·이름표 폭은 바뀔 수 있어서 자리를 잴 때마다 다시 만든다.
+        # 투명한 빈 곳은 클릭이 아래 창으로 가게 말풍선·펫·이름표 영역만 남긴다 (place 나 refit 에서 씌운다)
         region = QRegion(self.pet_rect).united(QRegion(self.name_rect))
         if self.bubble:
             region = region.united(QRegion(self.bubble_rect.adjusted(0, 0, 0, BUBBLE_TAIL)))
-        self.setMask(region)
+        self.mask_region = region
 
     size_hint_ = (0, 0)
 
@@ -356,9 +358,11 @@ class PetWindow(QWidget):
             self.place(left, top)
 
     def place(self, left, top):
-        """창 왼쪽 위를 (left, top) 에 두고 창 크기를 맞춘다."""
+        """창 왼쪽 위를 (left, top) 에 두고 창 크기와 클릭 영역을 맞춘다."""
         width, height = self.size_hint_
         self.setGeometry(left, top, width, height)
+        # GNOME(mutter)은 mask 를 받을 때의 창 크기로 잘라 두고 창이 커져도 다시 읽지 않아서 크기를 바꾼 뒤에 씌운다
+        self.setMask(self.mask_region)
 
     # ---- 애니메이션 --------------------------------------------------------
 
