@@ -644,6 +644,23 @@ class IdleTest(unittest.TestCase):
         self.assertEqual(petcore.changed_states(old, new), {"a": ("running", "done")})
 
 
+class NeighborTest(unittest.TestCase):
+    SPOTS = {"a": (1000, 500), "b": (900, 500), "c": (1300, 500), "far": (1600, 500)}
+
+    def test_nearest(self):
+        self.assertEqual(petcore.nearest(self.SPOTS, "a", 400, self.SPOTS), "b")
+        self.assertEqual(petcore.nearest(self.SPOTS, "a", 400, ["c", "far"]), "c")  # 고를 수 있는 펫 중에서
+        self.assertIsNone(petcore.nearest(self.SPOTS, "a", 400, ["far"]))  # 너무 멀다
+        self.assertIsNone(petcore.nearest(self.SPOTS, "a", 400, ["a"]))  # 자기 자신은 빼고
+        self.assertIsNone(petcore.nearest(self.SPOTS, "gone", 400, self.SPOTS))
+
+    def test_beside_dx(self):
+        gap = round(petcore.BESIDE * 100)
+        self.assertEqual(petcore.beside_dx(500, 100, 1000, 100), 1000 - gap - 500)  # 왼쪽에서 다가가 왼쪽 옆에
+        self.assertEqual(petcore.beside_dx(1500, 100, 1000, 100), 1000 + gap - 1500)  # 오른쪽에서 오면 오른쪽 옆에
+        self.assertEqual(petcore.beside_dx(1000 - 110, 100, 1000, 100), 110 - gap)  # 줄에서 바로 옆이면 한 걸음
+
+
 class MotionTest(unittest.TestCase):
     AREA = (1000, 3000)  # 화면 왼쪽 x, 오른쪽 끝 x + 1
 

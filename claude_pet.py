@@ -16,7 +16,8 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 펫이 혼자 움직이기, 작업 요약 켜고 끄기, 자동 실행, 종료
 
 펫이 혼자 움직이기: 새 세션 펫은 화면의 넓은 쪽에서 달려와 나타나고, 끝난 세션 펫은 인사하고 달려 나가며 사라진다.
-쉬는 펫은 가끔 옆으로 걸어갔다 온다. 오래 쉬면 졸고, 오래 걸린 일이 끝나면 색종이를 뿌린다.
+쉬는 펫은 가끔 옆으로 걸어갔다 오거나 가까운 펫에게 인사하러 가고, 오류 난 이웃은 찾아가 위로한다 (끄면 제자리에서).
+졸기·축하: 오래 쉬면 졸고, 오래 걸린 일이 끝나면 색종이를 뿌리고, 이웃이 일을 끝내면 옆 펫이 축하한다.
 
 나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
 그 펫을 클릭해 돌아가거나, 그 세션에 새 프롬프트를 보내거나, 표시 지우기를 누르면 풀린다.
@@ -83,6 +84,7 @@ WALK_MAX_MS = 4000  # 걸어갈 길이 이보다 오래 걸리면 더 빨리 달
 ENTER_SPEED = 260   # 등장·퇴장 때 달리는 속도 (px/s)
 RUN_OFF_PETS = 3    # 등장·퇴장 때 펫 폭의 몇 배만큼 달리는지 (화면의 넓은 쪽으로)
 WALK_SPEED = 90     # 산책할 때 걷는 속도 (px/s)
+VISIT_SPEED = 160   # 옆 펫을 찾아갈 때 (위로, 인사) 달리는 속도 (px/s)
 SLEEP_SLOWDOWN = 2  # 조는 동안 쉬는 동작을 이만큼 느리게
 WHEEL_NOTCH = 120   # 휠 한 칸 (angleDelta)
 EFFECT_TICK_MS = 33
@@ -1458,7 +1460,8 @@ class PetManager(QObject):
         if needs_layout:
             self.layout()
 
-        for sid, (_, new) in petcore.changed_states(old_states, self.view_states).items():
+        changes = petcore.changed_states(old_states, self.view_states)
+        for sid, (_, new) in changes.items():
             window = self.windows.get(sid)
             if window is None:
                 continue
@@ -1466,12 +1469,15 @@ class PetManager(QObject):
                 window.come_home()  # 산책 나가 있었으면 일하러 돌아온다
             if new == "done" and petcore.long_work(sessions[sid]):
                 window.celebrate()
+        for sid, (_, new) in changes.items():  # 이웃은 이번에 상태가 바뀌지 않은 펫 중에서 고른다
+            if new in ("done", "error"):
+                self.neighbor_react(sid, new, busy=changes)
         self.idle_play(now)
         if self.card.isVisible():
             self.update_card()
 
     def idle_play(self, now):
-        """쉬는 펫: 오래 쉬면 졸고, 좀 쉬면 가끔 옆으로 걸어갔다 온다.
+        """쉬는 펫: 오래 쉬면 졸고, 좀 쉬면 가끔 옆으로 걸어갔다 오거나 가까운 펫에게 인사하러 간다.
         보이는 상태(접힌 요약 펫이면 요약 상태)로 보고, 나중에 이어서 볼 펫은 기다리는 중이라 가만히 둔다."""
         for sid, window in self.windows.items():
             session = self.sessions.get(sid)
@@ -1486,6 +1492,8 @@ class PetManager(QObject):
                 window.next_wander_ms = now + random.randint(*petcore.WANDER_EVERY_MS)
             elif now >= window.next_wander_ms:
                 window.next_wander_ms = None
+                if random.random() < petcore.GREET_CHANCE and self.greet(sid, window):
+                    continue
                 dx = petcore.wander_step(random, window.pet_size[0], *self.wander_room(window))
                 if dx:
                     self.walk_behind(window, dx)
@@ -1495,8 +1503,82 @@ class PetManager(QObject):
         """산책해도 되는지: 혼자 움직이기가 켜져 있고, 아무도 만지거나 보고 있지 않고, 자리에 가만히 있을 때.
         접혀 있으면 한 마리뿐인 펫이 펼치기 단추 노릇도 해서 걷지 않는다."""
         return (self.motion_enabled() and not self.folded() and self.drag_origin is None and self.hover_sid != sid
-                and QApplication.activePopupWidget() is None and not window.playing() and not window.leaving
-                and window.play_animation is None and window.offset == QPoint())
+                and QApplication.activePopupWidget() is None and self.at_rest(window))
+
+    @staticmethod
+    def at_rest(window):
+        """자리에 가만히 서서 아무것도 안 하고 있는지 (움직이거나, 반응하거나, 나가는 중이 아님)."""
+        return (not window.playing() and not window.leaving and window.play_animation is None
+                and window.oneshot is None and window.offset == QPoint())
+
+    @staticmethod
+    def pet_center(window, settled=False):
+        """펫 그림 가운데의 화면 자리. settled 면 움직이는 중이어도 자기 자리(home)에 섰을 때의 자리."""
+        top_left = window.home if settled and (window.playing() or window.offset != QPoint()) else window.pos()
+        center = top_left + window.pet_rect.center()
+        return center.x(), center.y()
+
+    def free_to_react(self, sid, window):
+        """이웃 일에 반응할 수 있는지: 깬 채 쉬거나 다 했어요로 자리에 가만히 서 있을 때."""
+        return (window.state in ("idle", "done") and not window.sleeping and sid not in self.marks
+                and self.at_rest(window))
+
+    def neighbor_react(self, sid, state, busy=()):
+        """다 한 펫은 가장 가까운 이웃이 그 자리에서 축하하고, 오류 난 펫은 이웃이 옆으로 찾아가 위로한다.
+        busy 는 이번에 자기 상태가 바뀌어 할 일이 있는 펫들이라 이웃으로 고르지 않는다."""
+        if self.folded() or sid not in self.windows:
+            return
+        spots = {s: self.pet_center(w) for s, w in self.windows.items()}
+        friends = [s for s, w in self.windows.items() if s not in busy and self.free_to_react(s, w)]
+        friend = petcore.nearest(spots, sid, petcore.NEIGHBOR_PX, friends)
+        if friend is None:
+            return
+        if state == "done":
+            self.windows[friend].show_reaction(*petcore.CHEER)
+        else:
+            self.visit(friend, sid, petcore.CONSOLE)
+
+    def greet(self, sid, window):
+        """산책 대신 가까이에서 깬 채 쉬는 펫에게 다가가 서로 인사한다. 인사할 펫이 없으면 False."""
+        spots = {s: self.pet_center(w) for s, w in self.windows.items()}
+        friends = [s for s, w in self.windows.items()
+                   if w.state == "idle" and s not in self.marks and not w.sleeping and self.can_wander(s, w)]
+        friend = petcore.nearest(spots, sid, petcore.GREET_PETS * window.pet_size[0], friends)
+        if friend is None:
+            return False
+        self.windows[friend].next_wander_ms = None  # 인사하는 동안 자리를 뜨지 않게
+        self.visit(sid, friend, petcore.HELLO, petcore.HELLO)
+        return True
+
+    def visit(self, sid, target_sid, reaction, target_reaction=None):
+        """sid 펫이 target_sid 펫 옆으로 달려가 reaction 을 보이고 돌아온다 (가는 길의 펫들 뒤로 지나간다).
+        높이가 다르거나 걸을 수 없으면 (혼자 움직이기를 껐거나 만지는 중) 제자리에서 한다.
+        target_reaction 은 도착했을 때 상대가 보인다."""
+        window, target = self.windows[sid], self.windows[target_sid]
+        mine, theirs = self.pet_center(window), self.pet_center(target, settled=True)
+        floors = [w.y() + w.pet_rect.bottom() for w in (window, target)]
+        room_left, room_right = self.wander_room(window)
+        dx = petcore.beside_dx(mine[0], window.pet_size[0], theirs[0], target.pet_size[0])
+        dx = max(-room_left, min(dx, room_right))  # 화면 밖으로는 가지 않는다
+
+        def arrive():
+            other = self.windows.get(target_sid)
+            if other is None or other.leaving:  # 그새 떠났으면 그냥 돌아간다
+                window.wander_timer.start(0)
+                return
+            window.show_reaction(*reaction)
+            if target_reaction and not other.playing():
+                other.show_reaction(*target_reaction)
+            window.wander_timer.start(reaction[2] + 300)  # 다 말하고 돌아간다 (come_back)
+
+        if self.can_wander(sid, window) and abs(floors[0] - floors[1]) <= petcore.SAME_FLOOR_PX \
+                and abs(dx) >= window.pet_size[0] // 8:
+            self.walk_behind(window, dx)
+            window.walk_to(QPoint(dx, 0), VISIT_SPEED, then=arrive)
+        else:
+            window.show_reaction(*reaction)
+            if target_reaction:
+                target.show_reaction(*target_reaction)
 
     def wander_room(self, window):
         """산책할 수 있는 (왼쪽, 오른쪽) px: 화면 끝까지 (옆 펫은 뒤로 지나간다)."""

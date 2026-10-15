@@ -14,6 +14,7 @@ background 는 턴이 끝났지만 백그라운드 작업(bg_tasks 개, 첫 작�
 """
 
 import json
+import math
 import os
 import re
 import time
@@ -755,6 +756,40 @@ def long_work(session):
 def changed_states(old, new):
     """양쪽에 다 있는 세션 중 보이는 상태가 바뀐 것 {session_id: (전, 후)}."""
     return {sid: (old[sid], state) for sid, state in new.items() if sid in old and old[sid] != state}
+
+
+# ---- 펫끼리 ------------------------------------------------------------------------
+
+NEIGHBOR_PX = 400       # 이 거리 안의 가장 가까운 펫이 다 한 일을 축하하고 오류를 위로한다
+GREET_PETS = 3          # 펫 폭의 이만큼 안에 깬 채 쉬는 펫이 있으면 산책 대신 가끔 인사하러 간다
+GREET_CHANCE = 0.4
+SAME_FLOOR_PX = 20      # 발밑 높이가 이만큼 안이면 걸어서 찾아간다 (아니면 제자리에서 말만 한다)
+BESIDE = 0.85           # 옆에 설 때 두 펫 가운데 사이를 두 펫 폭 평균의 이만큼으로
+CHEER = ("jumping", "잘했어!", 1500)
+CONSOLE = ("waving", "괜찮아요?", 2000)
+HELLO = ("waving", "안녕!", 1500)
+
+
+def nearest(spots, sid, max_px, candidates):
+    """spots {session_id: (x, y)} 에서 sid 에 가장 가까운 candidates 중 하나 (max_px 안). 없으면 None."""
+    if sid not in spots:
+        return None
+    x, y = spots[sid]
+    best = None
+    for other in candidates:
+        if other == sid or other not in spots:
+            continue
+        distance = math.hypot(spots[other][0] - x, spots[other][1] - y)
+        if distance <= max_px and (best is None or distance < best[0]):
+            best = (distance, other)
+    return best[1] if best else None
+
+
+def beside_dx(my_x, my_w, their_x, their_w):
+    """펫 가운데 x 가 my_x 인 펫이 their_x 펫의 내 쪽 옆에 서려면 옆으로 갈 x 차이."""
+    gap = BESIDE * (my_w + their_w) / 2
+    target = their_x - gap if my_x <= their_x else their_x + gap
+    return round(target - my_x)
 
 
 # ---- 펫 자리 (줄, 따로 움직이기) --------------------------------------------------
