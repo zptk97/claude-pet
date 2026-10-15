@@ -16,6 +16,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 펫이 혼자 움직이기, 작업 요약 켜고 끄기, 자동 실행, 종료
 
 펫이 혼자 움직이기: 새 세션 펫은 화면의 넓은 쪽에서 달려와 나타나고, 끝난 세션 펫은 인사하고 달려 나가며 사라진다.
+쉬는 펫은 가끔 옆으로 걸어갔다 온다. 오래 쉬면 존다.
 
 나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
 그 펫을 클릭해 돌아가거나, 그 세션에 새 프롬프트를 보내거나, 표시 지우기를 누르면 풀린다.
@@ -24,6 +25,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 그런 세션이 없으면 가장 오래된 세션 펫에 상태 요약을 달고, 클릭하면 펼친다.
 """
 
+import ctypes
 import fcntl
 import json
 import math
@@ -80,6 +82,8 @@ GIST_MAX_FAILURES = 3  # 요약이 연달아 이만큼 실패하면 (로그인 �
 WALK_MAX_MS = 4000  # 걸어갈 길이 이보다 오래 걸리면 더 빨리 달린다
 ENTER_SPEED = 260   # 등장·퇴장 때 달리는 속도 (px/s)
 RUN_OFF_PETS = 3    # 등장·퇴장 때 펫 폭의 몇 배만큼 달리는지 (화면의 넓은 쪽으로)
+WALK_SPEED = 90     # 산책할 때 걷는 속도 (px/s)
+SLEEP_SLOWDOWN = 2  # 조는 동안 쉬는 동작을 이만큼 느리게
 WHEEL_NOTCH = 120   # 휠 한 칸 (angleDelta)
 EFFECT_TICK_MS = 33
 HEART_COUNT = 1     # 휠 한 칸마다 떠오르는 하트
@@ -237,6 +241,93 @@ class Desktop:
         return self.bus.connect(service, path, interface, "Clicked", slot)
 
 
+class XClientMessageEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                ("format", ctypes.c_int), ("data", ctypes.c_long * 5)]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [("xclient", XClientMessageEvent), ("pad", ctypes.c_long * 24)]
+
+
+class XStack:
+    """X11 창 쌓임 순서. GNOME 은 앱이 스스로 창을 올리거나 내리는 요청(raise/lower)을 무시하지만,
+    페이저처럼 _NET_RESTACK_WINDOW 로 다른 창 바로 아래에 두는 요청은 받아 준다 (위로 올리는 건 안 된다).
+    항상 위 창끼리만 순서가 바뀌고 보통 창보다는 계속 위에 있다. libX11 을 못 쓰면 아무것도 하지 않는다."""
+
+    STACK_BELOW = 1        # ConfigureWindow stack_mode Below
+    SOURCE_PAGER = 2       # 창 관리자가 앱 요청이 아니라 사용자 뜻으로 보고 들어준다
+    CLIENT_MESSAGE = 33
+    SUBSTRUCTURE_MASK = (1 << 19) | (1 << 20)  # SubstructureNotify | SubstructureRedirect
+    XA_WINDOW = 33
+
+    def __init__(self):
+        self.lib = self.display = None
+        try:
+            lib = ctypes.cdll.LoadLibrary("libX11.so.6")
+        except OSError:
+            return
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        lib.XInternAtom.restype = ctypes.c_ulong
+        lib.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long,
+                                   ctypes.POINTER(XEvent)]
+        lib.XFlush.argtypes = [ctypes.c_void_p]
+        lib.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int,
+            ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p)]
+        lib.XFree.argtypes = [ctypes.c_void_p]
+        display = lib.XOpenDisplay(None)
+        if not display:
+            return
+        self.lib, self.display = lib, display
+        self.root = lib.XDefaultRootWindow(display)
+        self.restack_atom = lib.XInternAtom(display, b"_NET_RESTACK_WINDOW", 0)
+        self.stacking_atom = lib.XInternAtom(display, b"_NET_CLIENT_LIST_STACKING", 0)
+
+    def stacking(self):
+        """창 관리자가 아는 창 id 들, 아래에서 위 순서."""
+        actual_type, actual_format = ctypes.c_ulong(), ctypes.c_int()
+        count, remaining, data = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        status = self.lib.XGetWindowProperty(
+            self.display, self.root, self.stacking_atom, 0, 4096, 0, self.XA_WINDOW, ctypes.byref(actual_type),
+            ctypes.byref(actual_format), ctypes.byref(count), ctypes.byref(remaining), ctypes.byref(data))
+        if status != 0 or not data:
+            return []
+        try:
+            if actual_format.value != 32:
+                return []
+            return list(ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[:count.value])
+        finally:
+            self.lib.XFree(data)
+
+    def lower_below(self, window, others):
+        """window 를 others 중 가장 아래 창 바로 아래로 내린다. 이미 그보다 아래면 그대로 둔다."""
+        if self.lib is None:
+            return
+        rank = {wid: i for i, wid in enumerate(self.stacking())}
+        lowest = min((wid for wid in others if wid in rank), key=rank.get, default=None)
+        if window not in rank or lowest is None or rank[window] < rank[lowest]:
+            return
+        event = XEvent()
+        message = event.xclient
+        message.type = self.CLIENT_MESSAGE
+        message.send_event = 1
+        message.display = self.display
+        message.window = window
+        message.message_type = self.restack_atom
+        message.format = 32
+        message.data[0] = self.SOURCE_PAGER
+        message.data[1] = lowest
+        message.data[2] = self.STACK_BELOW
+        self.lib.XSendEvent(self.display, self.root, 0, self.SUBSTRUCTURE_MASK, ctypes.byref(event))
+        self.lib.XFlush(self.display)
+
+
 class PetWindow(QWidget):
     """세션 하나의 펫: 말풍선, 펫, 이름표. 배치와 클릭 처리는 PetManager 가 한다."""
 
@@ -286,7 +377,12 @@ class PetWindow(QWidget):
         self.drag_animation = None  # 왼쪽 드래그로 옮기는 동안 끄는 쪽으로 달리는 동작 (장난보다 뒤)
         self.clicks = []            # 최근 클릭 시각 (연타하면 화낸다)
 
-        # 휠을 굴리면 쓰다듬는다
+        # 쉬는 펫: 가끔 산책하고, 오래 쉬면 존다. 휠을 굴리면 쓰다듬는다
+        self.sleeping = False
+        self.zzz = 0                # 조는 동안 넘긴 프레임 수 (Zzz 글자 수를 바꾼다)
+        self.touched_ms = 0         # 마지막 클릭·쓰다듬기 (쉬는 시간을 여기서부터 다시 센다)
+        self.next_wander_ms = None  # 다음 산책 시각 (산책할 수 없으면 None)
+        self.wander_timer = QTimer(self, singleShot=True, timeout=self.come_back)
         self.wheel_acc = 0          # 한 칸이 안 된 휠 양 (터치패드는 조금씩 온다)
         self.strokes = []           # 최근 쓰다듬은 시각
         self.effects = None         # 하트를 그리는 EffectLayer (처음 쓸 때 만든다)
@@ -443,15 +539,19 @@ class PetWindow(QWidget):
 
     def poke(self):
         """클릭하면 점프한다. 빠르게 여러 번 누르면 화낸다."""
-        self.clicks, angry = petcore.rapid_clicks(self.clicks, int(time.time() * 1000))
+        now = int(time.time() * 1000)
+        self.touch(now)
+        self.clicks, angry = petcore.rapid_clicks(self.clicks, now)
         if angry:
             self.show_reaction(*petcore.ANGRY)
         else:
             self.play_jump()
 
     def schedule_frame(self):
-        durations = petcore.ANIMATIONS[self.current_animation()][1]
-        self.anim_timer.start(durations[self.frame_index % len(durations)])
+        name = self.current_animation()
+        durations = petcore.ANIMATIONS[name][1]
+        ms = durations[self.frame_index % len(durations)]
+        self.anim_timer.start(ms * SLEEP_SLOWDOWN if self.sleeping and name == "idle" else ms)
 
     def next_frame(self):
         count = len(petcore.ANIMATIONS[self.current_animation()][1])
@@ -459,6 +559,8 @@ class PetWindow(QWidget):
         if self.frame_index >= count:
             self.frame_index = 0
             self.oneshot = None
+        if self.sleeping:
+            self.zzz += 1
         self.schedule_frame()
         self.update()
 
@@ -483,6 +585,7 @@ class PetWindow(QWidget):
         return self.refit()
 
     def grab_begin(self, pos):
+        self.touch(int(time.time() * 1000))
         self.stop_walk()
         self.back.stop()
         self.react_timer.stop()
@@ -533,11 +636,51 @@ class PetWindow(QWidget):
         self.set_play(self.walk_pose if self.walking() else None, None)
         self.manager.layout()
 
-    # ---- 쓰다듬기 ------------------------------------------------------------
+    # ---- 쉬는 펫: 졸기, 산책, 쓰다듬기 ---------------------------------------------
+
+    def touch(self, now_ms):
+        """클릭하거나 쓰다듬으면 깬다 (쉬는 시간을 여기서부터 다시 센다)."""
+        self.touched_ms = now_ms
+        self.set_sleeping(False)
+
+    def set_sleeping(self, sleeping):
+        """오래 쉬면 존다: 쉬는 동작을 느리게 하고 Zzz 를 단다. 깨면 한 번 뛴다."""
+        if sleeping == self.sleeping:
+            return
+        self.sleeping = sleeping
+        self.zzz = 0
+        if not sleeping and self.oneshot is None and not self.playing():
+            self.play_jump()
+        self.update()
+
+    def wander(self, dx, pause_ms):
+        """옆으로 dx 만큼 걸어가 pause_ms 동안 서 있다가 자리로 돌아온다."""
+        self.walk_to(QPoint(dx, 0), WALK_SPEED, then=lambda: self.rest_away(pause_ms))
+
+    def rest_away(self, ms):
+        if not self.react_timer.isActive():  # 걸어가는 동안 시작한 반응(헤헤 등)은 끝까지 보인다
+            self.end_play()
+        self.wander_timer.start(ms)
+
+    def come_back(self):
+        if self.leaving:
+            return
+        if self.react_timer.isActive():  # 반응이 끝난 뒤에 돌아간다
+            self.wander_timer.start(self.react_timer.remainingTime() + 200)
+            return
+        self.walk_to(QPoint(), WALK_SPEED)
+
+    def come_home(self):
+        """산책 나가 있으면 서둘러 자리로 돌아온다 (일이 생겼을 때)."""
+        self.wander_timer.stop()
+        heading_out = self.walking() and self.walk_target[1] and self.walk_target[0] != QPoint()
+        if not self.leaving and (self.offset != QPoint() or heading_out):
+            self.walk_to(QPoint(), ENTER_SPEED)
 
     def stroke(self):
         """휠 한 칸: 하트가 떠오르고, 빠르게 몇 칸 굴리면 좋아한다."""
         now = int(time.time() * 1000)
+        self.touch(now)
         self.effect("heart", HEART_COUNT)
         self.strokes, happy = petcore.pet_strokes(self.strokes, now)
         if happy and self.held is None:
@@ -605,6 +748,7 @@ class PetWindow(QWidget):
         """혼자 걷기를 그만두고 자리로 돌아갈 준비를 한다 (줄을 끌거나 펫을 들 때). 옮기는 건 부른 쪽이 한다."""
         walking = self.walking()
         self.walk.stop()
+        self.wander_timer.stop()
         self.fade.stop()
         self.setWindowOpacity(1.0)
         self.walk_target = self.walk_then = self.walk_pose = None
@@ -626,6 +770,8 @@ class PetWindow(QWidget):
         self.walk.stop()
         self.back.stop()
         self.react_timer.stop()
+        self.wander_timer.stop()
+        self.sleeping = False  # 깨는 점프 없이 (줄에서 빠져서 idle_play 가 더는 보지 않는다)
         self.oneshot = None
         animation, bubble, ms = petcore.BYE
         self.set_play(animation, bubble)  # 달리는 동안에도 이 말풍선을 달아서 창 크기가 그대로다
@@ -654,6 +800,8 @@ class PetWindow(QWidget):
             self.paint_badge(painter)
         if self.marked:
             self.paint_mark(painter)
+        if self.sleeping:
+            self.paint_zzz(painter)
 
     def paint_bubble(self, painter):
         style = "running" if self.play_bubble is not None else self.bubble_style
@@ -689,6 +837,23 @@ class PetWindow(QWidget):
         painter.setBrush(QColor(MARK_COLOR))
         painter.drawPolygon(QPolygonF([QPoint(x, y), QPoint(x + w, y), QPoint(x + w, y + h),
                                        QPoint(x + w // 2, y + h - 5), QPoint(x, y + h)]))
+
+    def paint_zzz(self, painter):
+        """조는 펫 오른쪽 위의 z Z Z (프레임마다 한 글자씩 늘었다가 다시). 펫 영역 안이라 창 마스크에 이미 들어 있다."""
+        size = max(9, self.pet_rect.height() // 7)
+        font = QFont(self.font().family())
+        font.setBold(True)
+        for i in range(min(3, self.zzz % 4 + 1)):
+            font.setPixelSize(int(size * (0.7 + 0.2 * i)))
+            path = QPainterPath()
+            path.addText(self.pet_rect.right() - size * (3 - i), self.pet_rect.top() + size * (3 - 0.8 * i),
+                         font, "z" if i == 0 else "Z")
+            painter.setPen(QPen(QColor("#FFFFFF"), 3))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(path)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#4C51BF"))
+            painter.drawPath(path)
 
     def paint_badge(self, painter):
         rect = QRectF(self.badge_rect).adjusted(1, 1, -1, -1)
@@ -1046,6 +1211,7 @@ class PetManager(QObject):
         self.config = load_config()
         self.state_dir = petcore.state_dir()
         self.desktop = Desktop()
+        self.xstack = XStack()
         self.transcripts = petcore.TranscriptReader()
         self.gister = Gister(self, self.refresh)
         self.gister.enabled = self.gist_enabled()
@@ -1199,7 +1365,7 @@ class PetManager(QObject):
                 gists[sid] = self.gister.gist(sid, said)
         self.gister.forget(sessions)
         views = petcore.session_views(sessions, now, self.acked, gists)
-        self.view_states = {sid: state for sid, state, _ in views}
+        old_states, self.view_states = self.view_states, {sid: state for sid, state, _ in views}
         # 펫 배정은 접혀서 안 보이는 세션까지 해 둬야 펼쳤을 때 펫이 바뀌지 않는다
         assigned = petcore.assign_pets([sid for sid, _, _ in views], [p["id"] for p in self.enabled_pets()],
                                        self.assignments)
@@ -1256,8 +1422,60 @@ class PetManager(QObject):
         self.order = order
         if needs_layout:
             self.layout()
+
+        for sid, (_, new) in petcore.changed_states(old_states, self.view_states).items():
+            window = self.windows.get(sid)
+            if window is None:
+                continue
+            if new != "idle":
+                window.come_home()  # 산책 나가 있었으면 일하러 돌아온다
+        self.idle_play(now)
         if self.card.isVisible():
             self.update_card()
+
+    def idle_play(self, now):
+        """쉬는 펫: 오래 쉬면 졸고, 좀 쉬면 가끔 옆으로 걸어갔다 온다.
+        보이는 상태(접힌 요약 펫이면 요약 상태)로 보고, 나중에 이어서 볼 펫은 기다리는 중이라 가만히 둔다."""
+        for sid, window in self.windows.items():
+            session = self.sessions.get(sid)
+            if session is None:
+                continue
+            state = window.state if sid not in self.marks else None
+            mood = petcore.idle_mood(state, now - max(session["ts"], window.touched_ms))
+            window.set_sleeping(mood == "sleep")
+            if mood != "wander" or not self.can_wander(sid, window):
+                window.next_wander_ms = None
+            elif window.next_wander_ms is None:
+                window.next_wander_ms = now + random.randint(*petcore.WANDER_EVERY_MS)
+            elif now >= window.next_wander_ms:
+                window.next_wander_ms = None
+                dx = petcore.wander_step(random, window.pet_size[0], *self.wander_room(window))
+                if dx:
+                    self.walk_behind(window, dx)
+                    window.wander(dx, random.randint(*petcore.WANDER_PAUSE_MS))
+
+    def can_wander(self, sid, window):
+        """산책해도 되는지: 혼자 움직이기가 켜져 있고, 아무도 만지거나 보고 있지 않고, 자리에 가만히 있을 때.
+        접혀 있으면 한 마리뿐인 펫이 펼치기 단추 노릇도 해서 걷지 않는다."""
+        return (self.motion_enabled() and not self.folded() and self.drag_origin is None and self.hover_sid != sid
+                and QApplication.activePopupWidget() is None and not window.playing() and not window.leaving
+                and window.play_animation is None and window.offset == QPoint())
+
+    def wander_room(self, window):
+        """산책할 수 있는 (왼쪽, 오른쪽) px: 화면 끝까지 (옆 펫은 뒤로 지나간다)."""
+        mine = window.geometry()
+        area = self.screen_area(mine.center())
+        return mine.left() - area.left(), area.right() - mine.right()
+
+    def walk_behind(self, window, dx):
+        """dx 만큼 걸어갈 길에 다른 펫이 있으면 그 펫들 뒤로 지나가게 창을 내린다
+        (앞에 선 펫이 클릭을 그대로 받아서, 옆 펫을 누르려다 산책하는 펫을 누르지 않는다)."""
+        mine = window.geometry()
+        path = mine.united(mine.translated(dx, 0))
+        others = [int(other.winId()) for other in self.windows.values()
+                  if other is not window and other.isVisible() and other.geometry().intersects(path)]
+        if others:
+            self.xstack.lower_below(int(window.winId()), others)
 
     def layout(self):
         """처음 생긴 세션이 줄의 오른쪽 끝, 새 세션일수록 왼쪽. 모두 같은 바닥선에 선다.

@@ -710,6 +710,46 @@ def run_off_left(left, width, area, distance):
     return left - max(0, min(distance, room_left))
 
 
+# ---- 혼자 놀기 -------------------------------------------------------------------------
+
+WANDER_AFTER_MS = 2 * 60_000         # 이만큼 쉬면 가끔 옆으로 걸어갔다 온다
+SLEEP_AFTER_MS = 15 * 60_000         # 이만큼 쉬면 존다
+WANDER_EVERY_MS = (40_000, 120_000)  # 산책 사이 간격 (이 사이에서 고른다)
+WANDER_PAUSE_MS = (1500, 3000)       # 걸어간 곳에 서 있는 시간
+WANDER_PETS = (0.5, 1.0)             # 펫 폭의 몇 배만큼 걸어가는지
+
+
+def idle_mood(state, idle_ms):
+    """쉬는 펫이 할 일: "sleep"(졸기), "wander"(가끔 산책), None(가만히). 쉬는 중이 아니면 None.
+    idle_ms 는 마지막 작업이나 손길(클릭, 쓰다듬기, 들기)부터 지난 시간이다."""
+    if state != "idle":
+        return None
+    if idle_ms >= SLEEP_AFTER_MS:
+        return "sleep"
+    if idle_ms >= WANDER_AFTER_MS:
+        return "wander"
+    return None
+
+
+def wander_step(rng, pet_w, room_left, room_right):
+    """산책 때 옆으로 걸어갈 x 차이 (0 이면 걸을 자리가 없다). room_* 는 그쪽 화면 끝까지 남은 px.
+    자리가 되는 쪽 중에서 고르고, 양쪽 다 좁으면 넓은 쪽 끝까지만 간다.
+    펫 폭의 1/4 도 못 가면 걷지 않는다 (달리는 그림만 잠깐 비친다)."""
+    distance = int(pet_w * rng.uniform(*WANDER_PETS))
+    sides = [side for side, room in ((-1, room_left), (1, room_right)) if room >= distance]
+    if sides:
+        return rng.choice(sides) * distance
+    step = max(room_left, room_right)
+    if step < pet_w // 4:
+        return 0
+    return step if room_right >= room_left else -step
+
+
+def changed_states(old, new):
+    """양쪽에 다 있는 세션 중 보이는 상태가 바뀐 것 {session_id: (전, 후)}."""
+    return {sid: (old[sid], state) for sid, state in new.items() if sid in old and old[sid] != state}
+
+
 # ---- 펫 자리 (줄, 따로 움직이기) --------------------------------------------------
 
 def layout_spots(order, sizes, anchor, gap, positions=None):

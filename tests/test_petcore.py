@@ -603,6 +603,42 @@ class PlayTest(unittest.TestCase):
         self.assertFalse(petcore.pet_strokes(times, petcore.PET_STROKE_MS + 1)[1])  # 첫 칸이 지나 버렸다
 
 
+class FixedRandom:
+    """wander_step 에 넣는 정해진 난수: uniform 은 value, choice 는 pick 번째."""
+
+    def __init__(self, value, pick=0):
+        self.value, self.pick = value, pick
+
+    def uniform(self, low, high):
+        return self.value
+
+    def choice(self, items):
+        return items[min(self.pick, len(items) - 1)]
+
+
+class IdleTest(unittest.TestCase):
+    def test_idle_mood(self):
+        self.assertIsNone(petcore.idle_mood("idle", petcore.WANDER_AFTER_MS - 1))
+        self.assertEqual(petcore.idle_mood("idle", petcore.WANDER_AFTER_MS), "wander")
+        self.assertEqual(petcore.idle_mood("idle", petcore.SLEEP_AFTER_MS), "sleep")
+        for state in ("running", "waiting", "done", "error", "background"):
+            self.assertIsNone(petcore.idle_mood(state, petcore.SLEEP_AFTER_MS * 2))  # 쉬는 중일 때만
+
+    def test_wander_step(self):
+        self.assertEqual(petcore.wander_step(FixedRandom(0.5, 0), 100, 500, 500), -50)
+        self.assertEqual(petcore.wander_step(FixedRandom(0.5, 1), 100, 500, 500), 50)
+        self.assertEqual(petcore.wander_step(FixedRandom(1.0, 1), 100, 500, 30), -100)  # 오른쪽은 좁다
+        self.assertEqual(petcore.wander_step(FixedRandom(1.0), 100, 20, 60), 60)  # 양쪽 다 좁으면 넓은 쪽 끝까지
+        self.assertEqual(petcore.wander_step(FixedRandom(1.0), 100, 50, 6), -50)
+        self.assertEqual(petcore.wander_step(FixedRandom(1.0), 100, 6, 20), 0)  # 화면 구석에 끼어 있다
+        self.assertEqual(petcore.wander_step(FixedRandom(1.0), 100, 0, -5), 0)  # 걸을 자리가 없다
+
+    def test_changed_states(self):
+        old = {"a": "running", "b": "idle", "gone": "done"}
+        new = {"a": "done", "b": "idle", "new": "running"}
+        self.assertEqual(petcore.changed_states(old, new), {"a": ("running", "done")})
+
+
 class MotionTest(unittest.TestCase):
     AREA = (1000, 3000)  # 화면 왼쪽 x, 오른쪽 끝 x + 1
 
