@@ -660,24 +660,37 @@ def release_reaction(shake):
     return "waving", "또 해 주세요!", 2000
 
 
-# ---- 연타, 등장·퇴장 -------------------------------------------------------------
+# ---- 연타, 쓰다듬기, 등장·퇴장 ---------------------------------------------------------
 
 RAPID_CLICKS = 5        # RAPID_CLICK_MS 안에 이만큼 누르면 화를 낸다
 RAPID_CLICK_MS = 2000
+PET_STROKES = 3         # 휠을 PET_STROKE_MS 안에 이만큼 굴리면 (쓰다듬으면) 좋아한다
+PET_STROKE_MS = 1500
 # (동작, 말풍선, 보여줄 ms)
 ANGRY = ("failed", "그만 눌러요!", 2000)
+PETTED = ("jumping", "헤헤", 1500)
 GREET = ("waving", "안녕하세요!", 1500)  # 새 세션 펫이 자리로 달려와서
 BYE = ("waving", "수고했어요!", 1200)    # 끝난 세션 펫이 달려 나가기 전에
 # 펫 프로그램이 켜지기 이만큼 전에 생긴 세션도 새 세션으로 본다 (훅이 상태 파일을 쓰고 펫을 띄운다)
 ENTER_GRACE_MS = 10_000
 
 
-def rapid_clicks(times, now_ms):
-    """누른 시각을 더해 (남길 최근 시각들, 화낼지). 화내면 처음부터 다시 센다."""
-    times = [t for t in times if now_ms - t <= RAPID_CLICK_MS] + [now_ms]
-    if len(times) >= RAPID_CLICKS:
+def burst(times, now_ms, count, window_ms):
+    """now_ms 를 더해 (남길 최근 시각들, window_ms 안에 count 번 찼는지). 차면 처음부터 다시 센다."""
+    times = [t for t in times if now_ms - t <= window_ms] + [now_ms]
+    if len(times) >= count:
         return [], True
     return times, False
+
+
+def rapid_clicks(times, now_ms):
+    """누른 시각을 더해 (남길 최근 시각들, 화낼지)."""
+    return burst(times, now_ms, RAPID_CLICKS, RAPID_CLICK_MS)
+
+
+def pet_strokes(times, now_ms):
+    """휠 한 칸(쓰다듬기)을 더해 (남길 최근 시각들, 좋아할지)."""
+    return burst(times, now_ms, PET_STROKES, PET_STROKE_MS)
 
 
 def new_sessions(sessions, known, since_ms):

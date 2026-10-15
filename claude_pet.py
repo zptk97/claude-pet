@@ -11,6 +11,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 왼쪽 클릭: 그 세션의 터미널 창을 앞으로 (GNOME 확장 claude-pet-focus 필요) + 완료·오류 확인, 연타하면 화낸다
 마우스 올림: 그 세션의 컨텍스트와 계정 5시간·주간 사용량 카드 (상태줄 중계 hooks/claude-pet-statusline.sh 필요)
 드래그: 줄 전체 이동 (펫 따로 움직이기를 켜면 그 펫만) / 휠 버튼 드래그: 펫을 들고 흔들기, 놓으면 자리로 돌아와 웃거나 운다
+휠 굴리기: 쓰다듬기 (하트가 떠오르고, 빠르게 굴리면 좋아한다)
 오른쪽 클릭: 나중에 이어서 볼게, 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기, 펫 따로 움직이기,
 펫이 혼자 움직이기, 작업 요약 켜고 끄기, 자동 실행, 종료
 
@@ -27,6 +28,7 @@ import fcntl
 import json
 import math
 import os
+import random
 import shutil
 import signal
 import sys
@@ -78,6 +80,10 @@ GIST_MAX_FAILURES = 3  # 요약이 연달아 이만큼 실패하면 (로그인 �
 WALK_MAX_MS = 4000  # 걸어갈 길이 이보다 오래 걸리면 더 빨리 달린다
 ENTER_SPEED = 260   # 등장·퇴장 때 달리는 속도 (px/s)
 RUN_OFF_PETS = 3    # 등장·퇴장 때 펫 폭의 몇 배만큼 달리는지 (화면의 넓은 쪽으로)
+WHEEL_NOTCH = 120   # 휠 한 칸 (angleDelta)
+EFFECT_TICK_MS = 33
+HEART_COUNT = 1     # 휠 한 칸마다 떠오르는 하트
+EDGE_FADE_PX = 20    # 효과 창 가장자리에서 이만큼 안쪽부터 흐려진다 (잘린 선이 보이지 않게)
 
 # 상태별 말풍선 (배경, 테두리)
 BUBBLE_COLORS = {
@@ -279,6 +285,11 @@ class PetWindow(QWidget):
         self.react_timer = QTimer(self, singleShot=True, timeout=self.end_play)
         self.drag_animation = None  # 왼쪽 드래그로 옮기는 동안 끄는 쪽으로 달리는 동작 (장난보다 뒤)
         self.clicks = []            # 최근 클릭 시각 (연타하면 화낸다)
+
+        # 휠을 굴리면 쓰다듬는다
+        self.wheel_acc = 0          # 한 칸이 안 된 휠 양 (터치패드는 조금씩 온다)
+        self.strokes = []           # 최근 쓰다듬은 시각
+        self.effects = None         # 하트를 그리는 EffectLayer (처음 쓸 때 만든다)
 
         # 혼자 움직이기: 정한 곳까지 달려가기
         self.offset = QPoint()      # 혼자 걸어가 자리(home)에서 벗어난 만큼
@@ -522,6 +533,21 @@ class PetWindow(QWidget):
         self.set_play(self.walk_pose if self.walking() else None, None)
         self.manager.layout()
 
+    # ---- 쓰다듬기 ------------------------------------------------------------
+
+    def stroke(self):
+        """휠 한 칸: 하트가 떠오르고, 빠르게 몇 칸 굴리면 좋아한다."""
+        now = int(time.time() * 1000)
+        self.effect("heart", HEART_COUNT)
+        self.strokes, happy = petcore.pet_strokes(self.strokes, now)
+        if happy and self.held is None:
+            self.show_reaction(*petcore.PETTED)
+
+    def effect(self, kind, count):
+        if self.effects is None:
+            self.effects = EffectLayer()
+        self.effects.add(kind, QRect(self.pos() + self.pet_rect.topLeft(), self.pet_rect.size()), count)
+
     # ---- 혼자 움직이기 -------------------------------------------------------
 
     def walking(self):
@@ -710,6 +736,24 @@ class PetWindow(QWidget):
             if not self.manager.drag_end():
                 self.manager.on_click(self.session_id)
 
+    def wheelEvent(self, event):
+        """휠을 굴리면 쓰다듬는다 (한 칸마다)."""
+        event.accept()
+        if self.leaving:
+            return
+        delta = event.angleDelta()
+        self.wheel_acc += abs(delta.y()) or abs(delta.x())
+        while self.wheel_acc >= WHEEL_NOTCH:
+            self.wheel_acc -= WHEEL_NOTCH
+            self.stroke()
+
+    def closeEvent(self, event):
+        if self.effects is not None:
+            self.effects.close()
+            self.effects.deleteLater()
+            self.effects = None
+        super().closeEvent(event)
+
     def contextMenuEvent(self, event):
         if not self.leaving:
             self.manager.show_menu(self.session_id, event.globalPos())
@@ -720,6 +764,90 @@ class PetWindow(QWidget):
 
     def leaveEvent(self, _event):
         self.manager.hover_leave(self.session_id)
+
+
+def heart_path(size):
+    """(0, 0) 가운데에 놓인 폭 약 size 의 하트."""
+    path = QPainterPath()
+    path.moveTo(0, size * 0.35)
+    path.cubicTo(-size * 0.9, -size * 0.25, -size * 0.35, -size * 0.85, 0, -size * 0.35)
+    path.cubicTo(size * 0.35, -size * 0.85, size * 0.9, -size * 0.25, 0, size * 0.35)
+    return path
+
+
+class EffectLayer(QWidget):
+    """펫 둘레에 잠깐 뜨는 효과 (쓰다듬기 하트). 펫 창 마스크 밖까지 그려야 해서 따로 띄우고,
+    입력은 통과시켜 아래 펫을 그대로 누를 수 있다. 효과가 다 끝나면 숨는다 (펫 창이 닫힐 때 같이 닫힌다)."""
+
+    def __init__(self):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                         | Qt.NoDropShadowWindowHint | Qt.WindowDoesNotAcceptFocus
+                         | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowTitle("Claude Pet Effect")
+        self.particles = []  # 화면 좌표로 둔다 (창을 옮겨도 제자리에 남는다)
+        self.timer = QTimer(self, interval=EFFECT_TICK_MS, timeout=self.step)
+        self.last = 0.0
+
+    def add(self, kind, pet, count):
+        """pet(펫 그림의 화면 자리) 위에 kind("heart") 를 count 개 띄운다."""
+        now = time.monotonic()
+        w, h = pet.width(), pet.height()
+        for _ in range(count):
+            self.particles.append({
+                "kind": kind, "x": pet.center().x() + random.uniform(-0.15, 0.15) * w,
+                "y": pet.top() + 0.35 * h, "vx": random.uniform(-15, 15), "vy": -random.uniform(55, 85),
+                "g": 0, "born": now, "life": 1.4, "size": w * 0.2, "color": "#FF5A8A", "angle": 0, "spin": 0})
+        # 떠오를 자리를 덮는다. 이미 떠 있으면 넓히기만 해서 날고 있는 것이 잘리지 않게 한다.
+        area = pet.adjusted(-w, -3 * h // 2, w, 0)
+        if self.isVisible():
+            area = area.united(self.geometry())
+        screen = QApplication.screenAt(pet.center()) or QApplication.primaryScreen()
+        area = area.intersected(screen.geometry())
+        if area != self.geometry():
+            self.setGeometry(area)
+        if not self.isVisible():
+            self.show()
+        if not self.timer.isActive():
+            self.last = now
+            self.timer.start()
+
+    def step(self):
+        now = time.monotonic()
+        dt, self.last = now - self.last, now
+        alive = []
+        for p in self.particles:
+            if now - p["born"] >= p["life"]:
+                continue
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            p["vy"] += p["g"] * dt
+            p["angle"] += p["spin"] * dt
+            alive.append(p)
+        self.particles = alive
+        if not alive:
+            self.timer.stop()
+            self.hide()
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        now = time.monotonic()
+        for p in self.particles:
+            age = (now - p["born"]) / p["life"]
+            x, y = p["x"] - self.x(), p["y"] - self.y()
+            edge = min(x, y, self.width() - x, self.height() - y)
+            # 끝 무렵과 창 가장자리 근처에서 흐려진다
+            painter.setOpacity(max(0.0, min(1.0, (1 - age) / 0.4, edge / EDGE_FADE_PX)))
+            painter.save()
+            painter.translate(x, y)
+            painter.rotate(p["angle"])
+            painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
+            painter.setBrush(QColor(p["color"]))
+            painter.drawPath(heart_path(p["size"]))
+            painter.restore()
 
 
 class UsageCard(QWidget):

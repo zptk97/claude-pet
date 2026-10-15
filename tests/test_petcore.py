@@ -591,6 +591,17 @@ class PlayTest(unittest.TestCase):
             slow, angry = petcore.rapid_clicks(slow, i * (petcore.RAPID_CLICK_MS // 2 + 100))
             self.assertFalse(angry)
 
+    def test_pet_strokes(self):
+        times, happy = petcore.pet_strokes([], 0)
+        times, happy = petcore.pet_strokes(times, 400)
+        self.assertFalse(happy)
+        times, happy = petcore.pet_strokes(times, 800)
+        self.assertTrue(happy)
+        self.assertEqual(times, [])
+        times, _ = petcore.pet_strokes([], 0)
+        times, _ = petcore.pet_strokes(times, 1000)
+        self.assertFalse(petcore.pet_strokes(times, petcore.PET_STROKE_MS + 1)[1])  # 첫 칸이 지나 버렸다
+
 
 class MotionTest(unittest.TestCase):
     AREA = (1000, 3000)  # 화면 왼쪽 x, 오른쪽 끝 x + 1
