@@ -735,6 +735,25 @@ class MotionTest(unittest.TestCase):
         self.assertEqual(petcore.run_off_left(1000, 250, (1000, 1250), 300), 1000)  # 자리가 없으면 제자리
 
 
+class WorkAreaTest(unittest.TestCase):
+    # 가운데 주 모니터는 위 상단바 32px, 아래 고정한 독 66px 을 뺀다. 양옆 세로 모니터는 전체
+    VALUES = [1080, 411, 1920, 982, 3000, 142, 1080, 1920, 0, 0, 1080, 1920]
+
+    def test_work_areas(self):
+        self.assertEqual(petcore.work_areas(self.VALUES),
+                         [(1080, 411, 1920, 982), (3000, 142, 1080, 1920), (0, 0, 1080, 1920)])
+        self.assertEqual(petcore.work_areas([1, 2, 3, 4, 5]), [(1, 2, 3, 4)])  # 모자란 끝은 버린다
+        self.assertEqual(petcore.work_areas([]), [])
+
+    def test_work_area_for_each_monitor(self):
+        areas = petcore.work_areas(self.VALUES)
+        self.assertEqual(petcore.work_area_for((1080, 379, 1920, 1080), areas), (1080, 411, 1920, 982))
+        self.assertEqual(petcore.work_area_for((3000, 142, 1080, 1920), areas), (3000, 142, 1080, 1920))
+        self.assertEqual(petcore.work_area_for((0, 0, 1080, 1920), areas), (0, 0, 1080, 1920))
+        self.assertEqual(petcore.work_area_for((5000, 0, 800, 600), areas), (5000, 0, 800, 600))  # 모르면 모니터 전체
+        self.assertEqual(petcore.work_area_for((0, 0, 1000, 1000), [(-10, 20, 2000, 900)]), (0, 20, 1000, 900))
+
+
 class LayoutTest(unittest.TestCase):
     SIZES = {"a": (100, 150), "b": (120, 200), "c": (80, 150)}
 

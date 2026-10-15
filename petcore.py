@@ -859,6 +859,27 @@ def fling_step(x, y, vx, vy, dt, bounds):
     return x, y, vx, vy, y >= floor and vy == 0 and abs(vx) < FLING_REST_SPEED
 
 
+# ---- 화면 작업 영역 ---------------------------------------------------------------
+
+def work_areas(values):
+    """_GTK_WORKAREAS_D<데스크톱> 값 (모니터마다 x, y, w, h 를 이어 붙인 수들) → [(x, y, w, h)]. 모자란 끝은 버린다."""
+    return [tuple(values[i:i + 4]) for i in range(0, len(values) - len(values) % 4, 4)]
+
+
+def work_area_for(screen, areas):
+    """모니터 screen (x, y, w, h) 의 작업 영역 (독·상단바를 뺀 곳). areas 중 그 모니터와 가장 많이 겹치는 것을
+    모니터 안으로 잘라 쓰고, 겹치는 게 없으면 모니터 전체."""
+    sx, sy, sw, sh = screen
+    best, best_size = screen, 0
+    for x, y, w, h in areas:
+        left, top = max(x, sx), max(y, sy)
+        right, bottom = min(x + w, sx + sw), min(y + h, sy + sh)
+        size = max(0, right - left) * max(0, bottom - top)
+        if size > best_size:
+            best, best_size = (left, top, right - left, bottom - top), size
+    return best
+
+
 # ---- 펫 자리 (줄, 따로 움직이기) --------------------------------------------------
 
 def layout_spots(order, sizes, anchor, gap, positions=None):

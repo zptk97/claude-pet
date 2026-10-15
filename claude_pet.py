@@ -259,15 +259,20 @@ class XEvent(ctypes.Union):
     _fields_ = [("xclient", XClientMessageEvent), ("pad", ctypes.c_long * 24)]
 
 
-class XStack:
-    """X11 창 쌓임 순서. GNOME 은 앱이 스스로 창을 올리거나 내리는 요청(raise/lower)을 무시하지만,
+class X11:
+    """Qt 가 알려 주지 않는 X11 정보와 요청. libX11 을 못 쓰면 아무것도 하지 않는다.
+
+    창 쌓임 순서: GNOME 은 앱이 스스로 창을 올리거나 내리는 요청(raise/lower)을 무시하지만,
     페이저처럼 _NET_RESTACK_WINDOW 로 다른 창 바로 아래에 두는 요청은 받아 준다 (위로 올리는 건 안 된다).
-    항상 위 창끼리만 순서가 바뀌고 보통 창보다는 계속 위에 있다. libX11 을 못 쓰면 아무것도 하지 않는다."""
+    항상 위 창끼리만 순서가 바뀌고 보통 창보다는 계속 위에 있다.
+    모니터별 작업 영역: 모니터가 여럿이면 Qt5 는 _NET_WORKAREA 를 쓰지 않아 독·상단바 자리까지 화면으로 보므로,
+    GNOME 이 모니터마다 알려 주는 _GTK_WORKAREAS_D<데스크톱> 을 읽는다."""
 
     STACK_BELOW = 1        # ConfigureWindow stack_mode Below
     SOURCE_PAGER = 2       # 창 관리자가 앱 요청이 아니라 사용자 뜻으로 보고 들어준다
     CLIENT_MESSAGE = 33
     SUBSTRUCTURE_MASK = (1 << 19) | (1 << 20)  # SubstructureNotify | SubstructureRedirect
+    XA_CARDINAL = 6
     XA_WINDOW = 33
 
     def __init__(self):
@@ -296,13 +301,16 @@ class XStack:
         self.root = lib.XDefaultRootWindow(display)
         self.restack_atom = lib.XInternAtom(display, b"_NET_RESTACK_WINDOW", 0)
         self.stacking_atom = lib.XInternAtom(display, b"_NET_CLIENT_LIST_STACKING", 0)
+        self.desktop_atom = lib.XInternAtom(display, b"_NET_CURRENT_DESKTOP", 0)
 
-    def stacking(self):
-        """창 관리자가 아는 창 id 들, 아래에서 위 순서."""
+    def root_property(self, atom, kind):
+        """루트 창의 32비트 값 목록 속성. 없거나 못 읽으면 []."""
+        if self.lib is None or not atom:
+            return []
         actual_type, actual_format = ctypes.c_ulong(), ctypes.c_int()
         count, remaining, data = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
         status = self.lib.XGetWindowProperty(
-            self.display, self.root, self.stacking_atom, 0, 4096, 0, self.XA_WINDOW, ctypes.byref(actual_type),
+            self.display, self.root, atom, 0, 4096, 0, kind, ctypes.byref(actual_type),
             ctypes.byref(actual_format), ctypes.byref(count), ctypes.byref(remaining), ctypes.byref(data))
         if status != 0 or not data:
             return []
@@ -312,6 +320,18 @@ class XStack:
             return list(ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[:count.value])
         finally:
             self.lib.XFree(data)
+
+    def stacking(self):
+        """창 관리자가 아는 창 id 들, 아래에서 위 순서."""
+        return self.root_property(self.stacking_atom, self.XA_WINDOW)
+
+    def work_areas(self):
+        """모니터별 작업 영역 [(x, y, w, h)] (독·상단바를 뺀 곳). 모르면 []."""
+        if self.lib is None:
+            return []
+        desktop = self.root_property(self.desktop_atom, self.XA_CARDINAL)
+        name = f"_GTK_WORKAREAS_D{desktop[0] if desktop else 0}".encode()
+        return petcore.work_areas(self.root_property(self.lib.XInternAtom(self.display, name, 1), self.XA_CARDINAL))
 
     def lower_below(self, window, others):
         """window 를 others 중 가장 아래 창 바로 아래로 내린다. 이미 그보다 아래면 그대로 둔다."""
@@ -667,13 +687,13 @@ class PetWindow(QWidget):
         self.manager.layout()  # 말풍선이 바뀌어 창 크기가 달라졌으면 다른 펫 자리를 다시 잰다
 
     def fling_tick(self):
-        """던진 펫 한 걸음. 벽은 지금 펫이 있는 화면 가장자리 (모니터 사이 빈 곳이면 마지막 화면)."""
+        """던진 펫 한 걸음. 벽은 지금 펫이 있는 화면의 작업 영역 가장자리 (모니터 사이 빈 곳이면 마지막 화면)."""
         now = time.monotonic()
         dt, self.fling_last = min(0.05, now - self.fling_last), now
         x, y, vx, vy, thrown = self.flight
-        screen = QApplication.screenAt(QPoint(round(x), round(y)) + self.pet_rect.center() - self.pet_rect.topLeft())
-        if screen is not None:
-            self.fling_area = screen.availableGeometry()
+        area = self.manager.work_area_at(QPoint(round(x), round(y)) + self.pet_rect.center() - self.pet_rect.topLeft())
+        if area is not None:
+            self.fling_area = area
         area = self.fling_area
         bounds = petcore.fling_bounds((area.left(), area.top(), area.right() + 1, area.bottom() + 1),
                                       self.pet_rect.width(), self.pet_rect.top(), self.size_hint_[1])
@@ -1161,11 +1181,9 @@ class UsageCard(QWidget):
         self.resize(width + 2 * CARD_PAD, height + 2 * CARD_PAD)
         self.update()
 
-    def show_above(self, window):
-        """펫 창 위 가운데에 띄운다. 화면 밖으로 나가지 않게 맞춘다."""
+    def show_above(self, window, area):
+        """펫 창 위 가운데에 띄운다. 화면 작업 영역 area 밖으로 나가지 않게 맞춘다."""
         pet = window.geometry()
-        screen = QApplication.screenAt(pet.center()) or QApplication.primaryScreen()
-        area = screen.availableGeometry()
         x = min(max(pet.center().x() - self.width() // 2, area.left() + 4), area.right() - self.width() - 4)
         y = max(pet.top() - self.height() - 6, area.top() + 4)
         self.move(x, y)
@@ -1317,7 +1335,8 @@ class PetManager(QObject):
         self.config = load_config()
         self.state_dir = petcore.state_dir()
         self.desktop = Desktop()
-        self.xstack = XStack()
+        self.x11 = X11()
+        self.work_areas = self.x11.work_areas()  # 모니터별 작업 영역 (refresh 마다 다시 읽는다)
         self.transcripts = petcore.TranscriptReader()
         self.gister = Gister(self, self.refresh)
         self.gister.enabled = self.gist_enabled()
@@ -1382,7 +1401,7 @@ class PetManager(QObject):
         return value if value in SCALES.values() else SCALES["보통"]
 
     def default_anchor(self):
-        area = QApplication.primaryScreen().availableGeometry()
+        area = self.work_area(QApplication.primaryScreen())
         return QPoint(area.right() - 20, area.bottom() - 10)
 
     def initial_anchor(self):
@@ -1448,6 +1467,7 @@ class PetManager(QObject):
 
     def refresh(self, *_):
         now = int(time.time() * 1000)
+        self.work_areas = self.x11.work_areas()  # 독을 옮기거나 모니터를 바꾸면 달라진다
         sessions = {}
         for sid, session in petcore.load_sessions(self.state_dir).items():
             if petcore.is_alive(session):
@@ -1663,7 +1683,7 @@ class PetManager(QObject):
         others = [int(other.winId()) for other in self.windows.values()
                   if other is not window and other.isVisible() and other.geometry().intersects(path)]
         if others:
-            self.xstack.lower_below(int(window.winId()), others)
+            self.x11.lower_below(int(window.winId()), others)
 
     def layout(self):
         """처음 생긴 세션이 줄의 오른쪽 끝, 새 세션일수록 왼쪽. 모두 같은 바닥선에 선다.
@@ -1686,9 +1706,22 @@ class PetManager(QObject):
             if not window.isVisible():
                 window.show()
 
-    @staticmethod
-    def screen_area(point):
-        return (QApplication.screenAt(point) or QApplication.primaryScreen()).availableGeometry()
+    def screen_area(self, point):
+        """point 가 있는 모니터(모니터 사이 빈 곳이면 주 모니터)의 작업 영역."""
+        return self.work_area_at(point) or self.work_area(QApplication.primaryScreen())
+
+    def work_area_at(self, point):
+        """point 가 있는 모니터의 작업 영역. 모니터 사이 빈 곳이면 None."""
+        screen = QApplication.screenAt(point)
+        return self.work_area(screen) if screen is not None else None
+
+    def work_area(self, screen):
+        """모니터의 작업 영역 (독·상단바를 뺀 곳). 창 관리자가 알려 주지 않으면 Qt 가 아는 값."""
+        if not self.work_areas:
+            return screen.availableGeometry()
+        geometry = screen.geometry()
+        return QRect(*petcore.work_area_for((geometry.x(), geometry.y(), geometry.width(), geometry.height()),
+                                            self.work_areas))
 
     def send_off(self, sid, window):
         """끝난 세션의 펫: 인사하고 달려 나가며 사라진 뒤 창을 닫는다."""
@@ -1737,7 +1770,7 @@ class PetManager(QObject):
         state = self.view_states.get(sid, session["state"])
         subtitle = f"{petcore.session_name(session)} · {petcore.STATE_LABELS.get(state, state)}"
         self.card.set_content(self.titles_by_sid.get(sid) or petcore.session_name(session), subtitle, rows, note)
-        self.card.show_above(window)
+        self.card.show_above(window, self.screen_area(window.geometry().center()))
 
     def drag_begin(self, sid, pos):
         """왼쪽 드래그 시작. 펫 따로 움직이기면 그 펫만, 아니면 줄 전체를 옮긴다."""
