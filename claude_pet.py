@@ -19,6 +19,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 펫이 혼자 움직이기: 새 세션 펫은 화면의 넓은 쪽에서 달려와 나타나고, 끝난 세션 펫은 인사하고 달려 나가며 사라진다.
 쉬는 펫은 가끔 옆으로 걸어갔다 오거나 가까운 펫에게 인사하러 가고, 오류 난 이웃은 찾아가 위로한다 (끄면 제자리에서).
 졸기·축하: 오래 쉬면 졸고, 오래 걸린 일이 끝나면 색종이를 뿌리고, 이웃이 일을 끝내면 옆 펫이 축하한다.
+펫 성장: 펫마다 작업한 시간과 끝낸 일로 경험치가 쌓여 레벨이 오른다 (마우스 올림 카드, 이 세션의 펫 메뉴에 표시).
 
 나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
 그 펫을 클릭해 돌아가거나, 그 세션에 새 프롬프트를 보내거나, 표시 지우기를 누르면 풀린다.
@@ -96,6 +97,10 @@ CONFETTI_COUNT = 40
 CONFETTI_DRAG = 2.0  # 공기 저항 (1/s): 옆으로 덜 퍼지고 천천히 팔랑이며 떨어진다
 EDGE_FADE_PX = 20    # 효과 창 가장자리에서 이만큼 안쪽부터 흐려진다 (잘린 선이 보이지 않게)
 CONFETTI_COLORS = ("#F56565", "#ECC94B", "#48BB78", "#4299E1", "#9F7AEA", "#ED64A6")
+LEVEL_UP_MS = 2500     # 레벨업 금색 말풍선을 보이는 시간
+LEVEL_CONFETTI = 16
+GROWTH_SAVE_MS = 60_000  # 작업 중에는 성장 기록을 이 간격으로 저장한다 (끝낸 일, 레벨업, 종료 때는 바로)
+GROWTH_COLOR = "#D69E2E"  # 카드의 경험치 막대
 
 # 상태별 말풍선 (배경, 테두리)
 BUBBLE_COLORS = {
@@ -105,6 +110,7 @@ BUBBLE_COLORS = {
     "error": ("#FDE2E1", "#C53030"),
     "background": ("#E3EFFD", "#2B6CB0"),
     "marked": ("#EFE4FB", "#7B3FC4"),  # 나중에 이어서 볼게
+    "level": ("#FFD966", "#A86B00"),   # 레벨업 (확인 필요의 연노랑과 구별되게 진하게)
 }
 MARK_COLOR = "#7B3FC4"
 
@@ -393,6 +399,7 @@ class PetWindow(QWidget):
         # 휠로 들고 장난치기
         self.play_animation = None  # 장난치는 동안의 동작 (상태 애니메이션보다 앞선다)
         self.play_bubble = None     # 장난치는 동안의 말풍선 (None 이면 상태 말풍선)
+        self.play_style = None      # 장난치는 동안의 말풍선 색 (None 이면 흰색, 레벨업은 "level")
         self.held = None            # 들고 있으면 [커서와 펫 왼쪽 위의 차이, petcore.Shake, 마지막 커서 자리]
         self.reaction = None        # 놓은 뒤 자리로 돌아와서 할 (동작, 말풍선, ms)
         self.home = QPoint()        # 줄이나 따로 놓은 자리 (창 왼쪽 위)
@@ -611,14 +618,16 @@ class PetWindow(QWidget):
         return (self.held is not None or self.flight is not None or self.back.state() == QAbstractAnimation.Running
                 or self.walking())
 
-    def set_play(self, animation, bubble):
-        """장난치는 동안의 동작과 말풍선. None 이면 상태대로 돌아간다. 창 크기가 바뀌었으면 True."""
+    def set_play(self, animation, bubble, style=None):
+        """장난치는 동안의 동작과 말풍선 (style 은 말풍선 색, 기본은 흰색). None 이면 상태대로 돌아간다.
+        창 크기가 바뀌었으면 True."""
         if animation != self.play_animation:
             self.play_animation = animation
             if self.oneshot is None:
                 self.frame_index = 0
                 self.anim_timer.stop()
                 self.schedule_frame()
+        self.play_style = style
         if bubble == self.play_bubble:
             self.update()
             return False
@@ -788,6 +797,18 @@ class PetWindow(QWidget):
         self.play_jump(petcore.CELEBRATE_JUMPS)
         self.effect("confetti", CONFETTI_COUNT)
 
+    def level_up(self, level):
+        """레벨이 오르면 금색 말풍선을 띄우고 뛰며 색종이를 조금 뿌린다.
+        들고 있거나, 날거나, 걷거나, 나가는 중이면 연출 없이 넘어간다 (레벨은 이미 기록됐다)."""
+        if self.held is not None or self.flight is not None or self.walking() or self.leaving:
+            return
+        self.set_play(None, petcore.LEVEL_UP.format(level=level), "level")
+        self.manager.layout()
+        self.react_timer.start(LEVEL_UP_MS)
+        if self.oneshot is None:  # 긴 작업 축하로 이미 뛰고 있으면 그대로 둔다
+            self.play_jump(petcore.LEVEL_UP_JUMPS)
+        self.effect("confetti", LEVEL_CONFETTI)
+
     def effect(self, kind, count):
         if self.effects is None:
             self.effects = EffectLayer()
@@ -908,7 +929,7 @@ class PetWindow(QWidget):
             self.paint_zzz(painter)
 
     def paint_bubble(self, painter):
-        style = "running" if self.play_bubble is not None else self.bubble_style
+        style = (self.play_style or "running") if self.play_bubble is not None else self.bubble_style
         fill, border = BUBBLE_COLORS.get(style, BUBBLE_COLORS["running"])
         rect = QRectF(self.bubble_rect).adjusted(1, 1, -1, -1)
         tail_x = int(min(max(self.pet_rect.center().x(), rect.left() + 14), rect.right() - 14))
@@ -1142,7 +1163,7 @@ class EffectLayer(QWidget):
 
 
 class UsageCard(QWidget):
-    """펫에 마우스를 올리면 그 펫 위에 뜨는 카드: 세션 제목·상태, 컨텍스트, 계정 5시간·주간 사용량."""
+    """펫에 마우스를 올리면 그 펫 위에 뜨는 카드: 세션 제목·상태, 펫 레벨, 컨텍스트, 계정 5시간·주간 사용량."""
 
     def __init__(self):
         # 카드가 마우스를 가로채면 펫에서 leave 가 와서 깜빡이므로 입력을 통과시킨다
@@ -1160,23 +1181,28 @@ class UsageCard(QWidget):
         self.title_text = ""
         self.label_w = self.pct_w = self.line_h = 0
 
-    def set_content(self, title, subtitle, rows, note):
-        content = (title, subtitle, tuple(rows), note)
+    def set_content(self, title, subtitle, rows, note, growth=None):
+        """rows 는 사용량 줄 [(이름, %, 설명)]. growth 는 펫 성장 (이름 Lv, 진행 %, XP, 일한 시간·끝낸 일) 으로
+        사용량 줄 위에 금색 막대와 그 아래 한 줄로 그린다."""
+        content = (title, subtitle, tuple(rows), note, growth)
         if content == self.content:
             return
         self.content = content
         title_metrics = QFontMetrics(self.title_font)
         text_metrics = QFontMetrics(self.text_font)
         self.title_text = title_metrics.elidedText(title, Qt.ElideRight, CARD_TITLE_MAX_W)
-        self.label_w = max(text_metrics.horizontalAdvance(label) for label, _, _ in rows)
+        bars = ([growth[:3]] if growth else []) + list(rows)
+        self.label_w = max(text_metrics.horizontalAdvance(label) for label, _, _ in bars)
         self.pct_w = text_metrics.horizontalAdvance("100%")
-        detail_w = max(text_metrics.horizontalAdvance(detail) for _, _, detail in rows)
+        detail_w = max(text_metrics.horizontalAdvance(detail) for _, _, detail in bars)
         row_w = self.label_w + 8 + CARD_BAR_W + 6 + self.pct_w + 8 + detail_w
         width = max(title_metrics.horizontalAdvance(self.title_text),
                     text_metrics.horizontalAdvance(subtitle),
+                    text_metrics.horizontalAdvance(growth[3]) if growth else 0,
                     QFontMetrics(self.note_font).horizontalAdvance(note), row_w)
         self.line_h = text_metrics.height() + 3
         height = (title_metrics.height() + text_metrics.height() + 6 + len(rows) * self.line_h
+                  + (self.line_h + text_metrics.height() + 6 if growth else 0)
                   + (QFontMetrics(self.note_font).height() + 2 if note else 0))
         self.resize(width + 2 * CARD_PAD, height + 2 * CARD_PAD)
         self.update()
@@ -1194,7 +1220,7 @@ class UsageCard(QWidget):
     def paintEvent(self, _event):
         if not self.content:
             return
-        _, subtitle, rows, note = self.content
+        _, subtitle, rows, note, growth = self.content
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
@@ -1214,32 +1240,45 @@ class UsageCard(QWidget):
         painter.drawText(x, y + text_metrics.ascent(), subtitle)
         y += text_metrics.height() + 6
 
-        for label, percent, detail in rows:
-            baseline = y + text_metrics.ascent()
-            painter.setPen(QColor("#E8E8EC"))
-            painter.drawText(x, baseline, label)
-            bar_x = x + self.label_w + 8
-            bar = QRectF(bar_x, y + (text_metrics.height() - CARD_BAR_H) / 2, CARD_BAR_W, CARD_BAR_H)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(255, 255, 255, 45))
-            painter.drawRoundedRect(bar, CARD_BAR_H / 2, CARD_BAR_H / 2)
-            if percent is not None and percent > 0:
-                filled = QRectF(bar)
-                filled.setWidth(max(CARD_BAR_H, CARD_BAR_W * min(percent, 100) / 100))
-                painter.setBrush(QColor(usage_color(percent)))
-                painter.drawRoundedRect(filled, CARD_BAR_H / 2, CARD_BAR_H / 2)
-            pct_x = bar_x + CARD_BAR_W + 6
-            painter.setPen(QColor("#FFFFFF"))
-            painter.drawText(QRect(pct_x, y, self.pct_w, text_metrics.height()), Qt.AlignRight | Qt.AlignVCenter,
-                             petcore.format_percent(percent) if percent is not None else "-")
+        if growth:
+            label, percent, detail, stats = growth
+            self.paint_row(painter, x, y, label, percent, detail, GROWTH_COLOR)
+            y += self.line_h
             painter.setPen(QColor("#B8B8C0"))
-            painter.drawText(pct_x + self.pct_w + 8, baseline, detail)
+            painter.drawText(x, y + text_metrics.ascent(), stats)
+            y += text_metrics.height() + 6
+
+        for label, percent, detail in rows:
+            self.paint_row(painter, x, y, label, percent, detail, usage_color(percent) if percent is not None else "")
             y += self.line_h
 
         if note:
             painter.setFont(self.note_font)
             painter.setPen(QColor("#9A9AA2"))
             painter.drawText(x, y + 2 + QFontMetrics(self.note_font).ascent(), note)
+
+    def paint_row(self, painter, x, y, label, percent, detail, color):
+        """막대 한 줄: 이름, color 로 채운 막대, %, 설명. percent 가 None 이면 빈 막대와 "-"."""
+        text_metrics = QFontMetrics(self.text_font)
+        baseline = y + text_metrics.ascent()
+        painter.setPen(QColor("#E8E8EC"))
+        painter.drawText(x, baseline, label)
+        bar_x = x + self.label_w + 8
+        bar = QRectF(bar_x, y + (text_metrics.height() - CARD_BAR_H) / 2, CARD_BAR_W, CARD_BAR_H)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 45))
+        painter.drawRoundedRect(bar, CARD_BAR_H / 2, CARD_BAR_H / 2)
+        if percent is not None and percent > 0:
+            filled = QRectF(bar)
+            filled.setWidth(max(CARD_BAR_H, CARD_BAR_W * min(percent, 100) / 100))
+            painter.setBrush(QColor(color))
+            painter.drawRoundedRect(filled, CARD_BAR_H / 2, CARD_BAR_H / 2)
+        pct_x = bar_x + CARD_BAR_W + 6
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(QRect(pct_x, y, self.pct_w, text_metrics.height()), Qt.AlignRight | Qt.AlignVCenter,
+                         petcore.format_percent(percent) if percent is not None else "-")
+        painter.setPen(QColor("#B8B8C0"))
+        painter.drawText(pct_x + self.pct_w + 8, baseline, detail)
 
 
 class Gister(QObject):
@@ -1370,6 +1409,13 @@ class PetManager(QObject):
         # 커서가 멈춰도 마우스 이벤트가 없으니 이 간격으로 달리기를 멈출지 다시 본다
         self.drag_timer = QTimer(self, interval=HELD_TICK_MS, timeout=self.drag_pose)
         self.warned_extension = False
+        self.growth = self.load_growth()  # 펫별 성장 기록 {pet_id: {"work_ms", "done"}}
+        self.growth_ms = self.started_ms  # 일한 시간을 마지막으로 잰 때
+        self.growth_saved = time.monotonic()  # 저장 간격은 시계를 바꿔도 맞게 monotonic 으로 잰다
+        self.growth_dirty = False
+        self.pending_work = {}  # 다음 훅을 기다리는 작업 시간 {session_id: [ts, ms]} (petcore.work_tick)
+        self.done_seen = None  # 경험치로 센 끝낸 일 {session_id: prompt_ts} (처음 refresh 때 이미 끝나 있던 일은 세지 않는다)
+        QApplication.instance().aboutToQuit.connect(self.save_growth)
 
         # XWayland 메뉴는 다른 창 클릭을 받지 못해서, 메뉴가 열린 동안 확장이 알려 주는 클릭으로 닫는다
         self.desktop.connect_clicked(self.on_screen_click)
@@ -1437,6 +1483,31 @@ class PetManager(QObject):
         self.positions = {sid: foot for sid, foot in self.positions.items() if sid in self.sessions}
         self.config["positions"] = self.positions
         save_config(self.config)
+
+    def load_growth(self):
+        path = petcore.growth_file()
+        growth, intact = petcore.load_growth(path)
+        if not intact:  # 깨진 기록은 다음 저장이 덮어쓰기 전에 시각을 붙인 이름으로 남겨 둔다
+            backup = path.with_name(f"{path.name}.broken-{time.strftime('%Y%m%d-%H%M%S')}")
+            try:
+                shutil.copy2(path, backup)
+                print(f"claude-pet: 성장 기록이 깨져서 {backup} 로 남기고 읽을 수 있는 것만 씀", file=sys.stderr)
+            except OSError as err:
+                print(f"claude-pet: 깨진 성장 기록을 남기지 못함: {err}", file=sys.stderr)
+        return growth
+
+    def save_growth(self):
+        if not self.growth_dirty:
+            return
+        self.growth_saved = time.monotonic()
+        try:
+            petcore.save_growth(petcore.growth_file(), self.growth)
+            self.growth_dirty = False
+        except OSError as err:
+            print(f"claude-pet: 성장 기록 저장 실패: {err}", file=sys.stderr)
+
+    def pet_level(self, pet_id):
+        return petcore.level_of(petcore.pet_xp(self.growth.get(pet_id, {"work_ms": 0, "done": 0})))[0]
 
     # ---- 펫 이미지 ---------------------------------------------------------
 
@@ -1561,9 +1632,32 @@ class PetManager(QObject):
         for sid, (_, new) in changes.items():  # 이웃은 이번에 상태가 바뀌지 않은 펫 중에서 고른다
             if new in ("done", "error"):
                 self.neighbor_react(sid, new, busy=changes)
+        self.grow(now, sessions, assigned)
         self.idle_play(now)
         if self.card.isVisible():
             self.update_card()
+
+    def grow(self, now, sessions, assigned):
+        """펫마다 경험치를 쌓는다: 작업 중인 시간은 그 세션의 다음 훅이 올 때 확정해서 (petcore.work_tick),
+        끝낸 일은 프롬프트 하나에 한 번 (petcore.done_tick). 접혀서 안 보이는 세션도 센다.
+        레벨이 오를 때 그 세션의 펫이 보이면 축하한다."""
+        step = petcore.work_step(self.growth_ms, now)
+        self.growth_ms = now
+        work, self.pending_work = petcore.work_tick(self.pending_work, {sid: sessions[sid] for sid in assigned},
+                                                    self.view_states, step)
+        dones, self.done_seen = petcore.done_tick(self.done_seen, sessions)
+        urgent = False
+        for sid, pet_id in assigned.items():
+            ms, done = work.get(sid, 0), 1 if sid in dones else 0
+            if not ms and not done:
+                continue
+            self.growth_dirty = True
+            level = petcore.add_growth(self.growth, pet_id, work_ms=ms, done=done)
+            urgent = urgent or done or level is not None
+            if level is not None and sid in self.windows:
+                self.windows[sid].level_up(level)
+        if self.growth_dirty and (urgent or time.monotonic() - self.growth_saved >= GROWTH_SAVE_MS / 1000):
+            self.save_growth()
 
     def idle_play(self, now):
         """쉬는 펫: 오래 쉬면 졸고, 좀 쉬면 가끔 옆으로 걸어갔다 오거나 가까운 펫에게 인사하러 간다.
@@ -1769,7 +1863,10 @@ class PetManager(QObject):
         rows, note = petcore.usage_rows(usage.get(sid), petcore.account_limits(usage), now)
         state = self.view_states.get(sid, session["state"])
         subtitle = f"{petcore.session_name(session)} · {petcore.STATE_LABELS.get(state, state)}"
-        self.card.set_content(self.titles_by_sid.get(sid) or petcore.session_name(session), subtitle, rows, note)
+        pet = next((p for p in self.pets if p["id"] == window.pet_id), None)
+        growth = petcore.growth_row(pet["name"], self.growth.get(pet["id"])) if pet else None
+        self.card.set_content(self.titles_by_sid.get(sid) or petcore.session_name(session), subtitle, rows, note,
+                              growth)
         self.card.show_above(window, self.screen_area(window.geometry().center()))
 
     def drag_begin(self, sid, pos):
@@ -1879,7 +1976,8 @@ class PetManager(QObject):
         window = self.windows.get(sid)
         for pet in self.enabled_pets():
             current = window is not None and pet["id"] == window.pet_id
-            action = QAction(self.pet_icon(pet), pet["name"] + ("  ✓" if current else ""), pet_menu)
+            label = f"{pet['name']}  Lv.{self.pet_level(pet['id'])}" + ("  ✓" if current else "")
+            action = QAction(self.pet_icon(pet), label, pet_menu)
             if current:
                 font = action.font()
                 font.setBold(True)
@@ -2073,6 +2171,13 @@ def main():
         print("claude-pet: 이미 실행 중", file=sys.stderr)
         return 0
     app = QApplication(sys.argv)
+    # kill·로그아웃(SIGTERM)에도 aboutToQuit 을 거쳐 성장 기록을 저장한다 (1초 refresh 때 파이썬이 신호를 받는다).
+    # 이벤트 루프가 돌기 전에 받아도 끝나게 루프에 넣고, 그래도 안 끝나면 다음 SIGTERM 에는 바로 끝난다
+
+    def on_term(*_):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        QTimer.singleShot(0, QApplication.quit)
+    signal.signal(signal.SIGTERM, on_term)
     # 세션이 하나도 없으면 창이 없지만, 새 세션을 기다려야 하므로 꺼지지 않는다 (종료는 메뉴에서)
     app.setQuitOnLastWindowClosed(False)
     manager = PetManager()  # noqa: F841  (app 이 도는 동안 살아 있어야 한다)

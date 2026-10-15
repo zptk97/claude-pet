@@ -754,6 +754,147 @@ class WorkAreaTest(unittest.TestCase):
         self.assertEqual(petcore.work_area_for((0, 0, 1000, 1000), [(-10, 20, 2000, 900)]), (0, 20, 1000, 900))
 
 
+class GrowthTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "claude-pet" / "growth.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_level_needs_more_each_time(self):
+        self.assertEqual(petcore.level_of(0), (1, 0, 100))
+        self.assertEqual(petcore.level_of(99), (1, 99, 100))
+        self.assertEqual(petcore.level_of(100), (2, 0, 200))
+        self.assertEqual(petcore.level_of(299), (2, 199, 200))
+        self.assertEqual(petcore.level_of(1000), (5, 0, 500))
+        self.assertEqual(petcore.level_of(4500), (10, 0, 1000))
+        for xp in range(0, 30_000, 7):  # 근의 공식 어림이 한 칸씩 쌓아 올린 것과 같다
+            level, have, need = petcore.level_of(xp)
+            self.assertEqual(petcore.level_start(level) + have, xp)
+            self.assertTrue(0 <= have < need == 100 * level)
+
+    def test_huge_xp_is_quick(self):
+        level, have, need = petcore.level_of(10 ** 30)  # 손으로 고친 터무니없는 기록에도 멈추지 않는다
+        self.assertEqual(petcore.level_start(level) + have, 10 ** 30)
+        self.assertLess(have, need)
+
+    def test_xp_from_work_minutes_and_done(self):
+        self.assertEqual(petcore.pet_xp({"work_ms": 59_999, "done": 0}), 0)  # 1분이 안 되면 아직 0
+        self.assertEqual(petcore.pet_xp({"work_ms": 120_000, "done": 3}), 2 + 15)
+
+    def test_add_growth_reports_level_up(self):
+        growth = {}
+        self.assertIsNone(petcore.add_growth(growth, "a", work_ms=60_000))  # 처음 보는 펫은 새로 만든다
+        self.assertEqual(growth, {"a": {"work_ms": 60_000, "done": 0}})
+        growth["a"]["done"] = 19  # 1 + 95 XP
+        self.assertIsNone(petcore.add_growth(growth, "a", work_ms=3 * 60_000))  # 99 XP
+        self.assertEqual(petcore.add_growth(growth, "a", done=1), 2)  # 104 XP
+        self.assertEqual(petcore.add_growth(growth, "a", done=60), 3)  # 여러 레벨을 한꺼번에 넘으면 마지막 레벨
+        self.assertIsNone(petcore.add_growth(growth, "a"))
+
+    def test_work_step(self):
+        self.assertEqual(petcore.work_step(1000, 2000), 1000)
+        self.assertEqual(petcore.work_step(1000, 1000), 0)
+        self.assertEqual(petcore.work_step(2000, 1000), 0)  # 시계가 뒤로 가면
+        self.assertEqual(petcore.work_step(0, petcore.WORK_STEP_MAX_MS), petcore.WORK_STEP_MAX_MS)
+        self.assertEqual(petcore.work_step(0, 3_600_000), petcore.WORK_STEP_MAX_MS)  # 절전에서 돌아오면
+
+    @staticmethod
+    def hooked(state, ts, event):
+        s = session(state)
+        s.update(ts=ts, event=event)
+        return s
+
+    def test_work_waits_for_next_hook(self):
+        sessions = {"a": self.hooked("running", 100, "PreToolUse")}
+        credit, pending = petcore.work_tick({}, sessions, {"a": "running"}, 1000)
+        self.assertEqual((credit, pending), ({}, {"a": [100, 1000]}))  # 아직 보류
+        credit, pending = petcore.work_tick(pending, sessions, {"a": "running"}, 1000)
+        self.assertEqual((credit, pending), ({}, {"a": [100, 2000]}))
+        sessions = {"a": self.hooked("running", 200, "PostToolUse")}  # 일이 이어졌다
+        credit, pending = petcore.work_tick(pending, sessions, {"a": "running"}, 1000)
+        self.assertEqual((credit, pending), ({"a": 2000}, {"a": [200, 1000]}))
+        sessions = {"a": self.hooked("done", 300, "Stop")}  # 끝낸 일도 확정
+        credit, pending = petcore.work_tick(pending, sessions, {"a": "done"}, 1000)
+        self.assertEqual((credit, pending), ({"a": 1000}, {}))
+
+    def test_work_before_new_prompt_is_dropped(self):
+        # Esc 로 끊으면 Stop 이 안 와서 30분 동안 작업 중으로 보이다가 (그 뒤는 쉬는 중), 다음 프롬프트가 온다
+        pending = {"a": [100, 1_800_000]}
+        sessions = {"a": self.hooked("running", 100, "PreToolUse")}
+        credit, pending = petcore.work_tick(pending, sessions, {"a": "idle"}, 1000)
+        self.assertEqual((credit, pending), ({}, {"a": [100, 1_800_000]}))  # 더 쌓지 않고 기다린다
+        sessions = {"a": self.hooked("running", 900, "UserPromptSubmit")}
+        credit, pending = petcore.work_tick(pending, sessions, {"a": "running"}, 1000)
+        self.assertEqual((credit, pending), ({}, {"a": [900, 1000]}))  # 버리고 새로 쌓는다
+
+    def test_work_of_ended_session_is_dropped(self):
+        credit, pending = petcore.work_tick({"gone": [100, 5000]}, {}, {}, 1000)
+        self.assertEqual((credit, pending), ({}, {}))
+
+    @staticmethod
+    def prompted(state, prompt_ts, age_ms=0):
+        s = session(state, age_ms)
+        s["prompt_ts"] = prompt_ts
+        return s
+
+    def test_new_dones_counts_once_per_prompt(self):
+        sessions = {"a": self.prompted("done", 100), "b": self.prompted("running", 100),
+                    "c": self.prompted("done", 50, age_ms=500), "d": self.prompted("error", 100),
+                    "e": self.prompted("background", 100), "f": self.prompted("done", 0)}  # f: 프롬프트를 보낸 적 없음
+        self.assertEqual(petcore.new_dones(sessions, {}), {"a": 100, "c": 50})
+        self.assertEqual(petcore.new_dones(sessions, {"a": 100, "c": 50}), {})
+        # 백그라운드 작업 알림으로 혼자 깨어나 다시 끝내면 ts 는 바뀌어도 프롬프트는 같다
+        self.assertEqual(petcore.new_dones({"a": self.prompted("done", 100, age_ms=-9000)}, {"a": 100}), {})
+        self.assertEqual(petcore.new_dones({"a": self.prompted("done", 700)}, {"a": 100}), {"a": 700})  # 다음 프롬프트
+
+    def test_done_tick(self):
+        sessions = {"a": self.prompted("done", 100), "b": self.prompted("running", 200)}
+        self.assertEqual(petcore.done_tick(None, sessions), ({}, {"a": 100}))  # 켜기 전에 끝나 있던 일은 기억만
+        self.assertEqual(petcore.done_tick({"a": 100}, sessions), ({}, {"a": 100}))
+        sessions["b"] = self.prompted("done", 200)
+        self.assertEqual(petcore.done_tick({"a": 100}, sessions), ({"b": 200}, {"a": 100, "b": 200}))
+        self.assertEqual(petcore.done_tick({"a": 100, "gone": 5}, {"a": self.prompted("done", 100)}),
+                         ({}, {"a": 100}))
+
+    def test_save_and_load(self):
+        self.assertEqual(petcore.load_growth(self.path), ({}, True))  # 아직 없는 파일
+        petcore.save_growth(self.path, {"동원리": {"work_ms": 5, "done": 2}})
+        petcore.save_growth(self.path, {"동원리": {"work_ms": 6, "done": 2}})  # 덮어쓴다
+        self.assertEqual(petcore.load_growth(self.path), ({"동원리": {"work_ms": 6, "done": 2}}, True))
+        self.assertEqual(os.listdir(self.path.parent), ["growth.json"])  # tmp 가 남지 않는다
+
+    def test_bad_entries_are_skipped_but_reported(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"pets": {"a": {"work_ms": 5, "done": 2}, "b": {"work_ms": "x"},
+                                                  "c": 3, "d": {"done": True}, "e": {"work_ms": -1},
+                                                  "f": {"done": 4}, "g": {"work_ms": 120000.0}}}))
+        self.assertEqual(petcore.load_growth(self.path),
+                         ({"a": {"work_ms": 5, "done": 2}, "f": {"work_ms": 0, "done": 4}}, False))
+
+    def test_broken_file_is_not_treated_as_intact(self):
+        self.path.parent.mkdir(parents=True)
+        for text in ("{", "[1]", json.dumps({"pets": [1]})):
+            self.path.write_text(text)
+            self.assertEqual(petcore.load_growth(self.path), ({}, False))
+        self.path.unlink()
+        self.path.mkdir()  # 읽을 수 없는 경로
+        self.assertEqual(petcore.load_growth(self.path), ({}, False))
+
+    def test_growth_row(self):
+        record = {"work_ms": (32 * 60 + 5) * 60_000 + 59_000, "done": 214}  # 1925 + 1070 = 2995 XP (Lv.8 은 2800)
+        self.assertEqual(petcore.growth_row("복슬이", record),
+                         ("복슬이 Lv.8", 24, "195/800 XP", "같이 일한 시간 32시간 5분 · 끝낸 일 214번"))
+        self.assertEqual(petcore.growth_row("아주아주긴펫이름입니다요", None),
+                         ("아주아주긴펫이름입… Lv.1", 0, "0/100 XP", "같이 일한 시간 0분 · 끝낸 일 0번"))
+        self.assertEqual(petcore.growth_row("a", {"work_ms": 60 * 60_000, "done": 0})[3],
+                         "같이 일한 시간 1시간 0분 · 끝낸 일 0번")
+        self.assertEqual(petcore.growth_row("a", {"work_ms": 0, "done": 19})[1], 95)
+        self.assertEqual(petcore.growth_row("a", {"work_ms": 99 * 60_000 + 59_999, "done": 0})[1:3],
+                         (99, "99/100 XP"))  # 레벨이 오르기 전에는 100% 로 보이지 않는다
+
+
 class LayoutTest(unittest.TestCase):
     SIZES = {"a": (100, 150), "b": (120, 200), "c": (80, 150)}
 

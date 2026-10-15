@@ -859,6 +859,150 @@ def fling_step(x, y, vx, vy, dt, bounds):
     return x, y, vx, vy, y >= floor and vy == 0 and abs(vx) < FLING_REST_SPEED
 
 
+# ---- 펫 성장 (경험치, 레벨) --------------------------------------------------------
+
+XP_PER_WORK_MIN = 1      # 작업 중(running)으로 보낸 1분마다
+XP_PER_DONE = 5          # 일을 끝낼(done) 때마다
+LEVEL_XP = 100           # Lv.n 에서 다음 레벨까지 LEVEL_XP * n
+WORK_STEP_MAX_MS = 5000  # 한 번에 이보다 많이 더하지 않는다 (절전에서 돌아왔을 때 몇 시간이 한꺼번에 들어가지 않게)
+# 작업 중으로 쌓은 시간은 그 세션의 다음 훅이 올 때 확정한다. 다음 훅이 이것이면 앞의 작업이 끝까지 이어진 게 아니라
+# (Esc 로 끊어 Stop 없이 남은 작업 중) 새로 시작한 것이라 쌓은 시간을 버린다
+RESTART_EVENTS = ("UserPromptSubmit", "SessionStart")
+GROWTH_NAME_MAX = 10     # 카드에 쓰는 펫 이름 글자 수
+LEVEL_UP = "Lv.{level} 됐어요!"
+LEVEL_UP_JUMPS = 2
+
+
+def growth_file():
+    """펫별 성장 기록. 재부팅해도 남아야 해서 상태 폴더($XDG_RUNTIME_DIR)가 아니라 $XDG_DATA_HOME 에 둔다."""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(base) / "claude-pet" / "growth.json"
+
+
+def _amount(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def load_growth(path):
+    """(펫별 기록 {pet_id: {"work_ms": 일한 ms, "done": 끝낸 일 수}}, 온전한지).
+    파일이 없으면 ({}, True). 읽을 수 없거나 깨졌으면 ({}, False), 깨진 항목만 있으면 나머지와 False.
+    온전하지 않으면 다음 저장이 덮어쓰기 전에 부른 쪽이 파일을 따로 남겨 둔다."""
+    path = Path(path)
+    if not path.exists():
+        return {}, True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, False
+    pets = data.get("pets") if isinstance(data, dict) else None
+    if not isinstance(pets, dict):
+        return {}, False
+    growth = {}
+    for pet_id, record in pets.items():
+        work_ms, done = (record.get("work_ms", 0), record.get("done", 0)) if isinstance(record, dict) else (-1, -1)
+        if _amount(work_ms) and _amount(done):
+            growth[pet_id] = {"work_ms": work_ms, "done": done}
+    return growth, len(growth) == len(pets)
+
+
+def save_growth(path, growth):
+    """tmp 에 다 쓰고 디스크에 내린 뒤 바꿔 끼운다 (전원이 꺼져도 빈 파일이 남지 않게)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "pets": growth}, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def pet_xp(record):
+    """경험치는 저장하지 않고 일한 시간과 끝낸 일로 매번 계산한다 (점수를 바꿔도 기록은 그대로 남는다)."""
+    return record["work_ms"] // 60_000 * XP_PER_WORK_MIN + record["done"] * XP_PER_DONE
+
+
+def level_start(level):
+    """Lv.level 이 되는 누적 XP (LEVEL_XP * (1 + 2 + … + level-1))."""
+    return LEVEL_XP * level * (level - 1) // 2
+
+
+def level_of(xp):
+    """(레벨, 이번 레벨에서 모은 XP, 다음 레벨까지 필요한 XP). Lv.n 에서 n+1 까지 LEVEL_XP * n.
+    기록이 아무리 커도 바로 계산되게 근의 공식으로 어림한 뒤 맞춘다."""
+    level = max(1, (1 + math.isqrt(1 + 8 * xp // LEVEL_XP)) // 2)
+    while level > 1 and level_start(level) > xp:
+        level -= 1
+    while level_start(level + 1) <= xp:
+        level += 1
+    return level, xp - level_start(level), LEVEL_XP * level
+
+
+def add_growth(growth, pet_id, work_ms=0, done=0):
+    """pet_id 의 기록에 일한 시간과 끝낸 일을 더한다. 레벨이 올랐으면 새 레벨, 아니면 None."""
+    record = growth.setdefault(pet_id, {"work_ms": 0, "done": 0})
+    before = level_of(pet_xp(record))[0]
+    record["work_ms"] += work_ms
+    record["done"] += done
+    after = level_of(pet_xp(record))[0]
+    return after if after > before else None
+
+
+def work_step(last_ms, now_ms):
+    """지난번부터 더할 일한 시간 (ms). 시계가 뒤로 가면 0, 너무 오래 비었으면 WORK_STEP_MAX_MS 까지만."""
+    return min(max(0, now_ms - last_ms), WORK_STEP_MAX_MS)
+
+
+def work_tick(pending, sessions, states, step_ms):
+    """이번 refresh 에서 확정할 일한 시간 {session_id: ms} 와 다음 보류 {session_id: [그때 ts, ms]}.
+
+    작업 중(states 가 running)인 동안은 바로 더하지 않고 보류해 둔다. 그 세션에 다음 훅이 오면(ts 가 바뀌면)
+    도구 사용·완료·확인 요청처럼 일이 이어진 것이면 확정하고, 새 프롬프트(RESTART_EVENTS)면 버린다.
+    Esc 로 끊으면 Stop 이 오지 않아 30분 동안 작업 중으로 남는데, 그 시간을 일한 시간으로 세지 않으려는 것이다.
+    sessions 에 없는 (끝난) 세션의 보류도 버린다."""
+    credit, kept = {}, {}
+    for sid, session in sessions.items():
+        held = pending.get(sid)
+        if held and held[0] != session["ts"]:
+            if session.get("event") not in RESTART_EVENTS:
+                credit[sid] = held[1]
+            held = None
+        if states.get(sid) == "running":
+            kept[sid] = [session["ts"], (held[1] if held else 0) + step_ms]
+        elif held:
+            kept[sid] = held  # 작업 중이 오래 조용해서 쉬는 중으로 보이면 더 쌓지 않고 다음 훅을 기다린다
+    return credit, kept
+
+
+def new_dones(sessions, seen):
+    """아직 세지 않은 끝낸 일 {session_id: prompt_ts}. 프롬프트 하나에 한 번만 센다: 백그라운드 작업 알림 등으로
+    Claude 가 혼자 깨어나 다시 끝내도 같은 프롬프트(같은 prompt_ts)면 세지 않는다. 확인(클릭)하거나 펫을 다시 켜도
+    같다. 프롬프트를 보낸 적이 없으면(prompt_ts 0) 세지 않는다."""
+    return {sid: s["prompt_ts"] for sid, s in sessions.items()
+            if s["state"] == "done" and s.get("prompt_ts") and seen.get(sid) != s["prompt_ts"]}
+
+
+def done_tick(seen, sessions):
+    """(이번에 새로 끝낸 일 {session_id: prompt_ts}, 다음 seen). seen 이 None 이면 펫을 막 켠 것이라
+    이미 끝나 있던 일은 세지 않고 기억만 한다. 끝난 세션은 seen 에서 뺀다."""
+    dones = new_dones(sessions, seen or {})
+    if seen is None:
+        return {}, dones
+    merged = {**seen, **dones}
+    return dones, {sid: ts for sid, ts in merged.items() if sid in sessions}
+
+
+def growth_row(name, record):
+    """카드의 성장 줄: (이름 Lv, 이번 레벨 진행 %, "320/500 XP", "같이 일한 시간 … · 끝낸 일 …번").
+    진행 % 는 내림한다 (레벨이 오르기 전에 100% 로 보이지 않게)."""
+    record = record or {"work_ms": 0, "done": 0}
+    level, have, need = level_of(pet_xp(record))
+    hours, minutes = divmod(record["work_ms"] // 60_000, 60)
+    worked = f"{hours}시간 {minutes}분" if hours else f"{minutes}분"
+    return (f"{shorten(name, GROWTH_NAME_MAX)} Lv.{level}", have * 100 // need, f"{have}/{need} XP",
+            f"같이 일한 시간 {worked} · 끝낸 일 {record['done']}번")
+
+
 # ---- 화면 작업 영역 ---------------------------------------------------------------
 
 def work_areas(values):
