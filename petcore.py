@@ -442,11 +442,34 @@ def load_usage(directory):
     return usage
 
 
+RESET_SLACK_S = 60  # 리셋 시각이 이만큼 안이면 같은 리셋 주기의 값으로 본다
+
+
+def _current_window(readings, key):
+    """한 창(five_hour, seven_day)의 (사용 %, 리셋 epoch 초). 리셋 시각이 가장 늦은 (지금) 주기 값들 중 가장 큰 것.
+    리셋 시각을 아는 값이 없으면 주기를 가를 수 없으니 가장 최근에 읽힌 값."""
+    values = [(u[f"{key}_reset"], u[f"{key}_pct"], u["ts"]) for u in readings if u[f"{key}_pct"] is not None]
+    if not values:
+        return None, None
+    resets = [reset for reset, _, _ in values if reset is not None]
+    if not resets:
+        return max(values, key=lambda v: v[2])[1], None
+    latest = max(resets)
+    return max(pct for reset, pct, _ in values if reset is not None and reset >= latest - RESET_SLACK_S), latest
+
+
 def account_limits(usage):
-    """5시간·주간 사용량은 계정 전체 값이라 어느 세션에서 읽혔든 가장 최근 것을 쓴다. 없으면 None."""
+    """5시간·주간 사용량은 계정 전체 값이라 어느 세션에서 읽혔든 같이 쓴다. 없으면 None.
+    세션마다 마지막으로 그린 상태줄 값이 남아서 오래 쉰 세션의 옛 값이 섞일 수 있으니, 창마다 리셋 시각이 가장 늦은
+    (지금) 주기의 값들 중 가장 큰 것을 쓴다 (한 주기 안에서 사용량은 줄지 않는다). ts 는 가장 최근에 읽힌 때."""
     readings = [u for u in usage.values()
                 if u["five_hour_pct"] is not None or u["seven_day_pct"] is not None]
-    return max(readings, key=lambda u: u["ts"], default=None)
+    if not readings:
+        return None
+    limits = {"ts": max(u["ts"] for u in readings)}
+    for key in ("five_hour", "seven_day"):
+        limits[f"{key}_pct"], limits[f"{key}_reset"] = _current_window(readings, key)
+    return limits
 
 
 def format_tokens(count):
@@ -485,13 +508,19 @@ def format_reset(reset_s, now_ms):
 
 def usage_rows(usage, limits, now_ms):
     """카드에 그릴 줄들 [(이름, 사용 % 또는 None, 설명)] 과 아래에 붙일 메모."""
-    rows = []
     if usage and usage["context_pct"] is not None:
         tokens, size = usage["context_tokens"], usage["context_size"]
         detail = f"{format_tokens(tokens)} / {format_tokens(size)}" if tokens is not None and size else ""
-        rows.append(("컨텍스트", usage["context_pct"], detail))
+        context = ("컨텍스트", usage["context_pct"], detail)
     else:
-        rows.append(("컨텍스트", None, "정보 없음"))
+        context = ("컨텍스트", None, "정보 없음")
+    rows, note = limit_rows(limits, now_ms)
+    return [context] + rows, note
+
+
+def limit_rows(limits, now_ms):
+    """계정 5시간·주간 사용량 줄들과 (오래된 값이면) 메모. 기지 카드에도 쓴다."""
+    rows = []
     for label, key in (("5시간", "five_hour"), ("주간", "seven_day")):
         pct = limits[f"{key}_pct"] if limits else None
         reset = limits[f"{key}_reset"] if limits else None
@@ -1001,6 +1030,82 @@ def growth_row(name, record):
     worked = f"{hours}시간 {minutes}분" if hours else f"{minutes}분"
     return (f"{shorten(name, GROWTH_NAME_MAX)} Lv.{level}", have * 100 // need, f"{have}/{need} XP",
             f"같이 일한 시간 {worked} · 끝낸 일 {record['done']}번")
+
+
+# ---- 팀 HP (기지) -----------------------------------------------------------------
+
+HP_WARNINGS = (20, 10)  # 팀 HP 가 이 이하로 내려갈 때 기지가 알린다
+POTION_RISE = 10        # 리셋으로 팀 HP 가 이만큼(%p) 이상 오르면 다 같이 기뻐한다
+HP_WARNING = "팀 HP {hp}% 남았어요!"
+GAME_OVER = ("failed", "한도를 다 썼어요…", 3000)  # 팀 HP 가 0 이 되는 순간 보이는 펫들이
+POTION = ("jumping", "다시 힘이 나요!", 2000)      # 리셋으로 다시 살아날 때 보이는 펫들이
+
+
+def hold_peaks(limits, peaks):
+    """창마다 지금 리셋 주기에서 본 가장 큰 사용량을 기억해 둔다. 반환: (limits, 다음 peaks {창: (reset, %)}).
+    가장 큰 값을 쓴 세션이 터미널째 닫혀 그 사용량 파일이 지워져도 HP 가 거꾸로 올랐다가 (가짜 POTION)
+    다시 크게 맞지 않게 한다. 리셋 시각을 모르는 값은 주기를 가를 수 없어 그대로 둔다."""
+    peaks = dict(peaks)
+    if not limits:
+        return limits, peaks
+    limits = dict(limits)
+    for key in ("five_hour", "seven_day"):
+        pct, reset = limits[f"{key}_pct"], limits[f"{key}_reset"]
+        peak = peaks.get(key)
+        if pct is None or reset is None:
+            if pct is None and peak is not None:  # 그 창 값을 가진 파일이 다 지워졌다
+                limits[f"{key}_reset"], limits[f"{key}_pct"] = peak
+            continue
+        if peak is not None and peak[0] > reset + RESET_SLACK_S:  # 기억한 주기가 더 새것이다
+            limits[f"{key}_reset"], limits[f"{key}_pct"] = peak
+            continue
+        if peak is not None and peak[0] >= reset - RESET_SLACK_S:  # 같은 주기
+            pct = max(pct, peak[1])
+        limits[f"{key}_pct"] = pct
+        peaks[key] = (reset, pct)
+    return limits, peaks
+
+
+def team_hp(limits, now_ms):
+    """(팀 HP 0~100 정수, 그 창의 리셋 epoch 초 또는 None). 5시간·주간 중 더 적게 남은 쪽이다. 모르면 None.
+    리셋 시각이 지난 창은 새 값이 오기 전까지 0% 로 본다. 카드의 사용 % 와 더해 100 이 되게 사용 % 를 반올림해 뺀다.
+    둘이 같으면 늦게 리셋되는 쪽 (그때까지는 HP 가 오르지 않는다)."""
+    best = None
+    for key in ("five_hour", "seven_day"):
+        pct, reset = (limits[f"{key}_pct"], limits[f"{key}_reset"]) if limits else (None, None)
+        if pct is None:
+            continue
+        if reset is not None and reset * 1000 <= now_ms:
+            pct = 0
+        hp = max(0, min(100, 100 - int(pct + 0.5)))
+        if best is None or (hp, -(reset or 0)) < (best[0], -(best[1] or 0)):
+            best = (hp, reset)
+    return best
+
+
+def hp_events(prev, hp):
+    """팀 HP 가 prev 에서 hp 로 바뀔 때 보일 것: (맞은 %, 경고할지, "over"/"potion"/None).
+    prev 가 None 이면 (펫을 막 켰거나 사용량을 처음 알게 됐으면) 기준만 잡고 아무것도 보이지 않는다.
+    경고는 HP_WARNINGS 문턱 이하로 내려갈 때마다 (한 주기 안에서 HP 는 오르지 않으니 문턱마다 한 번씩,
+    문턱 둘을 한꺼번에 넘어도 한 번)."""
+    if prev is None or hp == prev:
+        return 0, False, None
+    if hp > prev:
+        return 0, False, "potion" if prev == 0 or hp - prev >= POTION_RISE else None
+    if hp == 0:
+        return prev, False, "over"
+    return prev - hp, any(hp <= t < prev for t in HP_WARNINGS), None
+
+
+def hp_label(hp):
+    return "GAME OVER" if hp == 0 else f"팀 HP {hp}%"
+
+
+def game_over_text(reset_s, now_ms):
+    """GAME OVER 동안 기지 말풍선: '16:00 리셋\\n(42분 뒤)'."""
+    if reset_s is None or reset_s * 1000 <= now_ms:
+        return "리셋을 기다려요"
+    return format_reset(reset_s, now_ms).replace(" (", "\n(")
 
 
 # ---- 화면 작업 영역 ---------------------------------------------------------------

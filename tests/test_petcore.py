@@ -895,6 +895,129 @@ class GrowthTest(unittest.TestCase):
                          (99, "99/100 XP"))  # 레벨이 오르기 전에는 100% 로 보이지 않는다
 
 
+class TeamTest(unittest.TestCase):
+    NOW_S = 1791428400  # 2026-10-08(목) 12:00 KST
+    NOW_MS = NOW_S * 1000
+
+    def setUp(self):
+        self.old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Seoul"
+        time.tzset()
+
+    def tearDown(self):
+        if self.old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = self.old_tz
+        time.tzset()
+
+    def usage(self, ts, **values):
+        return {"ts": ts, **dict.fromkeys(petcore.USAGE_FIELDS), **values}
+
+    def limits(self, five=None, five_reset=None, week=None, week_reset=None):
+        return {"ts": self.NOW_MS, "five_hour_pct": five, "five_hour_reset": five_reset,
+                "seven_day_pct": week, "seven_day_reset": week_reset}
+
+    def test_account_limits_takes_largest_in_current_window(self):
+        reset = self.NOW_S + 3600
+        usage = {
+            "busy": self.usage(1, five_hour_pct=40, five_hour_reset=reset, seven_day_pct=20, seven_day_reset=reset + 9),
+            # 오래 쉰 세션이 같은 주기의 옛 값을 늦게 다시 썼다
+            "stale": self.usage(9, five_hour_pct=25, five_hour_reset=reset + 30, seven_day_pct=18,
+                                seven_day_reset=reset),
+            "last_window": self.usage(5, five_hour_pct=95, five_hour_reset=reset - 5 * 3600),  # 지난 주기
+        }
+        limits = petcore.account_limits(usage)
+        self.assertEqual(limits, {"ts": 9, "five_hour_pct": 40, "five_hour_reset": reset + 30,
+                                  "seven_day_pct": 20, "seven_day_reset": reset + 9})
+        only_old = petcore.account_limits({"a": self.usage(3, five_hour_pct=95, five_hour_reset=self.NOW_S - 10)})
+        self.assertEqual((only_old["five_hour_pct"], only_old["seven_day_pct"]), (95, None))
+        self.assertEqual(petcore.account_limits({"a": self.usage(3, five_hour_pct=7)})["five_hour_pct"], 7)
+
+    def test_account_limits_edges(self):
+        reset = self.NOW_S + 3600
+        same = {"a": self.usage(1, five_hour_pct=30, five_hour_reset=reset),
+                "b": self.usage(2, five_hour_pct=50, five_hour_reset=reset - 60)}  # 60초 안은 같은 주기
+        self.assertEqual(petcore.account_limits(same)["five_hour_pct"], 50)
+        apart = {"a": self.usage(1, five_hour_pct=30, five_hour_reset=reset),
+                 "b": self.usage(2, five_hour_pct=50, five_hour_reset=reset - 61)}
+        self.assertEqual(petcore.account_limits(apart)["five_hour_pct"], 30)
+        # 리셋 시각을 아는 값이 없으면 가장 최근에 읽힌 값 (며칠 묵은 파일의 100% 를 집지 않는다)
+        unknown = {"old": self.usage(1, five_hour_pct=100), "new": self.usage(5, five_hour_pct=12)}
+        self.assertEqual(petcore.account_limits(unknown)["five_hour_pct"], 12)
+        mixed = {"a": self.usage(1, five_hour_pct=20, five_hour_reset=reset), "b": self.usage(5, five_hour_pct=90)}
+        self.assertEqual(petcore.account_limits(mixed)["five_hour_pct"], 20)  # 주기를 아는 값을 쓴다
+
+    def test_hold_peaks_keeps_the_largest_in_a_cycle(self):
+        reset, week = self.NOW_S + 3600, self.NOW_S + 86400
+        limits, peaks = petcore.hold_peaks(self.limits(60, reset, 20, week), {})
+        self.assertEqual((limits["five_hour_pct"], peaks), (60, {"five_hour": (reset, 60), "seven_day": (week, 20)}))
+        # 60% 를 가진 세션이 끝나 파일이 지워지고 옛 30% 만 남았다: 거꾸로 오르지 않는다
+        limits, peaks = petcore.hold_peaks(self.limits(30, reset, 20, week), peaks)
+        self.assertEqual(petcore.team_hp(limits, self.NOW_MS), (40, reset))
+        limits, peaks = petcore.hold_peaks(self.limits(61, reset, 20, week), peaks)  # 다음 값은 그대로 1% 만
+        self.assertEqual(petcore.team_hp(limits, self.NOW_MS), (39, reset))
+        # 지난 주기의 파일만 남아도 기억한 새 주기 값을 쓴다
+        limits, peaks = petcore.hold_peaks(self.limits(95, reset - 5 * 3600, 20, week), peaks)
+        self.assertEqual((limits["five_hour_pct"], limits["five_hour_reset"]), (61, reset))
+        # 그 창 값을 가진 파일이 다 지워져도
+        limits, peaks = petcore.hold_peaks(self.limits(None, None, 20, week), peaks)
+        self.assertEqual((limits["five_hour_pct"], limits["five_hour_reset"]), (61, reset))
+        # 새 주기가 오면 새로 센다
+        limits, peaks = petcore.hold_peaks(self.limits(3, reset + 5 * 3600, 20, week), peaks)
+        self.assertEqual((limits["five_hour_pct"], peaks["five_hour"]), (3, (reset + 5 * 3600, 3)))
+        self.assertEqual(petcore.hold_peaks(None, peaks), (None, peaks))
+        limits, _ = petcore.hold_peaks(self.limits(7, None), {"five_hour": (reset, 50)})  # 주기를 모르면 그대로
+        self.assertEqual(limits["five_hour_pct"], 7)
+
+    def test_team_hp_uses_the_lower_remaining(self):
+        week_reset, five_reset = self.NOW_S + 86400, self.NOW_S + 3600
+        self.assertEqual(petcore.team_hp(self.limits(28.4, five_reset, 41, week_reset), self.NOW_MS), (59, week_reset))
+        self.assertEqual(petcore.team_hp(self.limits(71.5, five_reset, 41, week_reset), self.NOW_MS), (28, five_reset))
+        self.assertEqual(petcore.team_hp(self.limits(None, None, 41, None), self.NOW_MS), (59, None))
+        self.assertIsNone(petcore.team_hp(self.limits(), self.NOW_MS))
+        self.assertIsNone(petcore.team_hp(None, self.NOW_MS))
+
+    def test_team_hp_after_reset_and_ties(self):
+        week_reset = self.NOW_S + 86400
+        # 5시간이 리셋되면 새 값이 오기 전까지 0% 로 보고 주간이 HP 를 정한다
+        self.assertEqual(petcore.team_hp(self.limits(100, self.NOW_S - 1, 41, week_reset), self.NOW_MS),
+                         (59, week_reset))
+        # 둘 다 다 썼으면 늦게 리셋되는 쪽까지 기다려야 한다
+        self.assertEqual(petcore.team_hp(self.limits(100, self.NOW_S + 60, 100, week_reset), self.NOW_MS),
+                         (0, week_reset))
+        self.assertEqual(petcore.team_hp(self.limits(130, self.NOW_S + 60), self.NOW_MS), (0, self.NOW_S + 60))
+        self.assertEqual(petcore.team_hp(self.limits(50, self.NOW_S), self.NOW_MS), (100, self.NOW_S))  # 리셋 시각 = 지금
+        self.assertEqual(petcore.team_hp(self.limits(99.5, self.NOW_S + 60), self.NOW_MS)[0], 0)  # 반올림해 100%
+
+    def test_hp_events(self):
+        self.assertEqual(petcore.hp_events(None, 72), (0, False, None))  # 처음 값은 기준만
+        self.assertEqual(petcore.hp_events(72, 72), (0, False, None))
+        self.assertEqual(petcore.hp_events(72, 71), (1, False, None))
+        self.assertEqual(petcore.hp_events(72, 69), (3, False, None))
+        self.assertEqual(petcore.hp_events(25, 15), (10, True, None))   # 20 아래로
+        self.assertEqual(petcore.hp_events(15, 12), (3, False, None))
+        self.assertEqual(petcore.hp_events(21, 20), (1, True, None))
+        self.assertEqual(petcore.hp_events(11, 9), (2, True, None))     # 10 아래로
+        self.assertEqual(petcore.hp_events(9, 0), (9, False, "over"))
+        self.assertEqual(petcore.hp_events(0, 3), (0, False, "potion"))  # GAME OVER 에서 벗어나면
+        self.assertEqual(petcore.hp_events(30, 41), (0, False, "potion"))
+        self.assertEqual(petcore.hp_events(30, 39), (0, False, None))   # 조금 오른 것은 그냥 지나간다
+        self.assertEqual(petcore.hp_events(25, 5), (20, True, None))    # 문턱 둘을 한꺼번에 넘어도 경고 한 번
+        self.assertEqual(petcore.hp_events(0, 0), (0, False, None))
+
+    def test_texts(self):
+        self.assertEqual(petcore.hp_label(72), "팀 HP 72%")
+        self.assertEqual(petcore.hp_label(0), "GAME OVER")
+        self.assertEqual(petcore.game_over_text(self.NOW_S + 42 * 60, self.NOW_MS), "12:42 리셋\n(42분 뒤)")
+        self.assertEqual(petcore.game_over_text(None, self.NOW_MS), "리셋을 기다려요")
+        self.assertEqual(petcore.game_over_text(1791763200, self.NOW_MS), "10/12(월) 09:00 리셋\n(3일 21시간 뒤)")
+        self.assertEqual(petcore.game_over_text(self.NOW_S - 1, self.NOW_MS), "리셋을 기다려요")
+        rows, note = petcore.limit_rows(self.limits(28, self.NOW_S + 3600, None, None), self.NOW_MS)
+        self.assertEqual(rows, [("5시간", 28, "13:00 리셋 (1시간 0분 뒤)"), ("주간", None, "정보 없음")])
+        self.assertEqual(note, "")
+
+
 class LayoutTest(unittest.TestCase):
     SIZES = {"a": (100, 150), "b": (120, 200), "c": (80, 150)}
 

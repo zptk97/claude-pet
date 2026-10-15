@@ -14,12 +14,14 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 휙 놓으면 날아가 튕기다가 달려 돌아온다
 휠 굴리기: 쓰다듬기 (하트가 떠오르고, 빠르게 굴리면 좋아한다)
 오른쪽 클릭: 나중에 이어서 볼게, 이 세션의 펫(펫 다시 읽기), 펫 켜고 끄기, 크기, 접기, 펫 따로 움직이기,
-펫이 혼자 움직이기, 작업 요약 켜고 끄기, 자동 실행, 종료
+펫이 혼자 움직이기, 디펜스 보기, 작업 요약 켜고 끄기, 자동 실행, 종료
 
 펫이 혼자 움직이기: 새 세션 펫은 화면의 넓은 쪽에서 달려와 나타나고, 끝난 세션 펫은 인사하고 달려 나가며 사라진다.
 쉬는 펫은 가끔 옆으로 걸어갔다 오거나 가까운 펫에게 인사하러 가고, 오류 난 이웃은 찾아가 위로한다 (끄면 제자리에서).
 졸기·축하: 오래 쉬면 졸고, 오래 걸린 일이 끝나면 색종이를 뿌리고, 이웃이 일을 끝내면 옆 펫이 축하한다.
 펫 성장: 펫마다 작업한 시간과 끝낸 일로 경험치가 쌓여 레벨이 오른다 (마우스 올림 카드, 이 세션의 펫 메뉴에 표시).
+팀 HP: 줄 오른쪽 끝의 기지(개발 PC)가 계정 5시간·주간 사용량 중 더 적게 남은 쪽을 HP 로 보여준다.
+사용량이 오를 때마다 맞고, 20%·10% 에서 경고하고, 다 쓰면 GAME OVER, 리셋되면 다 같이 기뻐한다 (디펜스 보기로 끈다).
 
 나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
 그 펫을 클릭해 돌아가거나, 그 세션에 새 프롬프트를 보내거나, 표시 지우기를 누르면 풀린다.
@@ -101,6 +103,16 @@ LEVEL_UP_MS = 2500     # 레벨업 금색 말풍선을 보이는 시간
 LEVEL_CONFETTI = 16
 GROWTH_SAVE_MS = 60_000  # 작업 중에는 성장 기록을 이 간격으로 저장한다 (끝낸 일, 레벨업, 종료 때는 바로)
 GROWTH_COLOR = "#D69E2E"  # 카드의 경험치 막대
+ASSET_DIR = APP_DIR / "assets" / "defense"
+BASE_ID = ":base"      # 마우스 올림 카드에서 기지를 가리키는 이름 (세션 id 에는 ':' 가 없다)
+BASE_ICON_H = 170      # 기지 그림 높이 (펫 크기 배율을 곱한다)
+BASE_MIN_W = 90        # 기지 칸 최소 폭 (HP 막대)
+BASE_BAR_H = 8
+BASE_SHAKE_MS = 400    # 맞으면 이만큼 흔들리며 빨갛게 번쩍인다
+BASE_SHAKE_PX = 4
+BASE_TICK_MS = 30
+HP_WARNING_MS = 4000   # 팀 HP 경고 말풍선을 보이는 시간
+POTION_CONFETTI = 30
 
 # 상태별 말풍선 (배경, 테두리)
 BUBBLE_COLORS = {
@@ -797,17 +809,22 @@ class PetWindow(QWidget):
         self.play_jump(petcore.CELEBRATE_JUMPS)
         self.effect("confetti", CONFETTI_COUNT)
 
-    def level_up(self, level):
-        """레벨이 오르면 금색 말풍선을 띄우고 뛰며 색종이를 조금 뿌린다.
-        들고 있거나, 날거나, 걷거나, 나가는 중이면 연출 없이 넘어간다 (레벨은 이미 기록됐다)."""
+    def announce(self, animation, bubble, ms, style=None, jumps=0):
+        """알릴 일 (레벨업, GAME OVER, POTION): 동작과 색 말풍선을 ms 동안 보인다. jumps 는 뛸 횟수
+        (긴 작업 축하로 이미 뛰고 있으면 그대로 둔다). 들고 있거나, 날거나, 걷거나, 나가는 중이면 넘어가고 False."""
         if self.held is not None or self.flight is not None or self.walking() or self.leaving:
-            return
-        self.set_play(None, petcore.LEVEL_UP.format(level=level), "level")
+            return False
+        self.set_play(animation, bubble, style)
         self.manager.layout()
-        self.react_timer.start(LEVEL_UP_MS)
-        if self.oneshot is None:  # 긴 작업 축하로 이미 뛰고 있으면 그대로 둔다
-            self.play_jump(petcore.LEVEL_UP_JUMPS)
-        self.effect("confetti", LEVEL_CONFETTI)
+        self.react_timer.start(ms)
+        if jumps and self.oneshot is None:
+            self.play_jump(jumps)
+        return True
+
+    def level_up(self, level):
+        """레벨이 오르면 금색 말풍선을 띄우고 뛰며 색종이를 조금 뿌린다 (못 보여도 레벨은 이미 기록됐다)."""
+        if self.announce(None, petcore.LEVEL_UP.format(level=level), LEVEL_UP_MS, "level", petcore.LEVEL_UP_JUMPS):
+            self.effect("confetti", LEVEL_CONFETTI)
 
     def effect(self, kind, count):
         if self.effects is None:
@@ -1080,12 +1097,18 @@ class EffectLayer(QWidget):
         self.timer = QTimer(self, interval=EFFECT_TICK_MS, timeout=self.step)
         self.last = 0.0
 
-    def add(self, kind, pet, count):
-        """pet(펫 그림의 화면 자리) 위에 kind("heart", "confetti") 를 count 개 띄운다."""
+    def add(self, kind, pet, count, text=""):
+        """pet(펫 그림의 화면 자리) 위에 kind("heart", "confetti", "text") 를 count 개 띄운다.
+        "text" 는 text 를 펫 위에서 천천히 떠오르게 한다 (기지가 맞은 -1%)."""
         now = time.monotonic()
         w, h = pet.width(), pet.height()
         for _ in range(count):
-            if kind == "heart":
+            if kind == "text":
+                self.particles.append({
+                    "kind": kind, "text": text, "x": pet.center().x(), "y": pet.top() + 0.15 * h, "vx": 0,
+                    "vy": -45, "g": 0, "born": now, "life": 1.2, "size": max(12, h // 6), "color": "#FF5A5A",
+                    "angle": 0, "spin": 0})
+            elif kind == "heart":
                 self.particles.append({
                     "kind": kind, "x": pet.center().x() + random.uniform(-0.15, 0.15) * w,
                     "y": pet.top() + 0.35 * h, "vx": random.uniform(-15, 15), "vy": -random.uniform(55, 85),
@@ -1101,7 +1124,7 @@ class EffectLayer(QWidget):
                     "angle": random.uniform(0, 360), "spin": random.uniform(-360, 360)})
         # 날아갈 자리를 덮는다 (색종이는 펫 둘레 좌우 2.5배, 위 2배, 아래 2.5배 안에서 흐려진다).
         # 이미 떠 있으면 넓히기만 해서 날고 있는 것이 잘리지 않게 한다.
-        if kind == "heart":
+        if kind in ("heart", "text"):
             area = pet.adjusted(-w, -3 * h // 2, w, 0)
         else:
             area = pet.adjusted(-5 * w // 2, -2 * h, 5 * w // 2, 5 * h // 2)
@@ -1156,6 +1179,15 @@ class EffectLayer(QWidget):
                 painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
                 painter.setBrush(QColor(p["color"]))
                 painter.drawPath(heart_path(p["size"]))
+            elif p["kind"] == "text":
+                font = QFont(self.font().family(), 1, QFont.Bold)
+                font.setPixelSize(p["size"])
+                path = QPainterPath()
+                path.addText(0, 0, font, p["text"])
+                path.translate(-path.boundingRect().center())
+                # 어느 바탕에서도 읽히게 진한 테두리를 먼저 두르고 그 위를 채운다
+                painter.strokePath(path, QPen(QColor(30, 30, 30, 220), 3))
+                painter.fillPath(path, QColor(p["color"]))
             else:
                 size = p["size"]
                 painter.fillRect(QRectF(-size / 2, -size / 4, size, size / 2), QColor(p["color"]))
@@ -1279,6 +1311,222 @@ class UsageCard(QWidget):
                          petcore.format_percent(percent) if percent is not None else "-")
         painter.setPen(QColor("#B8B8C0"))
         painter.drawText(pct_x + self.pct_w + 8, baseline, detail)
+
+
+class BaseWindow(QWidget):
+    """팀 HP 기지: 펫 줄 오른쪽 끝의 개발 PC 그림, HP 막대, '팀 HP 72%' 이름표.
+    맞으면 흔들리며 빨갛게 번쩍이고, 경고와 GAME OVER(리셋까지 남은 시간)는 위에 말풍선으로 알린다.
+    줄 배치는 PetManager 가 칸(slot_w)을 비워 두고 place 로 세운다."""
+
+    def __init__(self, manager):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                         | Qt.NoDropShadowWindowHint | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowTitle("Claude Pet Base")
+        self.setFont(QFont(self.font().family(), 10))
+        self.label_font = QFont(self.font().family(), 9, QFont.Bold)
+        self.manager = manager
+        self.images = {name: QPixmap(str(ASSET_DIR / f"{name}.png")) for name in ("base", "base_over")}
+        self.scale = None
+        self.icons = {}  # 펫 크기에 맞춘 그림 {"base", "base_over", "red"(번쩍일 때 덮는 빨간 그림)}
+        self.hp = None
+        self.reset = None
+        self.label = ""
+        self.bubble = ""
+        self.bubble_style = "waiting"
+        self.said = None  # 잠깐 보이는 말풍선 (문구, 색 이름): 경고
+        self.say_timer = QTimer(self, singleShot=True, timeout=self.end_say)
+        self.shake_end = 0.0
+        self.shake_timer = QTimer(self, interval=BASE_TICK_MS, timeout=self.update)
+        self.effects = None
+        self.spot = None  # 마지막 place 인자 (칸 오른쪽 끝, 바닥, 작업 영역)
+        self.slot_w = BASE_MIN_W
+        self.size_hint_ = (0, 0)
+        self.icon_rect = self.bar_rect = self.label_rect = self.bubble_rect = QRect()
+
+    def set_scale(self, scale):
+        """펫 크기 배율에 맞춰 그림을 다시 만든다. 바뀌었으면 True."""
+        if scale == self.scale:
+            return False
+        self.scale = scale
+        height = round(BASE_ICON_H * scale)
+        for name, image in self.images.items():
+            self.icons[name] = image.scaledToHeight(height, Qt.SmoothTransformation) if not image.isNull() else None
+        base = self.icons["base"]
+        if base is not None:
+            red = QPixmap(base.size())
+            red.fill(Qt.transparent)
+            painter = QPainter(red)
+            painter.drawPixmap(0, 0, base)
+            painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            painter.fillRect(red.rect(), QColor(255, 40, 40))
+            painter.end()
+            self.icons["red"] = red
+        return True
+
+    def set_hp(self, hp, reset, now_ms, scale):
+        """팀 HP 를 보인다. 칸 폭이나 창 크기가 바뀌었으면 True (줄을 다시 세워야 한다)."""
+        rescaled = self.set_scale(scale)
+        self.hp, self.reset = hp, reset
+        if hp == 0:
+            bubble = (petcore.game_over_text(reset, now_ms), "error")
+        else:
+            bubble = self.said or ("", "waiting")
+        view = (petcore.hp_label(hp), *bubble)
+        if view == (self.label, self.bubble, self.bubble_style) and not rescaled:
+            self.update()
+            return False
+        self.label, self.bubble, self.bubble_style = view
+        return self.relayout()
+
+    def relayout(self):
+        """칸과 말풍선 크기로 창 크기를 다시 잰다. 바뀌었으면 True."""
+        icon = self.icons.get("base")
+        icon_w, icon_h = (icon.width(), icon.height()) if icon is not None else (BASE_MIN_W, BASE_MIN_W)
+        label_metrics = QFontMetrics(self.label_font)
+        label_w, label_h = label_metrics.horizontalAdvance(self.label) + 12, label_metrics.height() + 2
+        if self.bubble:
+            text = QFontMetrics(self.font()).boundingRect(
+                QRect(0, 0, BUBBLE_MAX_W - 2 * BUBBLE_PAD, 1000), Qt.TextWordWrap, self.bubble)
+            bubble_w, bubble_h = min(text.width() + 2 * BUBBLE_PAD, BUBBLE_MAX_W), text.height() + 2 * BUBBLE_PAD
+        else:
+            bubble_w = bubble_h = 0
+        # GAME OVER 말풍선은 며칠씩 떠 있을 수 있어서 칸을 그만큼 넓혀 옆 펫 말풍선을 덮지 않는다
+        # (잠깐 뜨는 경고는 줄이 흔들리지 않게 칸에 넣지 않는다)
+        slot_w = max(icon_w, BASE_MIN_W, label_w, bubble_w if self.hp == 0 else 0)
+        top = bubble_h + BUBBLE_TAIL if self.bubble else 0
+        self.bubble_rect = QRect(0, 0, bubble_w, bubble_h)
+        self.icon_rect = QRect(0, top, icon_w, icon_h)
+        self.bar_rect = QRect(0, top + icon_h + 4, max(icon_w, BASE_MIN_W), BASE_BAR_H)
+        self.label_rect = QRect(0, self.bar_rect.bottom() + 5, label_w, label_h)
+        size = (max(slot_w, bubble_w), self.label_rect.bottom() + 1)
+        changed = (slot_w, size) != (self.slot_w, self.size_hint_)
+        self.slot_w, self.size_hint_ = slot_w, size
+        if self.spot is not None and self.isVisible():  # 안쪽 자리를 다시 잡는다 (숨어 있으면 layout 이 세울 때)
+            self.place(*self.spot)
+        return changed
+
+    def place(self, slot_right, floor, area):
+        """칸 오른쪽 끝 slot_right, 바닥 floor (이름표 아래 끝) 에 세운다. 말풍선이 화면 밖으로 나가지 않게 창을 맞춘다."""
+        self.spot = (slot_right, floor, area)
+        width, height = self.size_hint_
+        slot_left = slot_right - self.slot_w
+        left = max(area.left(), min(slot_left - (width - self.slot_w) // 2, area.right() + 1 - width))
+        slot_x = slot_left - left  # 창 안에서 칸의 왼쪽
+        for rect in (self.icon_rect, self.bar_rect, self.label_rect):
+            rect.moveLeft(slot_x + (self.slot_w - rect.width()) // 2)
+        center = self.icon_rect.center().x()
+        self.bubble_rect.moveLeft(max(0, min(center - self.bubble_rect.width() // 2, width - self.bubble_rect.width())))
+        self.setGeometry(left, floor - height, width, height)
+        # 투명한 빈 곳은 클릭이 아래 창으로 가게 (흔들려도 그림이 잘리지 않게 그림 칸은 넓혀 둔다)
+        region = QRegion(self.icon_rect.adjusted(-BASE_SHAKE_PX, 0, BASE_SHAKE_PX, 0))
+        region = region.united(QRegion(self.bar_rect)).united(QRegion(self.label_rect))
+        if self.bubble:
+            region = region.united(QRegion(self.bubble_rect.adjusted(0, 0, 0, BUBBLE_TAIL)))
+        self.setMask(region)  # 크기를 바꾼 뒤에 씌운다 (PetWindow.place 참고)
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    def hit(self, percent):
+        """맞았다: 흔들리며 빨갛게 번쩍이고 '-n%' 가 떠오른다."""
+        self.shake_end = time.monotonic() + BASE_SHAKE_MS / 1000
+        self.shake_timer.start()
+        self.effect("text", 1, f"-{percent}%")
+
+    def say(self, text, style, ms):
+        self.said = (text, style)
+        self.say_timer.start(ms)
+        if self.hp is not None and self.set_hp(self.hp, self.reset, int(time.time() * 1000), self.scale):
+            self.manager.layout()
+
+    def forget_say(self):
+        self.say_timer.stop()
+        self.said = None
+
+    def retire(self):
+        """숨는다 (디펜스 보기를 껐거나 펫·사용량이 없을 때). 경고·흔들림 타이머도 멈춰서 혼자 다시 뜨지 않는다."""
+        self.forget_say()
+        self.shake_timer.stop()
+        self.hide()
+
+    def end_say(self):
+        self.said = None
+        if self.hp is not None and self.set_hp(self.hp, self.reset, int(time.time() * 1000), self.scale):
+            self.manager.layout()
+
+    def celebrate(self):
+        self.effect("confetti", POTION_CONFETTI)
+
+    def effect(self, kind, count, text=""):
+        if self.effects is None:
+            self.effects = EffectLayer()
+        self.effects.add(kind, QRect(self.pos() + self.icon_rect.topLeft(), self.icon_rect.size()), count, text)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        if self.bubble:
+            fill, border = BUBBLE_COLORS.get(self.bubble_style, BUBBLE_COLORS["waiting"])
+            rect = QRectF(self.bubble_rect).adjusted(1, 1, -1, -1)
+            tail_x = int(min(max(self.icon_rect.center().x(), rect.left() + 14), rect.right() - 14))
+            bottom = int(rect.bottom())
+            path = QPainterPath()
+            path.addRoundedRect(rect, 8, 8)
+            tail = QPainterPath()
+            tail.addPolygon(QPolygonF([QPoint(tail_x - 7, bottom - 1), QPoint(tail_x + 7, bottom - 1),
+                                       QPoint(tail_x, bottom + BUBBLE_TAIL - 1)]))
+            painter.setPen(QPen(QColor(border), 1.5))
+            painter.setBrush(QColor(fill))
+            painter.drawPath(path.united(tail))
+            painter.setPen(QColor("#222222"))
+            painter.drawText(self.bubble_rect.adjusted(BUBBLE_PAD, BUBBLE_PAD, -BUBBLE_PAD, -BUBBLE_PAD),
+                             Qt.TextWordWrap | Qt.AlignCenter, self.bubble)
+
+        left = time.monotonic() - self.shake_end
+        shaking = left < 0
+        if not shaking:
+            self.shake_timer.stop()
+        icon = self.icons.get("base_over" if self.hp == 0 else "base")
+        if icon is not None:
+            dx = round(BASE_SHAKE_PX * math.sin(left * 70)) if shaking else 0
+            spot = self.icon_rect.topLeft() + QPoint(dx, 0)
+            painter.drawPixmap(spot, icon)
+            if shaking and self.hp != 0 and self.icons.get("red") is not None:
+                painter.setOpacity(0.55 * -left / (BASE_SHAKE_MS / 1000))
+                painter.drawPixmap(spot, self.icons["red"])
+                painter.setOpacity(1.0)
+
+        bar = QRectF(self.bar_rect)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 60))
+        painter.drawRoundedRect(bar, BASE_BAR_H / 2, BASE_BAR_H / 2)
+        if self.hp:
+            filled = QRectF(bar)
+            filled.setWidth(max(BASE_BAR_H, bar.width() * self.hp / 100))
+            painter.setBrush(QColor(usage_color(100 - self.hp)))
+            painter.drawRoundedRect(filled, BASE_BAR_H / 2, BASE_BAR_H / 2)
+
+        painter.setBrush(QColor(30, 30, 30, 170))
+        painter.drawRoundedRect(QRectF(self.label_rect), 6, 6)
+        painter.setFont(self.label_font)
+        painter.setPen(QColor("#FF8080") if self.hp == 0 else QColor("#FFFFFF"))
+        painter.drawText(self.label_rect, Qt.AlignCenter, self.label)
+
+    def enterEvent(self, _event):
+        self.manager.hover_enter(BASE_ID)
+
+    def leaveEvent(self, _event):
+        self.manager.hover_leave(BASE_ID)
+
+    def contextMenuEvent(self, event):
+        self.manager.show_base_menu(event.globalPos())
+
+    def closeEvent(self, event):
+        if self.effects is not None:
+            self.effects.close()
+        super().closeEvent(event)
 
 
 class Gister(QObject):
@@ -1414,6 +1662,10 @@ class PetManager(QObject):
         self.growth_saved = time.monotonic()  # 저장 간격은 시계를 바꿔도 맞게 monotonic 으로 잰다
         self.growth_dirty = False
         self.pending_work = {}  # 다음 훅을 기다리는 작업 시간 {session_id: [ts, ms]} (petcore.work_tick)
+        self.base = None  # 팀 HP 기지 (BaseWindow, 처음 보일 때 만든다)
+        self.base_on = False  # 기지를 세웠는지 (줄 오른쪽 끝에 기지 칸을 비운다)
+        self.team_prev = None  # 지난번 팀 HP (줄어든 만큼 맞는다. None 이면 다음 값은 기준만)
+        self.peaks = {}  # 창마다 지금 리셋 주기에서 본 가장 큰 사용량 (petcore.hold_peaks)
         self.done_seen = None  # 경험치로 센 끝낸 일 {session_id: prompt_ts} (처음 refresh 때 이미 끝나 있던 일은 세지 않는다)
         QApplication.instance().aboutToQuit.connect(self.save_growth)
 
@@ -1437,6 +1689,10 @@ class PetManager(QObject):
     def motion_enabled(self):
         """펫이 혼자 움직이기 (새 세션은 달려와 나타나고 끝난 세션은 달려 나가며 사라진다)."""
         return self.config.get("motion") is not False
+
+    def defense_enabled(self):
+        """디펜스 보기: 줄 오른쪽 끝의 기지가 계정 사용량을 팀 HP 로 보여준다."""
+        return self.config.get("defense") is not False
 
     def free_layout(self):
         """펫 따로 움직이기. 접혀 있으면 한 마리만 보이므로 줄 자리에 세운다."""
@@ -1617,6 +1873,8 @@ class PetManager(QObject):
                 needs_layout = True
 
         self.order = order
+        if self.update_team(now):
+            needs_layout = True
         if needs_layout:
             self.layout()
 
@@ -1658,6 +1916,40 @@ class PetManager(QObject):
                 self.windows[sid].level_up(level)
         if self.growth_dirty and (urgent or time.monotonic() - self.growth_saved >= GROWTH_SAVE_MS / 1000):
             self.save_growth()
+
+    def update_team(self, now):
+        """계정 사용량으로 팀 HP 를 구해 기지에 보이고, 바뀐 만큼 연출한다. 줄을 다시 세워야 하면 True.
+        디펜스 보기를 껐거나, 펫이 없거나, 사용량을 모르면 (상태줄 중계를 안 쓰면) 기지를 숨긴다."""
+        team = None
+        if self.defense_enabled() and self.order:
+            team = petcore.team_hp(self.account_limits(), now)
+        if team is None:
+            self.team_prev = None
+            was_on, self.base_on = self.base_on, False
+            if self.base is not None:
+                self.base.retire()
+            return was_on
+        hp, reset = team
+        if self.base is None:
+            self.base = BaseWindow(self)
+        hit, warn, mood = petcore.hp_events(self.team_prev, hp)
+        self.team_prev = hp
+        if mood:
+            self.base.forget_say()  # 떠 있던 경고는 GAME OVER·POTION 이 덮는다
+        resized = self.base.set_hp(hp, reset, now, self.scale())
+        was_on, self.base_on = self.base_on, True
+        if hit:
+            self.base.hit(hit)
+        if warn:
+            self.base.say(petcore.HP_WARNING.format(hp=hp), "waiting", HP_WARNING_MS)
+        if mood == "over":
+            for window in list(self.windows.values()):
+                window.announce(*petcore.GAME_OVER, style="error")
+        elif mood == "potion":
+            self.base.celebrate()
+            for window in list(self.windows.values()):
+                window.announce(*petcore.POTION, style="level")
+        return resized or not was_on
 
     def idle_play(self, now):
         """쉬는 펫: 오래 쉬면 졸고, 좀 쉬면 가끔 옆으로 걸어갔다 오거나 가까운 펫에게 인사하러 간다.
@@ -1774,22 +2066,29 @@ class PetManager(QObject):
         (앞에 선 펫이 클릭을 그대로 받아서, 옆 펫을 누르려다 산책하는 펫을 누르지 않는다)."""
         mine = window.geometry()
         path = mine.united(mine.translated(dx, 0))
-        others = [int(other.winId()) for other in self.windows.values()
+        candidates = list(self.windows.values()) + ([self.base] if self.base is not None else [])
+        others = [int(other.winId()) for other in candidates
                   if other is not window and other.isVisible() and other.geometry().intersects(path)]
         if others:
             self.x11.lower_below(int(window.winId()), others)
 
     def layout(self):
         """처음 생긴 세션이 줄의 오른쪽 끝, 새 세션일수록 왼쪽. 모두 같은 바닥선에 선다.
+        기지가 있으면 줄 맨 오른쪽 칸에 기지가 서고 펫들은 그 왼쪽부터 선다.
         펫 따로 움직이기에서 옮긴 펫은 옮긴 자리에 서고, 안 옮긴 펫들이 줄에 남는다.
         휠로 들고 있거나 돌아가는 중인 펫은 자리만 알려 주고 옮기지 않는다."""
         area = self.screen_area(self.anchor)
-        tallest = max((self.windows[sid].size_hint_[1] for sid in self.order), default=0)
+        tallest = max([self.windows[sid].size_hint_[1] for sid in self.order]
+                      + ([self.base.size_hint_[1]] if self.base_on else []), default=0)
         self.anchor = QPoint(min(max(self.anchor.x(), area.left() + 50), area.right() + 1),
                              min(max(self.anchor.y(), area.top() + tallest), area.bottom() + 1))
         sizes = {sid: self.windows[sid].size_hint_ for sid in self.order}
         positions = self.positions if self.free_layout() else {}
-        spots = petcore.layout_spots(self.order, sizes, (self.anchor.x(), self.anchor.y()), ROW_GAP, positions)
+        right = self.anchor.x()
+        if self.base_on:
+            self.base.place(right, self.anchor.y(), area)
+            right -= self.base.slot_w + ROW_GAP
+        spots = petcore.layout_spots(self.order, sizes, (right, self.anchor.y()), ROW_GAP, positions)
         for sid in self.order:
             window = self.windows[sid]
             window.set_home(*spots[sid])
@@ -1853,6 +2152,9 @@ class PetManager(QObject):
     def update_card(self):
         """마우스를 올린 펫의 카드를 채워 그 펫 위에 띄운다 (떠 있는 동안 매초 다시 채운다)."""
         sid = self.hover_sid
+        if sid == BASE_ID:
+            self.update_base_card()
+            return
         window = self.windows.get(sid)
         session = self.sessions.get(sid)
         if window is None or session is None or self.drag_origin is not None or window.playing():
@@ -1860,7 +2162,7 @@ class PetManager(QObject):
             return
         now = int(time.time() * 1000)
         usage = petcore.load_usage(petcore.usage_dir())
-        rows, note = petcore.usage_rows(usage.get(sid), petcore.account_limits(usage), now)
+        rows, note = petcore.usage_rows(usage.get(sid), self.account_limits(usage), now)
         state = self.view_states.get(sid, session["state"])
         subtitle = f"{petcore.session_name(session)} · {petcore.STATE_LABELS.get(state, state)}"
         pet = next((p for p in self.pets if p["id"] == window.pet_id), None)
@@ -1868,6 +2170,25 @@ class PetManager(QObject):
         self.card.set_content(self.titles_by_sid.get(sid) or petcore.session_name(session), subtitle, rows, note,
                               growth)
         self.card.show_above(window, self.screen_area(window.geometry().center()))
+
+    def account_limits(self, usage=None):
+        """계정 5시간·주간 사용량 (지금 리셋 주기에서 본 가장 큰 값을 기억해 거꾸로 줄지 않게 한다)."""
+        if usage is None:
+            usage = petcore.load_usage(petcore.usage_dir())
+        limits, self.peaks = petcore.hold_peaks(petcore.account_limits(usage), self.peaks)
+        return limits
+
+    def update_base_card(self):
+        """기지에 마우스를 올리면: 팀 HP 와 계정 5시간·주간 사용량, 리셋 시각."""
+        now = int(time.time() * 1000)
+        limits = self.account_limits()
+        team = petcore.team_hp(limits, now)
+        if not self.base_on or team is None or self.drag_origin is not None:
+            self.card.hide()
+            return
+        rows, note = petcore.limit_rows(limits, now)
+        self.card.set_content(petcore.hp_label(team[0]), "5시간·주간 중 더 적게 남은 쪽", rows, note)
+        self.card.show_above(self.base, self.screen_area(self.base.geometry().center()))
 
     def drag_begin(self, sid, pos):
         """왼쪽 드래그 시작. 펫 따로 움직이기면 그 펫만, 아니면 줄 전체를 옮긴다."""
@@ -2025,6 +2346,7 @@ class PetManager(QObject):
         motion = QAction("펫이 혼자 움직이기", menu, checkable=True, checked=self.motion_enabled())
         motion.triggered.connect(self.set_motion)
         menu.addAction(motion)
+        menu.addAction(self.defense_action(menu))
         gist = QAction("작업 요약 (Haiku 로 말풍선 요약)", menu, checkable=True, checked=self.gist_enabled())
         gist.triggered.connect(self.set_gist)
         menu.addAction(gist)
@@ -2040,6 +2362,21 @@ class PetManager(QObject):
         finally:
             self.desktop.watch_clicks(False)
 
+    def defense_action(self, menu):
+        action = QAction("디펜스 보기 (팀 HP 기지)", menu, checkable=True, checked=self.defense_enabled())
+        action.triggered.connect(self.set_defense)
+        return action
+
+    def show_base_menu(self, pos):
+        self.hide_card()
+        menu = QMenu()
+        menu.addAction(self.defense_action(menu))
+        self.desktop.watch_clicks(True)
+        try:
+            menu.exec_(pos)
+        finally:
+            self.desktop.watch_clicks(False)
+
     @pyqtSlot(QDBusMessage)
     def on_screen_click(self, message):
         """메뉴가 열린 동안 메뉴·펫 밖을 누르면 메뉴를 닫는다 (메뉴·펫 위 클릭은 Qt 가 처리한다)."""
@@ -2048,7 +2385,7 @@ class PetManager(QObject):
             return
         point = QPoint(int(args[0]), int(args[1]))
         for widget in QApplication.topLevelWidgets():
-            if (widget.isVisible() and isinstance(widget, (QMenu, PetWindow))
+            if (widget.isVisible() and isinstance(widget, (QMenu, PetWindow, BaseWindow))
                     and widget.geometry().contains(point)):
                 return
         for _ in range(10):  # 하위 메뉴까지 차례로 닫는다
@@ -2117,6 +2454,7 @@ class PetManager(QObject):
         self.frames_cache.clear()
         for window in self.windows.values():
             window.set_pet(window.pet_id, *self.pet_frames(window.pet_id))
+        self.update_team(int(time.time() * 1000))  # 기지 그림도 새 크기로
         self.layout()
         self.save()
 
@@ -2141,6 +2479,11 @@ class PetManager(QObject):
     def set_motion(self, enabled):
         self.config["motion"] = bool(enabled)
         self.save()
+
+    def set_defense(self, enabled):
+        self.config["defense"] = bool(enabled)
+        save_config(self.config)
+        self.refresh()
 
     def set_gist(self, enabled):
         self.config["gist"] = bool(enabled)
