@@ -269,6 +269,7 @@ class PetWindow(QWidget):
         self.back.finished.connect(self.react)
         self.held_timer = QTimer(self, interval=HELD_TICK_MS, timeout=self.follow)
         self.react_timer = QTimer(self, singleShot=True, timeout=self.end_play)
+        self.drag_animation = None  # 왼쪽 드래그로 옮기는 동안 끄는 쪽으로 달리는 동작 (장난보다 뒤)
 
         self.pet_rect = self.bubble_rect = self.name_rect = self.badge_rect = QRect()
         self.set_animation(petcore.STATE_ANIMATION[self.state])
@@ -362,12 +363,23 @@ class PetWindow(QWidget):
     # ---- 애니메이션 --------------------------------------------------------
 
     def current_animation(self):
-        return self.oneshot or self.play_animation or self.animation
+        return self.oneshot or self.play_animation or self.drag_animation or self.animation
 
     def set_animation(self, name):
         if name == self.animation:
             return
         self.animation = name
+        if self.oneshot is None and self.play_animation is None and self.drag_animation is None:
+            self.frame_index = 0
+            self.anim_timer.stop()
+            self.schedule_frame()
+        self.update()
+
+    def set_drag(self, name):
+        """왼쪽 드래그로 옮기는 동안의 동작. None 이면 상태 동작으로 돌아간다."""
+        if name == self.drag_animation:
+            return
+        self.drag_animation = name
         if self.oneshot is None and self.play_animation is None:
             self.frame_index = 0
             self.anim_timer.stop()
@@ -785,6 +797,9 @@ class PetManager(QObject):
         self.positions = self.initial_positions()  # 따로 움직이기에서 옮긴 펫의 발밑 가운데 {session_id: [x, y]}
         self.drag_origin = None
         self.dragged = False
+        self.drag_shake = None  # 왼쪽 드래그로 끄는 방향 (petcore.Shake)
+        # 커서가 멈춰도 마우스 이벤트가 없으니 이 간격으로 달리기를 멈출지 다시 본다
+        self.drag_timer = QTimer(self, interval=HELD_TICK_MS, timeout=self.drag_pose)
         self.warned_extension = False
 
         # XWayland 메뉴는 다른 창 클릭을 받지 못해서, 메뉴가 열린 동안 확장이 알려 주는 클릭으로 닫는다
@@ -1012,16 +1027,22 @@ class PetManager(QObject):
         else:
             self.drag_origin = (pos, None, QPoint(self.anchor))
         self.dragged = False
+        self.drag_shake = petcore.Shake()
+        self.drag_shake.add(pos.x(), int(time.time() * 1000))
 
     def drag_move(self, pos):
         if self.drag_origin is None:
             return
         start, sid, origin = self.drag_origin
+        self.drag_shake.add(pos.x(), int(time.time() * 1000))
         delta = pos - start
         if delta.manhattanLength() > 4:
             self.dragged = True
         if not self.dragged:
             return
+        if not self.drag_timer.isActive():
+            self.drag_timer.start()
+        self.drag_pose()
         if sid is None:
             self.anchor = origin + delta
         elif sid in self.windows:
@@ -1033,6 +1054,16 @@ class PetManager(QObject):
                                    min(max(foot.y(), area.top() + height), area.bottom() + 1)]
         self.layout()
 
+    def drag_pose(self):
+        """옮기는 펫(줄 전체거나 따로 움직이는 펫 하나)이 끄는 쪽으로 달리고, 멈추면 상태 동작으로 선다."""
+        if self.drag_origin is None:
+            return
+        name = petcore.drag_pose(self.drag_shake, int(time.time() * 1000))
+        sid = self.drag_origin[1]
+        for moving in ([sid] if sid else self.order):
+            if moving in self.windows:
+                self.windows[moving].set_drag(name)
+
     def drag_end(self):
         """드래그였으면 True (클릭으로 치지 않는다)."""
         dragged = self.dragged
@@ -1040,6 +1071,10 @@ class PetManager(QObject):
             self.save()
         self.drag_origin = None
         self.dragged = False
+        self.drag_shake = None
+        self.drag_timer.stop()
+        for window in self.windows.values():
+            window.set_drag(None)
         return dragged
 
     def on_click(self, sid):

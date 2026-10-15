@@ -549,6 +549,21 @@ class PlayTest(unittest.TestCase):
         now = drag(shake, (list(range(0, 61, 10)) + list(range(50, -1, -10))) * 3, now + 16)
         self.assertEqual(petcore.held_pose(shake, now), ("failed", "어지러워요!"))
 
+    def test_drag_pose(self):
+        shake = petcore.Shake()
+        self.assertIsNone(petcore.drag_pose(shake, 0))
+        now = drag(shake, range(0, 100, 10))
+        self.assertEqual(petcore.drag_pose(shake, now), "running-right")
+        self.assertIsNone(petcore.drag_pose(shake, now + petcore.HEADING_MS + 1))  # 멈추면 상태 동작으로 선다
+        now = drag(shake, range(90, 0, -10), now + 16)
+        self.assertEqual(petcore.drag_pose(shake, now), "running-left")
+        now = drag(shake, (list(range(0, 61, 10)) + list(range(50, -1, -10))) * 3, now + 16)
+        now = drag(shake, range(0, -100, -10), now + 16)
+        self.assertEqual(petcore.drag_pose(shake, now), "running-left")  # 줄을 옮길 때는 흔들어도 어지러워하지 않는다
+        vertical = petcore.Shake()
+        now = drag(vertical, [50] * 10)  # 위아래로만 끌면 x 가 그대로다
+        self.assertIsNone(petcore.drag_pose(vertical, now))
+
     def test_release_reaction(self):
         gentle = petcore.Shake()
         drag(gentle, range(0, 100, 10))

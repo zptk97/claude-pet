@@ -637,15 +637,20 @@ class Shake:
         return 1 if recent[-1] > recent[0] else -1
 
 
+def drag_pose(shake, now_ms):
+    """끄는 쪽으로 달리는 동작. 멈췄거나 위아래로만 끌면 None (상태 동작대로 둔다)."""
+    heading = shake.heading(now_ms)
+    if heading:
+        return "running-right" if heading > 0 else "running-left"
+    return None
+
+
 def held_pose(shake, now_ms):
     """들고 있는 펫의 (동작, 말풍선). 말풍선이 None 이면 상태 말풍선을 그대로 둔다.
     세게 흔들면 어지러워하고, 끄는 동안은 그쪽으로 달리고, 가만히 들고 있으면 버둥거린다."""
     if shake.recent(now_ms) >= DIZZY_TURNS:
         return "failed", "어지러워요!"
-    heading = shake.heading(now_ms)
-    if heading:
-        return ("running-right" if heading > 0 else "running-left"), None
-    return "jumping", None
+    return drag_pose(shake, now_ms) or "jumping", None
 
 
 def release_reaction(shake):
