@@ -710,13 +710,15 @@ def run_off_left(left, width, area, distance):
     return left - max(0, min(distance, room_left))
 
 
-# ---- 혼자 놀기 -------------------------------------------------------------------------
+# ---- 혼자 놀기, 긴 작업 축하 -----------------------------------------------------------
 
 WANDER_AFTER_MS = 2 * 60_000         # 이만큼 쉬면 가끔 옆으로 걸어갔다 온다
 SLEEP_AFTER_MS = 15 * 60_000         # 이만큼 쉬면 존다
 WANDER_EVERY_MS = (40_000, 120_000)  # 산책 사이 간격 (이 사이에서 고른다)
 WANDER_PAUSE_MS = (1500, 3000)       # 걸어간 곳에 서 있는 시간
 WANDER_PETS = (0.5, 1.0)             # 펫 폭의 몇 배만큼 걸어가는지
+LONG_WORK_MS = 10 * 60_000           # 이보다 오래 걸린 일이 끝나면 크게 축하한다
+CELEBRATE_JUMPS = 3
 
 
 def idle_mood(state, idle_ms):
@@ -743,6 +745,11 @@ def wander_step(rng, pet_w, room_left, room_right):
     if step < pet_w // 4:
         return 0
     return step if room_right >= room_left else -step
+
+
+def long_work(session):
+    """다 한 일이 LONG_WORK_MS 보다 오래 걸렸는지 (since 는 그 일을 시작한 때)."""
+    return session["state"] == "done" and session["ts"] - session["since"] >= LONG_WORK_MS
 
 
 def changed_states(old, new):

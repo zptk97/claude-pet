@@ -633,6 +633,11 @@ class IdleTest(unittest.TestCase):
         self.assertEqual(petcore.wander_step(FixedRandom(1.0), 100, 6, 20), 0)  # 화면 구석에 끼어 있다
         self.assertEqual(petcore.wander_step(FixedRandom(1.0), 100, 0, -5), 0)  # 걸을 자리가 없다
 
+    def test_long_work(self):
+        self.assertTrue(petcore.long_work(session("done", since_ago_ms=petcore.LONG_WORK_MS)))
+        self.assertFalse(petcore.long_work(session("done", since_ago_ms=petcore.LONG_WORK_MS - 1000)))
+        self.assertFalse(petcore.long_work(session("error", since_ago_ms=petcore.LONG_WORK_MS * 2)))
+
     def test_changed_states(self):
         old = {"a": "running", "b": "idle", "gone": "done"}
         new = {"a": "done", "b": "idle", "new": "running"}

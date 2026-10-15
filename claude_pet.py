@@ -16,7 +16,7 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 펫이 혼자 움직이기, 작업 요약 켜고 끄기, 자동 실행, 종료
 
 펫이 혼자 움직이기: 새 세션 펫은 화면의 넓은 쪽에서 달려와 나타나고, 끝난 세션 펫은 인사하고 달려 나가며 사라진다.
-쉬는 펫은 가끔 옆으로 걸어갔다 온다. 오래 쉬면 존다.
+쉬는 펫은 가끔 옆으로 걸어갔다 온다. 오래 쉬면 졸고, 오래 걸린 일이 끝나면 색종이를 뿌린다.
 
 나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
 그 펫을 클릭해 돌아가거나, 그 세션에 새 프롬프트를 보내거나, 표시 지우기를 누르면 풀린다.
@@ -87,7 +87,10 @@ SLEEP_SLOWDOWN = 2  # 조는 동안 쉬는 동작을 이만큼 느리게
 WHEEL_NOTCH = 120   # 휠 한 칸 (angleDelta)
 EFFECT_TICK_MS = 33
 HEART_COUNT = 1     # 휠 한 칸마다 떠오르는 하트
+CONFETTI_COUNT = 40
+CONFETTI_DRAG = 2.0  # 공기 저항 (1/s): 옆으로 덜 퍼지고 천천히 팔랑이며 떨어진다
 EDGE_FADE_PX = 20    # 효과 창 가장자리에서 이만큼 안쪽부터 흐려진다 (잘린 선이 보이지 않게)
+CONFETTI_COLORS = ("#F56565", "#ECC94B", "#48BB78", "#4299E1", "#9F7AEA", "#ED64A6")
 
 # 상태별 말풍선 (배경, 테두리)
 BUBBLE_COLORS = {
@@ -376,6 +379,7 @@ class PetWindow(QWidget):
         self.react_timer = QTimer(self, singleShot=True, timeout=self.end_play)
         self.drag_animation = None  # 왼쪽 드래그로 옮기는 동안 끄는 쪽으로 달리는 동작 (장난보다 뒤)
         self.clicks = []            # 최근 클릭 시각 (연타하면 화낸다)
+        self.jumps_left = 0         # 점프를 이만큼 더 한다 (긴 작업 축하)
 
         # 쉬는 펫: 가끔 산책하고, 오래 쉬면 존다. 휠을 굴리면 쓰다듬는다
         self.sleeping = False
@@ -385,7 +389,7 @@ class PetWindow(QWidget):
         self.wander_timer = QTimer(self, singleShot=True, timeout=self.come_back)
         self.wheel_acc = 0          # 한 칸이 안 된 휠 양 (터치패드는 조금씩 온다)
         self.strokes = []           # 최근 쓰다듬은 시각
-        self.effects = None         # 하트를 그리는 EffectLayer (처음 쓸 때 만든다)
+        self.effects = None         # 하트·색종이를 그리는 EffectLayer (처음 쓸 때 만든다)
 
         # 혼자 움직이기: 정한 곳까지 달려가기
         self.offset = QPoint()      # 혼자 걸어가 자리(home)에서 벗어난 만큼
@@ -530,8 +534,9 @@ class PetWindow(QWidget):
             self.schedule_frame()
         self.update()
 
-    def play_jump(self):
+    def play_jump(self, times=1):
         self.oneshot = "jumping"
+        self.jumps_left = times - 1
         self.frame_index = 0
         self.anim_timer.stop()
         self.schedule_frame()
@@ -558,7 +563,10 @@ class PetWindow(QWidget):
         self.frame_index += 1
         if self.frame_index >= count:
             self.frame_index = 0
-            self.oneshot = None
+            if self.jumps_left > 0:
+                self.jumps_left -= 1
+            else:
+                self.oneshot = None
         if self.sleeping:
             self.zzz += 1
         self.schedule_frame()
@@ -636,7 +644,7 @@ class PetWindow(QWidget):
         self.set_play(self.walk_pose if self.walking() else None, None)
         self.manager.layout()
 
-    # ---- 쉬는 펫: 졸기, 산책, 쓰다듬기 ---------------------------------------------
+    # ---- 쉬는 펫: 졸기, 산책, 쓰다듬기, 축하 ----------------------------------------
 
     def touch(self, now_ms):
         """클릭하거나 쓰다듬으면 깬다 (쉬는 시간을 여기서부터 다시 센다)."""
@@ -685,6 +693,11 @@ class PetWindow(QWidget):
         self.strokes, happy = petcore.pet_strokes(self.strokes, now)
         if happy and self.held is None:
             self.show_reaction(*petcore.PETTED)
+
+    def celebrate(self):
+        """오래 걸린 일이 끝나면 여러 번 뛰며 색종이를 뿌린다."""
+        self.play_jump(petcore.CELEBRATE_JUMPS)
+        self.effect("confetti", CONFETTI_COUNT)
 
     def effect(self, kind, count):
         if self.effects is None:
@@ -941,7 +954,7 @@ def heart_path(size):
 
 
 class EffectLayer(QWidget):
-    """펫 둘레에 잠깐 뜨는 효과 (쓰다듬기 하트). 펫 창 마스크 밖까지 그려야 해서 따로 띄우고,
+    """펫 둘레에 잠깐 뜨는 효과 (쓰다듬기 하트, 축하 색종이). 펫 창 마스크 밖까지 그려야 해서 따로 띄우고,
     입력은 통과시켜 아래 펫을 그대로 누를 수 있다. 효과가 다 끝나면 숨는다 (펫 창이 닫힐 때 같이 닫힌다)."""
 
     def __init__(self):
@@ -956,16 +969,30 @@ class EffectLayer(QWidget):
         self.last = 0.0
 
     def add(self, kind, pet, count):
-        """pet(펫 그림의 화면 자리) 위에 kind("heart") 를 count 개 띄운다."""
+        """pet(펫 그림의 화면 자리) 위에 kind("heart", "confetti") 를 count 개 띄운다."""
         now = time.monotonic()
         w, h = pet.width(), pet.height()
         for _ in range(count):
-            self.particles.append({
-                "kind": kind, "x": pet.center().x() + random.uniform(-0.15, 0.15) * w,
-                "y": pet.top() + 0.35 * h, "vx": random.uniform(-15, 15), "vy": -random.uniform(55, 85),
-                "g": 0, "born": now, "life": 1.4, "size": w * 0.2, "color": "#FF5A8A", "angle": 0, "spin": 0})
-        # 떠오를 자리를 덮는다. 이미 떠 있으면 넓히기만 해서 날고 있는 것이 잘리지 않게 한다.
-        area = pet.adjusted(-w, -3 * h // 2, w, 0)
+            if kind == "heart":
+                self.particles.append({
+                    "kind": kind, "x": pet.center().x() + random.uniform(-0.15, 0.15) * w,
+                    "y": pet.top() + 0.35 * h, "vx": random.uniform(-15, 15), "vy": -random.uniform(55, 85),
+                    "g": 0, "born": now, "life": 1.4, "size": w * 0.2, "color": "#FF5A8A", "angle": 0, "spin": 0})
+            else:
+                direction = math.radians(random.uniform(-150, -30))  # 위쪽으로 퍼진다
+                speed = random.uniform(220, 380) * w / 96
+                self.particles.append({
+                    "kind": kind, "x": pet.center().x() + random.uniform(-0.2, 0.2) * w, "y": pet.top() + 0.3 * h,
+                    "vx": math.cos(direction) * speed, "vy": math.sin(direction) * speed, "g": 350 * h / 104,
+                    "drag": CONFETTI_DRAG, "born": now, "life": random.uniform(1.8, 2.6),
+                    "size": random.uniform(5, 9) * w / 96, "color": random.choice(CONFETTI_COLORS),
+                    "angle": random.uniform(0, 360), "spin": random.uniform(-360, 360)})
+        # 날아갈 자리를 덮는다 (색종이는 펫 둘레 좌우 2.5배, 위 2배, 아래 2.5배 안에서 흐려진다).
+        # 이미 떠 있으면 넓히기만 해서 날고 있는 것이 잘리지 않게 한다.
+        if kind == "heart":
+            area = pet.adjusted(-w, -3 * h // 2, w, 0)
+        else:
+            area = pet.adjusted(-5 * w // 2, -2 * h, 5 * w // 2, 5 * h // 2)
         if self.isVisible():
             area = area.united(self.geometry())
         screen = QApplication.screenAt(pet.center()) or QApplication.primaryScreen()
@@ -988,6 +1015,10 @@ class EffectLayer(QWidget):
             p["x"] += p["vx"] * dt
             p["y"] += p["vy"] * dt
             p["vy"] += p["g"] * dt
+            if p.get("drag"):
+                slow = math.exp(-p["drag"] * dt)
+                p["vx"] *= slow
+                p["vy"] *= slow
             p["angle"] += p["spin"] * dt
             alive.append(p)
         self.particles = alive
@@ -1009,9 +1040,13 @@ class EffectLayer(QWidget):
             painter.save()
             painter.translate(x, y)
             painter.rotate(p["angle"])
-            painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
-            painter.setBrush(QColor(p["color"]))
-            painter.drawPath(heart_path(p["size"]))
+            if p["kind"] == "heart":
+                painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
+                painter.setBrush(QColor(p["color"]))
+                painter.drawPath(heart_path(p["size"]))
+            else:
+                size = p["size"]
+                painter.fillRect(QRectF(-size / 2, -size / 4, size, size / 2), QColor(p["color"]))
             painter.restore()
 
 
@@ -1429,6 +1464,8 @@ class PetManager(QObject):
                 continue
             if new != "idle":
                 window.come_home()  # 산책 나가 있었으면 일하러 돌아온다
+            if new == "done" and petcore.long_work(sessions[sid]):
+                window.celebrate()
         self.idle_play(now)
         if self.card.isVisible():
             self.update_card()
