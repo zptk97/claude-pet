@@ -111,6 +111,26 @@ class HookTest(unittest.TestCase):
         s = self.state()
         self.assertEqual((s["state"], s["bg_tasks"], s["bg_desc"], s["crons"]), ("background", 0, "", 1))
 
+    def test_artifact_watch_is_not_background_work(self):
+        # 아티팩트를 발행하면 대화가 끝나도 페이지 감시 작업이 남는다. 세션을 깨우지 않으니 완료로 본다.
+        watches = [
+            {"id": "w1", "type": "monitor", "status": "running",
+             "description": "live updates for artifact 3G8WGtTjwqNCQ6XCn6XiFC (auto-armed on publish)"},
+            {"id": "w2", "type": "monitor", "status": "running",
+             "description": "presence on artifact https://claude.ai/artifact/3G8WGtTjwqNCQ6XCn6XiFC"}]
+        self.fire("Stop", background_tasks=watches, session_crons=[])
+        s = self.state()
+        self.assertEqual((s["state"], s["bg_tasks"], s["bg_desc"]), ("done", 0, ""))
+
+    def test_artifact_watch_skipped_among_real_work(self):
+        self.fire("Stop", session_crons=[], background_tasks=[
+            {"id": "w1", "type": "monitor", "status": "running",
+             "description": "live updates for artifact abc (watch requested)"},
+            {"id": "b1", "type": "shell", "status": "running",
+             "description": "Train model", "command": "python train.py"}])
+        s = self.state()
+        self.assertEqual((s["state"], s["bg_tasks"], s["bg_desc"]), ("background", 1, "Train model"))
+
     def test_background_label_fallbacks(self):
         self.fire("Stop", background_tasks=[{"id": "b", "type": "shell", "status": "running",
                                              "description": "", "command": "sleep 100"}])

@@ -10,6 +10,7 @@
 #   Notification(권한 요청·질문), PreToolUse(AskUserQuestion, ExitPlanMode) -> waiting
 #   Stop                                             -> done
 #     (백그라운드 작업이나 깨우기 예약이 남아 있으면)     -> background
+#     (아티팩트를 발행하면 붙는 감시 작업은 세션을 깨우지 않으므로 세지 않는다)
 #   StopFailure                                      -> error
 #   SessionEnd                                       -> 상태 파일 삭제
 #
@@ -27,13 +28,18 @@ disabled_flag="${XDG_CONFIG_HOME:-$HOME/.config}/claude-pet/disabled"
 US=$'\x1f'
 # background_tasks / session_crons 는 Stop 에만 온다. 백그라운드 작업 수, 첫 작업 설명, 깨우기 예약 수만 남긴다.
 # 설명에 줄바꿈이 있으면 한 줄 read 가 깨지므로 제어 문자는 공백으로 바꾼다.
+# 아티팩트 감시(live updates / presence)는 페이지 변경을 기다리기만 하는 ambient 작업인데, 훅 입력에는
+# ambient 표시 없이 "monitor" 로만 와서 Claude Code 가 붙이는 설명 문구로 거른다.
 IFS=$US read -r event sid cwd tool ntype source transcript bg_tasks bg_desc crons < <(
   jq -r 'def list(f): f | if type == "array" then . else [] end;
          def task_text: [.description, .name, .agent_type, .command]
                     | map(select(type == "string" and . != "")) | .[0] // "" | .[0:200];
-         [.hook_event_name, .session_id, .cwd, .tool_name, .notification_type, .source, .transcript_path,
-          (list(.background_tasks) | length),
-          (list(.background_tasks)[0] | if type == "object" then task_text else "" end),
+         def artifact_watch: type == "object" and (.description | type == "string"
+                    and test("^(live updates for|presence on) artifact "));
+         (list(.background_tasks) | map(select(artifact_watch | not))) as $bg
+         | [.hook_event_name, .session_id, .cwd, .tool_name, .notification_type, .source, .transcript_path,
+          ($bg | length),
+          ($bg[0] | if type == "object" then task_text else "" end),
           (list(.session_crons) | length)]
          | map(. // "" | tostring | gsub("[[:cntrl:]]+"; " ")) | join("\u001f")' <<<"$input" 2>/dev/null
 )
