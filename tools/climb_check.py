@@ -168,7 +168,8 @@ def by_work():
 
     # 같은 손발을 연달아 옮기는 비율: 시드 8개 x 300초, 일하는 펫 1·3. 5% 이하, 빠르기는 자세 다듬기 (삼지점, 빠른 템포) 뒤
     # 값 (분당 6.4·9.1m) 의 95% 넘게 (보통 빠르기는 몇 동작마다 둘러보며 쉬어서 85% 넘게),
-    # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임 11% 이하 (내다보기 전에는 약 13%, 지금은 실행마다 9~10% 대)
+    # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임 12.5% 이하 (내다보기 전에는 약 13%, 내다본 뒤 9~10% 대,
+    # 뗀 발을 다음 동작으로 바꾼 뒤 시드 24개 평균 약 11%, 시드 묶음마다 ±1%p)
     for work, before, keep in ((1, 6.4, 0.85), (3, 9.1, 0.95)):
         repeats = moves = far = made = frames = stretched = 0
         speeds = []
@@ -189,7 +190,7 @@ def by_work():
             moves, far, made = moves + len(m), far + sim.far_reaches, made + sim.missing
             speeds.append((sim.top_y - y0) / 5)
         rate, speed = repeats / moves, statistics.mean(speeds)
-        check(rate <= 0.05 and made == 0 and stretched / frames <= 0.11,
+        check(rate <= 0.05 and made == 0 and stretched / frames <= 0.125,
               f"같은 손발 연달아 (일하는 펫 {work}, 시드 8개 x 300초): {rate:.1%} ({repeats}/{moves}), 한 번에 멀리 {far}번, "
               f"만든 홀드 {made}, 팔이 닿는 거리를 넘은 프레임 {stretched / frames:.2%}")
         check(speed >= before * keep,
