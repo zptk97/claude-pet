@@ -660,7 +660,7 @@ class Look:
                 continue   # 침낭 안
             a, b = ARM if limb.kind == "H" else LEG
             root = limb.root(body, tilt)
-            elbow, tip = two_bone(root, limb.pos, a, b, limb.side, limb.kind)
+            elbow, tip = two_bone(root, limb.pos, a, b, limb.side, limb.kind, limb.drop)
             if tremble and limb.mode == "grip":
                 elbow = elbow + V(math.sin(sim.t * 47 + i * 1.7), math.cos(sim.t * 53 + i)) * 0.035
             pts = [self.to_screen(q, cam) for q in (root, elbow, tip)]

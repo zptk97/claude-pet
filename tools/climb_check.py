@@ -164,9 +164,9 @@ def by_work():
               f"가장 많이 {max(recover_moves) if recover_moves else '-'}번")
 
     # 같은 손발을 연달아 옮기는 비율: 시드 8개 x 300초, 일하는 펫 1·3. 5% 이하, 빠르기는 자세 다듬기 (삼지점, 빠른 템포) 뒤
-    # 값 (분당 6.4·9.1m) 의 95% 넘게,
+    # 값 (분당 6.4·9.1m) 의 95% 넘게 (보통 빠르기는 몇 동작마다 둘러보며 쉬어서 85% 넘게),
     # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임 10% 이하 (내다보기 전에는 약 13%)
-    for work, before in ((1, 6.4), (3, 9.1)):
+    for work, before, keep in ((1, 6.4, 0.85), (3, 9.1, 0.95)):
         repeats = moves = far = made = frames = stretched = 0
         speeds = []
 
@@ -189,7 +189,8 @@ def by_work():
         check(rate <= 0.05 and made == 0 and stretched / frames <= 0.10,
               f"같은 손발 연달아 (일하는 펫 {work}, 시드 8개 x 300초): {rate:.1%} ({repeats}/{moves}), 한 번에 멀리 {far}번, "
               f"만든 홀드 {made}, 팔이 닿는 거리를 넘은 프레임 {stretched / frames:.2%}")
-        check(speed >= before * 0.95, f"오르는 빠르기 (일하는 펫 {work}): 분당 {speed:.1f}m (자세 다듬기 뒤 {before}m 의 95% 넘게)")
+        check(speed >= before * keep,
+              f"오르는 빠르기 (일하는 펫 {work}): 분당 {speed:.1f}m (자세 다듬기 뒤 {before}m 의 {keep:.0%} 넘게)")
 
     # 날씨: 일하는 펫 3 (8초) ↔ 0 (12초) 를 20번. 비와 눈이 둘 다 나오고, 한 번 내리는 동안은 안 바뀐다
     sim = climber(5)
