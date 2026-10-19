@@ -67,6 +67,7 @@ PACE_NAME = {1: "보통", 2: "빠름", 3: "전력 질주"}
 M_PER_TOKEN = 2 / 1000                        # 출력 토큰 1,000개 = 2m
 PACE_BANK = (8.0, 30.0)                       # 쌓인 높이 (m) 가 이만큼 넘으면 빠름, 전력 질주
 DYNO_MIX = {2: 0.06, 3: 0.18}                 # 빠름·전력 질주에서 손발 동작 대신 다이노를 할 비율
+NAP_AFTER = 180.0                             # 쉬는 자세 (기다림·쉼) 로 이만큼 (초) 있으면 포타레지를 펴고 낮잠을 잔다
 LEFTOVER_WAIT = 20.0                          # 1m 가 안 되게 남은 오를 높이는 토큰이 이만큼 (초) 안 들어오면 마저 오른다
 COOLDOWN = {"dyno": 8.0, "chalk": 15.0}      # 잦은 신호는 이 간격 (초) 안이면 버린다 (일 끝냄 → 다이노, 사용량 → 초크)
 SHAKE_EVERY = (40.0, 80.0)                    # 체력 60% 이하면 오르다가 이 간격으로 팔을 턴다
@@ -428,6 +429,8 @@ class Climber:
         self.work = 1               # 일하는 펫 수 (0 이면 쉰다)
         self.hp = self.hp_shown = 100
         self.sleeping = False
+        self.nap = False            # 자는 게 낮잠 (오래 쉬어서) 이다. 토큰이 모이면 깬다 (사용량 잠은 리셋이 와야 깬다)
+        self.idle_since = None      # 쉬는 자세로 있기 시작한 때 (오르면 지운다)
         self.ledge = None
         self.lids, self.blink_t, self.blink_age = 0.0, 2.0, None
         self.z_t = 0.0
@@ -513,6 +516,9 @@ class Climber:
             if self.t - self.signal_t.get(name, -1e9) < wait:
                 return False
             self.signal_t[name] = self.t
+        if self.sleeping and self.nap and name == "exhaust":   # 낮잠 중에 사용량을 다 썼다: 이제 리셋이 와야 깬다
+            self.nap = False
+            return True
         if self.sleeping and name not in AWAKE:
             return False
         self.request(name, *args)
@@ -553,7 +559,7 @@ class Climber:
     def state_label(self):
         """높이 상자에 보이는 지금 상태: 잠, 쉬는 자세면 기다림 (일하는 펫 있음)·쉼, 오르는 중이면 빠르기."""
         if self.sleeping:
-            return "잠"
+            return "낮잠" if self.nap else "잠"
         if self.resting:
             return "기다림" if self.work > 0 else "쉼"
         return PACE_NAME[max(1, self.pace)]
@@ -1131,7 +1137,7 @@ class Climber:
                 self.request("slip_hand" if self.hp <= 20 and (not wet or rng.random() < 0.5) else "slip_foot")
 
     def move_weather(self, dt):
-        target = WEATHER[max(0, min(3, self.work))] if not self.sleeping else 0.0
+        target = WEATHER[max(0, min(3, self.work))] if not self.sleeping or self.nap else 0.0   # 낮잠 중에는 날씨 그대로
         self.weather += (target - self.weather) * (1 - math.exp(-0.6 * dt))
         amount = self.precip()
         if amount > 0 and not self.precipitating:   # 비·눈이 새로 시작될 때마다 무작위 (내리는 동안은 그대로)
@@ -1228,6 +1234,9 @@ class Climber:
                 yield from getattr(self, name)(*args)
                 continue
             if self.sleeping:
+                if self.nap and self.climb_ready():   # 낮잠: 토큰이 모였으면 깨어나 다시 오른다
+                    yield from self.wake()
+                    continue
                 yield from self.wait(0.3)
                 continue
             if not self.has_climb():
@@ -1237,6 +1246,7 @@ class Climber:
             if bolt is not None:
                 yield from self.clip(bolt)
                 continue
+            self.idle_since = None
             sprint = DYNO_MIX.get(self.pace, 0.0) if self.tokens_on and self.hp > 30 else 0.0
             if sprint and self.rng.random() < sprint and self.dyno_jug(near=True) is not None:
                 yield from self.dyno(show=False)   # 많이 쌓였으면 다이노를 섞어 크게 오른다
@@ -1705,6 +1715,8 @@ class Climber:
         팔을 쭉 펴고 엉덩이를 낮춰 매달려 쉰다. 일하는 펫은 있는데 토큰을 기다리는 중이면 쉬는 동작을 짧게 자주 한다."""
         self.actions.append("rest")
         self.resting, start = True, self.t
+        if self.idle_since is None:
+            self.idle_since = self.t
         for foot in (self.limbs["LF"], self.limbs["RF"]):
             foot.drop = False
         ready = self.climb_ready
@@ -1728,11 +1740,15 @@ class Climber:
             last, first = None, True
             while not ready() and not self.requests and not self.sleeping:
                 waiting = self.work > 0   # 토큰을 기다리는 중: 초크·털기·두리번을 짧게 자주
-                yield from self.wait(self.rng.uniform(1.5, 2.5) if first else self.rng.uniform(*((1.0, 2.0) if waiting else (2.5, 5.0))),
-                                     until=ready)
-                first = False
-                if ready() or self.requests:
+                left = NAP_AFTER - (self.t - self.idle_since)
+                if left <= 0:   # 오래 쉬었다: 포타레지를 펴고 낮잠
+                    yield from self.exhaust(nap=True)
                     break
+                pause = self.rng.uniform(1.5, 2.5) if first else self.rng.uniform(*((1.0, 2.0) if waiting else (2.5, 5.0)))
+                yield from self.wait(min(pause, left), until=ready)
+                first = False
+                if ready() or self.requests or self.t - self.idle_since >= NAP_AFTER:
+                    continue
                 pick = self.rng.choice([a for a in (("shake", "chalk", "look") if waiting else ("shake", "chalk", "look", "blow"))
                                         if a != last])
                 last = pick
@@ -1745,6 +1761,8 @@ class Climber:
                     yield from self.look_around()
                 else:
                     yield from self.blow()
+            if self.sleeping:   # 낮잠에 들었다
+                return
             yield from self.tween(self, "crouch", self.crouch, 0.0, 0.5)
             if ready() and not self.requests and (not self.tokens_on or self.t - start > 8):
                 yield from self.shake()   # 오래 쉬었으면 한 번 털고 다시 오른다
@@ -1870,11 +1888,13 @@ class Climber:
         self.mode = "spring"
         yield from self.wait(0.3, stoppable=False)
 
-    def exhaust(self):
-        """사용량을 다 쓰면 포타레지를 꺼내 걸고 펴서, 그 위 침낭에 들어가 리셋까지 잔다."""
-        if self.sleeping or self.ledge is not None or self.hp > 0:
+    def exhaust(self, nap=False):
+        """사용량을 다 쓰면 포타레지를 꺼내 걸고 펴서, 그 위 침낭에 들어가 리셋까지 잔다.
+        nap 이면 오래 쉬어서 자는 낮잠이다 (토큰이 모이면 깬다)."""
+        if self.sleeping or self.ledge is not None or (self.hp > 0 and not nap):
             return   # 이미 자고 있거나 펴는 중이거나 (같은 신호가 두 번 왔다), 그사이 체력이 돌아왔다
-        self.actions.append("exhaust")
+        self.nap = nap
+        self.actions.append("nap" if nap else "exhaust")
         side = 1 if self.body.x < 0 else -1   # 넓은 쪽에 편다
         ax = max(-WALL_HALF + 1.2, min(WALL_HALF - 1.2, self.body.x + side * 0.9))
         ledge = self.ledge = Ledge(V(ax, self.body.y + 1.9))
@@ -1900,8 +1920,8 @@ class Climber:
         self.requests = [r for r in self.requests if r[0] in AWAKE]   # 자기 전에 받아 둔 동작은 버린다
         self.z_t = 0.6
         yield from self.tween(self, "lids", self.lids, 1.0, 0.8)
-        if self.hp > 0:   # 펴는 동안 체력이 돌아왔다 (그사이 창이 숨어 깨우는 신호를 못 받았을 수도 있다)
-            yield from self.wake()
+        if (self.hp > 0 and not self.nap) or (self.nap and self.climb_ready()):
+            yield from self.wake()   # 펴는 동안 체력이 돌아왔거나 (그사이 창이 숨어 깨우는 신호를 못 받았을 수도 있다), 토큰이 모였다
 
     def wake(self):
         """사용량이 돌아오면 깨어나 기지개를 켜고, 벽으로 돌아가 포타레지를 접어 넣고, 초크를 바르고 다시 오른다."""
@@ -1925,6 +1945,7 @@ class Climber:
         ledge.hung, ledge.stow = False, 0.0
         yield from self.tween(ledge, "stow", 0.0, 1.0, 0.45)
         self.ledge = None
+        self.nap, self.idle_since = False, None   # 깨면 쉬기를 처음부터 센다
         yield from self.chalk()
 
     def refill(self, gain=0):

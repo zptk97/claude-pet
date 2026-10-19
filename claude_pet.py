@@ -1828,7 +1828,7 @@ class PetManager(QObject):
         if not was_on:  # 숨어 있던 동안 바뀐 체력에 맞춰 자거나 깨기만 한다 (그동안의 다른 신호는 보내지 않는다)
             if hp == 0 and not climber.sleeping:
                 climber.signal("exhaust")
-            elif hp > 0 and (climber.sleeping or climber.ledge is not None):   # 포타레지를 펴다가 숨었어도 깨운다
+            elif hp > 0 and not climber.nap and (climber.sleeping or climber.ledge is not None):   # 포타레지를 펴다가 숨었어도 깨운다 (낮잠은 두고)
                 climber.signal("wake")
         else:
             for name, *args in climbcore.hp_signals(prev, hp):

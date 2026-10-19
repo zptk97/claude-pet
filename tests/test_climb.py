@@ -295,6 +295,68 @@ class ClimberTest(unittest.TestCase):
         self.assertLessEqual(repeats / moves, 0.06)
         self.assertGreater(far, 0)   # 같은 손발을 또 옮기지 않으려고 한 번에 멀리 간 적이 있다
 
+    def test_nap_after_three_minutes_of_rest(self):
+        sim = Climber(7)
+        sim.work = 1
+        run(sim, climbcore.NAP_AFTER - 2)
+        self.assertFalse(sim.sleeping)
+        self.assertNotIn("nap", sim.actions)
+        start = None
+        t = climbcore.NAP_AFTER - 2
+        while t < climbcore.NAP_AFTER + 12:
+            sim.update(DT)
+            t += DT
+            if start is None and "nap" in sim.actions:
+                start = t
+        self.assertIsNotNone(start)
+        self.assertLessEqual(start, climbcore.NAP_AFTER + 5)
+        self.assertTrue(sim.sleeping and sim.nap)
+        self.assertEqual(sim.state_label(), "낮잠")
+
+    def test_tokens_before_three_minutes_keep_it_awake(self):
+        sim = Climber(7)
+        sim.work = 1
+        run(sim, 150)
+        sim.deposit(600)
+        run(sim, 80)
+        self.assertNotIn("nap", sim.actions)
+
+    def test_nap_wakes_on_tokens_and_naps_again(self):
+        sim = Climber(7)
+        sim.work = 1
+        run(sim, climbcore.NAP_AFTER + 10)
+        self.assertTrue(sim.nap)
+        moves = len(sim.moves)
+        sim.deposit(600)
+        run(sim, 10)
+        self.assertFalse(sim.sleeping)
+        self.assertGreater(len(sim.moves), moves)   # 깨어나 다시 오른다
+        run(sim, climbcore.NAP_AFTER + 60)          # 다 오르고 다시 쉬기 시작한 뒤 3분
+        self.assertTrue(sim.sleeping and sim.nap)
+        self.assertEqual(sim.actions.count("nap"), 2)
+
+    def test_nap_turns_into_exhaustion_at_zero(self):
+        sim = Climber(7)
+        sim.work = 1
+        run(sim, climbcore.NAP_AFTER + 10)
+        sim.hp = 0
+        sim.signal("exhaust")
+        self.assertFalse(sim.nap)
+        sim.deposit(5000)
+        run(sim, 20)
+        self.assertTrue(sim.sleeping)   # 토큰으로는 깨지 않는다
+        sim.hp = 100
+        sim.signal("wake")
+        run(sim, 10)
+        self.assertFalse(sim.sleeping)
+
+    def test_weather_stays_during_nap(self):
+        sim = Climber(7)
+        sim.work = 2
+        run(sim, climbcore.NAP_AFTER + 30)
+        self.assertTrue(sim.nap)
+        self.assertGreater(sim.weather, 0.6)
+
     def test_sprint_never_makes_holds(self):
         for seed in range(4):
             sim = Climber(seed)
