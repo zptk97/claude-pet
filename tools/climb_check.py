@@ -4,7 +4,7 @@
     python3 tools/climb_check.py
 
 일하는 펫 수로 오르는 검사 (홀드를 미리 깔아 둠, 쉬기, 다 씀·회복, 좌우 퍼짐, 제자리 구간, 날씨, 높이 기록,
-로프 추락, 저절로 생기는 이벤트) 와 토큰으로 오르는 검사 (넣은 만큼 오름, 빠르기, 기다리기·쉬기, 실제 기록 읽기 비용).
+로프 추락, 저절로 생기는 이벤트, 크럭스) 와 토큰으로 오르는 검사 (넣은 만큼 오름, 빠르기, 기다리기·쉬기, 실제 기록 읽기 비용).
 """
 import collections
 import statistics
@@ -278,6 +278,25 @@ def by_work():
     check(on.get("slip_foot", 0) >= 1 and on.get("slip_hand", 0) >= 1 and on.get("rocks_seen", 0) >= 1
           and on.get("missing", 0) == 0, f"저절로 생긴 이벤트 (켬, 600초): {on}")
     check(sum(v for k, v in off.items() if k != "missing") == 0, f"이벤트 끔 (600초): {off}")
+
+    # 크럭스: 시드 8개 x 600초, 일하는 펫 1·3 과 토큰 전력 질주. 지나간 크럭스는 모두 끝 홀드를 잡아 넘고 (돌아가는 길 없이),
+    # 크럭스 아래 끝에 닿은 뒤 뛰기까지 손발 동작 10번 이하 (실행마다 6~9번), 만든 홀드 0
+    passed = skipped = made = longest = retried = 0
+    for setup in (1, 3, "sprint"):
+        for seed in range(1, 9):
+            sim = climber(seed, tokens=setup == "sprint")
+            if setup != "sprint":
+                sim.work = setup
+            run(sim, 600, feed=(lambda s, t: setattr(s, "bank", max(s.bank, 60.0))) if setup == "sprint" else None)
+            grabbed = {id(g[2]) for g in sim.grabs}
+            passed += len(sim.crux_log)
+            retried += sum(1 for tries, _ in sim.crux_log if tries > 1)
+            longest = max([longest] + [moves for _, moves in sim.crux_log])
+            skipped += sum(1 for jug in sim.route.jugs if jug.p.y < sim.top_y - 1 and id(jug) not in grabbed)
+            made += sim.missing
+    check(passed >= 30 and skipped == 0 and longest <= 10 and made == 0,
+          f"크럭스 (일하는 펫 1·3·전력 질주, 시드 8개 x 600초): {passed}번 넘음 (미끄러져 다시 {retried}), "
+          f"끝 홀드 안 잡고 지나침 {skipped}, 아래 끝에서 뛰기까지 동작 가장 많이 {longest}번, 만든 홀드 {made}")
 
 
 def by_tokens():

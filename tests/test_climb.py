@@ -463,6 +463,115 @@ class NightTest(unittest.TestCase):
         self.assertEqual(ends[0], ends[1])
 
 
+class CruxTest(unittest.TestCase):
+    """크럭스: 홀드를 비운 구간 끝의 몸 반대쪽 큰 홀드를 다이노로 잡아 넘는다."""
+
+    def climb_to_crux(self, seed=3, events=True):
+        sim = Climber(seed)
+        sim.tokens_on, sim.work, sim.events = False, 3, events
+        sim.route.next_crux = 15.0   # 첫 크럭스를 가까이 (아직 깔지 않은 높이)
+        for _ in range(600):
+            run(sim, 0.5)
+            if sim.crux_log:
+                break
+        return sim
+
+    def test_route_leaves_a_gap_and_puts_the_jug_on_the_far_side(self):
+        sim = Climber(3)
+        sim.route.next_crux = 15.0
+        sim.route.fill(sim, 30.0)
+        jug = sim.route.jugs[0]
+        start = jug.crux_from
+        self.assertTrue(1.5 <= jug.p.y - start <= 2.5 and jug.big)
+        gap = [h for h in sim.holds if start <= h.p.y < jug.p.y - 0.01 and not h.foot]
+        self.assertEqual(gap, [])   # 크럭스 구간에는 손으로 잡을 홀드가 없다
+        below = [h for h in sim.holds if start - 1.5 < h.p.y < start and not h.foot]
+        self.assertTrue(below)
+        self.assertTrue(all(h.p.x * jug.p.x < 0 or abs(h.p.x) < 0.3 for h in below))   # 바로 아래 홀드는 반대쪽
+        self.assertGreater(abs(jug.p.x), 1.5)
+        chips = [h for h in sim.holds if h.foot]   # 발 턱: 끝 홀드 쪽, 둘은 끝 홀드 아래 (잡은 뒤 딛기), 하나는 구간 안
+        self.assertEqual(len(chips), 3)
+        self.assertTrue(all(h.p.x * jug.p.x > 0 for h in chips))
+        self.assertEqual(sum(1 for h in chips if h.p.y < jug.p.y - 2), 2)
+        self.assertEqual(sum(1 for h in chips if start < h.p.y < jug.p.y), 1)
+        gap_bolts = [b for b in sim.bolts if start - 1.0 < b.p.y < jug.p.y]
+        self.assertEqual(gap_bolts, [])   # 구간 안에는 볼트가 없고
+        base = [b for b in sim.bolts if start - 4.5 < b.p.y <= start - 3.0]
+        self.assertTrue(base and all(b.p.x * jug.p.x < 0 for b in base))   # 뛰기 전에 걸 볼트는 시작 쪽에
+
+    def test_waits_for_tokens_before_the_crux(self):
+        sim = Climber(3)
+        sim.route.next_crux = 15.0
+        for _ in range(600):   # 1m 씩 조금씩 넣으면 크럭스 아래 끝에서 끝 홀드까지 모자라 기다린다
+            if sim.wait_for or sim.crux_log:
+                break
+            if sim.bank < 0.3:
+                sim.deposit(500)
+            run(sim, 1.0)
+        self.assertEqual(sim.crux_log, [])
+        self.assertTrue(sim.parked and sim.wait_for > 0)
+        self.assertFalse(sim.climb_ready())
+        sim.deposit(500)   # 1m 더 와도 모자라면 계속 기다린다
+        run(sim, 25.0)
+        self.assertEqual(sim.crux_log, [])
+        sim.deposit(3000)
+        run(sim, 30.0)
+        self.assertEqual(len(sim.crux_log), 1)
+        self.assertGreater(sim.bank, -1.0)   # 넣은 것보다 크게 더 오르지 않는다
+
+    def test_climber_dynos_across_and_never_grabs_foot_chips(self):
+        sim = self.climb_to_crux()
+        self.assertEqual(len(sim.crux_log), 1)
+        jug = sim.route.jugs[0]
+        self.assertTrue(any(g[2] is jug for g in sim.grabs))
+        self.assertIn("crux_dyno", sim.actions)
+        self.assertFalse(any(g[2].foot and g[1] in ("LH", "RH") for g in sim.grabs))
+        self.assertEqual(sim.missing, 0)
+        run(sim, 45.0)   # 넘은 뒤에도 계속 오른다
+        self.assertGreater(sim.top_y, jug.p.y + 3.0)
+
+    def test_no_limb_jumps_during_crux(self):
+        """놓치고 다시 뛰는 동안 몸과 그려지는 발끝이 한 프레임에 크게 튀지 않는다 (60fps)."""
+        saved = climbcore.CRUX_MISS
+        climbcore.CRUX_MISS = 1.0
+        try:
+            for seed in (3, 4, 5, 7):
+                sim = Climber(seed)
+                sim.tokens_on, sim.work = False, 3
+                sim.route.next_crux = 15.0
+                last, worst = None, {"body": 0.0, "feet": 0.0}
+                for _ in range(60 * 240):
+                    sim.update(1 / 60)
+                    inside = sim.actions and sim.actions[-1] in ("crux", "crux_miss", "crux_dyno")
+                    tips = [climbcore.two_bone(f.root(sim.body, sim.tilt), f.pos, *climbcore.LEG, f.side, "F", f.drop)[1]
+                            for f in (sim.limbs["LF"], sim.limbs["RF"])]
+                    now = (sim.body, tips)
+                    if inside and last is not None:
+                        worst["body"] = max(worst["body"], (now[0] - last[0]).len())
+                        worst["feet"] = max([worst["feet"]] + [(a - b).len() for a, b in zip(now[1], last[1])])
+                    last = now
+                    if sim.crux_log and sim.actions[-1] not in ("crux", "crux_miss", "crux_dyno"):
+                        break
+                self.assertEqual(sim.crux_log[0][0], 2, seed)
+                self.assertLess(worst["body"], 0.6, seed)   # 다이노는 빠르지만 이어진다 (전력 질주 다이노도 0.48m)
+                self.assertLess(worst["feet"], 0.7, seed)
+        finally:
+            climbcore.CRUX_MISS = saved
+
+    def test_miss_then_retry_only_with_events(self):
+        saved = climbcore.CRUX_MISS
+        climbcore.CRUX_MISS = 1.0
+        try:
+            sim = self.climb_to_crux()
+            self.assertEqual(sim.crux_log[0][0], 2)
+            self.assertIn("crux_miss", sim.actions)
+            sim = self.climb_to_crux(events=False)
+            self.assertEqual(sim.crux_log[0][0], 1)
+            self.assertNotIn("crux_miss", sim.actions)
+        finally:
+            climbcore.CRUX_MISS = saved
+
+
 class StateFileTest(unittest.TestCase):
 
     def test_save_and_load(self):

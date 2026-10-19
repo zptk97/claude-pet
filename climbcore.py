@@ -83,6 +83,9 @@ FOOT_SPAN = 3.6                               # 편한 자세에서 아래쪽 �
 FOOT_HIGH = 2.6                               # 가끔 발을 높이 올릴 때
 FOOT_CEIL = 0.55                              # 발은 매달린 엉덩이보다 적어도 이만큼 아래에 둔다
 FOOT_WIDTH = 0.35                             # 발을 몸 가운데에서 옆으로 두는 거리 (엉덩이 너비 가까이)
+CRUX_EVERY = (40.0, 80.0)     # 크럭스 간격 (m)
+CRUX_GAP = (1.5, 2.5)         # 크럭스: 이 높이만큼 홀드를 비우고 끝에 큰 홀드를 몸 반대쪽 끝에 둔다 (다이노로 넘는다)
+CRUX_MISS = 0.2               # 크럭스에서 손이 미끄러져 다시 뛸 확률 (추락 이벤트를 켰을 때)
 BREAK_CHANCE = 1 / 1000                       # 오르며 손으로 새 홀드를 잡을 때 그 홀드가 부서질 확률
 DROP_KNEE = 0.75                               # 옆으로 멀리 뻗는데 같은 쪽 발이 높으면 드롭니를 할 비율
 SWAY = 0.35                                   # 손을 떼면 몸이 남은 손 쪽으로 기우는 정도 (플래그 중이면 0.35 배)
@@ -187,6 +190,9 @@ def two_bone(root, end, a, b, side, kind, flip=False):
 class Hold:
     def __init__(self, p, r, rng, big=False):
         self.p, self.r, self.big = p, r, big
+        self.crux = False           # 크럭스 끝 홀드 (crux_from: 크럭스 아래 끝 높이)
+        self.crux_from = 0.0
+        self.foot = False           # 발만 딛는 작은 턱 (손으로 잡지 않는다)
         self.chalk = 0.0
         self.snow = 0.0
         self.made_t = self.made_cam = 0.0
@@ -209,12 +215,17 @@ class Route:
     가끔 짧은 높이 안에서 반대편으로 길게 옆으로 간다 (트래버스)."""
     BAND = 0.5
 
-    def __init__(self, rng):
+    def __init__(self, rng, xrng=None):
         self.rng = rng
+        self.xrng = xrng or random.Random(0)   # 크럭스 (홀드 깔기와 따로)
         self.top = -5.0
         self.a = (self.top, 0.0)            # 지금 구간의 시작 (높이, x)
         self.b = (self.top + 3.0, 0.0)      # 지금 구간의 끝
         self.centers = [(self.top, 0.0)]
+        self.next_crux = 0.0 + self.xrng.uniform(*CRUX_EVERY)   # 다음 크럭스 시작 높이
+        self.crux = None            # 깔고 있는 크럭스 (시작 높이, 끝 높이, 끝 홀드 쪽 -1/1)
+        self.crux_bolted = False    # 그 크럭스 아래 볼트를 두었다
+        self.jugs = []              # 깐 크럭스 끝 홀드 (검사용)
         self.next_bolt = -1.5       # 다음 볼트 높이 (약 3m 마다)
 
     def center(self, y):
@@ -245,6 +256,34 @@ class Route:
         while self.top < upto:
             y0 = self.top
             self.top += self.BAND
+            if self.crux is None and self.top + 4.0 >= self.next_crux:   # 크럭스 4m 앞: 길을 끝 홀드 반대쪽으로 모은다
+                cx = self.centers[-1][1]
+                side = (1 if cx < 0 else -1) if abs(cx) > 0.3 else self.xrng.choice((-1, 1))
+                start = y0 + self.BAND * math.ceil((max(self.next_crux, y0 + 3.0) - y0) / self.BAND)   # 홀드 띠 경계에서 비운다
+                end = start + self.xrng.uniform(*CRUX_GAP)
+                self.crux, self.crux_bolted = (start, end, side), False
+                self.a, self.b = (y0, cx), (start, -side * 1.3)
+                for x, y in ((1.55, end - 2.5), (1.0, end - 3.1), (0.5, (start + end) / 2)):   # 발만 딛는 작은 턱:
+                    chip = sim.place_hold(V(side * x, y))   # 끝 홀드를 잡은 뒤 디딜 곳 둘, 구간을 건너 오를 때 딛을 곳 하나
+                    if chip is not None:
+                        chip.foot, chip.r = True, 0.16
+                self.bolt_crux(sim)
+            if self.crux is not None and y0 >= self.crux[0]:
+                start, end, side = self.crux
+                if y0 < end:   # 크럭스 구간은 비운다 (길 가운데는 끝 홀드 쪽으로 옮겨 간다)
+                    self.centers.append((self.top, -side * 1.3 + side * 2.9 * smooth(min(1.0, (self.top - start) / (end - start)))))
+                    continue
+                jug = sim.place_hold(V(side * (WALL_HALF - 0.55), end), big=True)
+                if jug is None:
+                    jug = Hold(V(side * (WALL_HALF - 0.55), end), 0.34, rng, True)
+                    sim.holds.append(jug)
+                jug.crux, jug.crux_from = True, start
+                jug.r, jug.chalk = 0.38, 0.5   # 크고, 초크 자국이 묻은 홀드 (크럭스 끝이라는 걸 알아보게)
+                self.jugs.append(jug)
+                self.crux = None
+                self.next_crux = end + self.xrng.uniform(*CRUX_EVERY)
+                self.b = (end, side * 0.9)   # 끝 홀드 쪽에서 길을 잇는다 (벽 끝 구석에 몰리지 않게 조금 안쪽)
+                self.a, self.b = self.b, self.next_point()
             while self.top > self.b[0]:
                 self.a, self.b = self.b, self.next_point()
             (ya, xa), (yb, xb) = self.a, self.b
@@ -253,10 +292,24 @@ class Route:
             for _ in range(rng.choice((2, 3, 3))):
                 sim.place_hold(V(cx + rng.uniform(-1.15, 1.15), y0 + rng.uniform(0, self.BAND)), big=rng.random() < 0.08)
             if rng.random() < 0.2:   # 길 밖의 바위 턱
-                sim.place_hold(V(rng.uniform(-WALL_HALF + 0.3, WALL_HALF - 0.3), y0 + rng.uniform(0, self.BAND)))
+                x = rng.uniform(-WALL_HALF + 0.3, WALL_HALF - 0.3)
+                if self.crux is not None:   # 크럭스로 다가가는 동안은 시작 쪽에만 (끝 홀드 쪽으로 건너가는 길이 없게)
+                    x = -self.crux[2] * abs(x)
+                sim.place_hold(V(x, y0 + rng.uniform(0, self.BAND)))
             if self.top >= self.next_bolt:   # 볼트는 길 가운데 근처에 약 3m 마다
                 sim.bolts.append(Bolt(V(cx + sim.wrng.uniform(-0.4, 0.4), self.next_bolt)))
                 self.next_bolt += sim.wrng.uniform(2.6, 3.4)
+                self.bolt_crux(sim)
+
+    def bolt_crux(self, sim):
+        """다음 볼트가 크럭스 근처에 걸리면 크럭스 아래 (시작 쪽, 뛰기 전에 로프를 걸 높이) 에 두고, 크럭스 구간은
+        건너뛰어 끝 홀드 위에 다음 볼트를 둔다 (구간 안이나 먼 끝 홀드 쪽 볼트는 손이 안 닿아 건너뛰게 된다)."""
+        if self.crux is None or self.crux_bolted or self.next_bolt < self.crux[0] - 5.2:
+            return
+        start, end, side = self.crux
+        sim.bolts.append(Bolt(V(-side * 1.1 + sim.wrng.uniform(-0.2, 0.2), start - 3.8)))   # 뛸 때 하네스 높이쯤
+        self.next_bolt = end + sim.wrng.uniform(0.8, 1.4)
+        self.crux_bolted = True
 
 
 class Limb:
@@ -523,10 +576,13 @@ class Climber:
         self.free_log = []          # 뗀 발로 한 다음 동작: up (올라가 딛기), match (합발), keep (그대로 두고 손), return (검사용)
         self.switch_foot = None     # 합발 뒤 위로 옮길 발
         self.parked = False         # 남은 높이로 닿는 홀드가 없어 다음 토큰을 기다리는 중
+        self.wait_for = 0.0         # 크럭스 앞에서 기다릴 때 모여야 할 높이
+        self.crux_log = []          # 넘은 크럭스마다 (시도 횟수, 크럭스 아래 끝에 닿은 뒤 뛰기까지 손발 동작 수) (검사용)
+        self.moves_since_crux = 0   # 크럭스 아래 끝에 닿은 뒤 한 손발 동작 수
         self.stall = 0              # 제자리 (손발 높이 합이 안 오름) 로 이어진 손발 동작 수
         self.best_top = -1e9        # 손발 높이 합의 최고 기록
         self.moves, self.grabs, self.actions = [], [], []
-        self.route = Route(self.rng)
+        self.route = Route(self.rng, random.Random(seed + 3))
         self.route.fill(self, self.cam + FILL_AHEAD)
         self.body = V(self.route.center(0.0), 0.0)
         self.limbs = {name: Limb(name) for name in LIMBS}
@@ -579,7 +635,8 @@ class Climber:
         """출력 토큰을 받아 오를 높이로 쌓는다."""
         self.tokens += tokens
         self.bank += tokens * M_PER_TOKEN
-        self.parked = False
+        if self.room() >= self.wait_for:   # 크럭스 앞에서 기다리면 끝 홀드까지 오를 만큼 모여야 다시 오른다
+            self.parked, self.wait_for = False, 0.0
         self.token_buf += tokens
         self.deposit_t = self.t
 
@@ -599,6 +656,8 @@ class Climber:
         """쉬다가 다시 오를지. 토큰은 1m 넘게 모였거나 (조금씩 들어올 때 한 동작만 하고 또 쉬지 않게 모아서 오른다),
         1m 가 안 되게 남았는데 토큰이 LEFTOVER_WAIT 초 동안 더 안 들어왔으면 남은 것을 마저 오른다."""
         if self.tokens_on:
+            if self.parked and self.wait_for:
+                return self.room() >= self.wait_for or self.body.y < self.top_y - 1.5
             return (self.bank >= 0.99 or (self.bank > 0.05 and not self.parked and self.t - self.deposit_t >= LEFTOVER_WAIT)
                     or self.body.y < self.top_y - 1.5)
         return self.work > 0
@@ -751,7 +810,7 @@ class Climber:
         want = min(0.75, max(0.3, self.room()))   # 남은 높이가 적으면 마지막 한 수도 그만큼만
         out = []
         for h in self.holds:
-            if h is limb.hold or (h is other.hold and h.r < 0.3):
+            if h is limb.hold or (h is other.hold and h.r < 0.3) or h.foot:
                 continue
             gain = h.p.y - my_y
             if gain < (0.12 if up_only else 0.12 - 0.17 * relax) or h.p.y > other_y + 1.25 + 0.4 * relax:
@@ -927,7 +986,7 @@ class Climber:
         for limb in limbs:
             root = limb.root(self.body, self.tilt)
             for h in self.holds:
-                if h is limb.hold or h is self.other(limb).hold or h.p.y <= self.held_y(limb) + 0.2:
+                if h is limb.hold or h is self.other(limb).hold or h.p.y <= self.held_y(limb) + 0.2 or (h.foot and limb.kind == "H"):
                     continue
                 d = (h.p - root).len()
                 if d < (2.6 if limb.kind == "H" else 2.2) and (best is None or d < best[0]):
@@ -941,6 +1000,7 @@ class Climber:
         limit = limb.reach * (0.97 if limb.kind == "H" else 0.92)
         return [(-(h.p - ideal).len(), id(h), h) for h in self.holds
                 if h is not limb.hold and h not in limb.recent and (h is not other.hold or (limb.kind == "H" and h.r >= 0.3))
+                and not (h.foot and limb.kind == "H")
                 and h.p.y > self.held_y(limb) + 0.2 and (h.grip(limb.kind) - root).len() < limit
                 and limb.side * (h.p.x - self.body.x) > -side_tol]
 
@@ -1304,6 +1364,14 @@ class Climber:
                 yield from self.clip(bolt)
                 continue
             self.idle_since = None
+            jug = self.crux_ready()
+            if jug is not None:
+                need = jug.p.y - max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
+                if self.room() < need:   # 쌓인 높이가 끝 홀드까지 안 되면 크럭스 앞에서 토큰을 기다린다
+                    self.parked, self.wait_for = True, need
+                    continue
+                yield from self.crux(jug)
+                continue
             sprint = DYNO_MIX.get(self.pace, 0.0) if self.tokens_on and self.hp > 30 else 0.0
             if sprint and self.rng.random() < sprint and self.dyno_jug(near=True) is not None:
                 yield from self.dyno(show=False)   # 많이 쌓였으면 다이노를 섞어 크게 오른다
@@ -1450,6 +1518,11 @@ class Climber:
             return
         limb, hold = move
         self.moves.append(limb.name)
+        top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
+        if any(h.crux and h.crux_from - 0.8 < top < h.p.y for h in self.holds):
+            self.moves_since_crux += 1   # 크럭스 아래 끝에서 맴돈다
+        else:
+            self.moves_since_crux = 0
         self.move_start = self.body.x   # 이 동작을 시작할 때 몸 x (검사용)
         self.k_now = PACE_DUR[max(1, self.pace)]
         k = self.k_now * (1.4 if self.hp <= 30 else 1.0)
@@ -1756,7 +1829,7 @@ class Climber:
             new = max(options)[2]
         else:
             root = limb.root(self.body, self.tilt)
-            new = min((h for h in self.holds if h is not self.other(limb).hold), key=lambda h: (h.p - root).len())
+            new = min((h for h in self.holds if h is not self.other(limb).hold and not h.foot), key=lambda h: (h.p - root).len())
         yield from self.move_limb(limb.name, new, 0.35, arc=0.1)
 
     def fall(self):
@@ -1788,8 +1861,8 @@ class Climber:
             for l in self.limbs.values():   # 몸 근처 홀드에 다시 붙는다
                 ideal = self.body + V(l.side * 0.7, HAND_UP - 0.2 if l.kind == "H" else -FOOT_DOWN + 0.3)
                 root = l.root(self.body, self.tilt)
-                near = [h for h in self.holds if id(h) not in taken and (h.p - root).len() < l.reach * 0.95] or \
-                       [h for h in self.holds if id(h) not in taken]
+                free = [h for h in self.holds if id(h) not in taken and not (h.foot and l.kind == "H")]   # 손은 발 턱을 잡지 않는다
+                near = [h for h in free if (h.p - root).len() < l.reach * 0.95] or free
                 hold = min(near, key=lambda h: (h.p - ideal).len())
                 taken.add(id(hold))
                 goals[l.name] = hold
@@ -1915,20 +1988,27 @@ class Climber:
     def dyno_jug(self, near=False):
         """다이노로 잡을 홀드 (손보다 1.5~2.5m 위, 몸 가까이). near 가 아니면 조금 더 넓게 찾는다."""
         top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
-        options = [h for h in self.holds if top + 1.5 < h.p.y < top + 2.5 and abs(h.p.x - self.body.x) < 1.4]
+        limit = 1e9
+        crux = next((h for h in self.holds if h.crux and h.p.y > top), None)
+        if crux is not None:   # 크럭스 너머로는 건너뛰지 않는다 (끝 홀드는 crux 가 뛴다. 세션 다이노는 닿으면 끝 홀드로)
+            if not near and 1.0 < crux.p.y - top < 3.8:
+                return crux
+            limit = crux.crux_from
+        options = [h for h in self.holds if top + 1.5 < h.p.y < min(top + 2.5, limit) and abs(h.p.x - self.body.x) < 1.4
+                   and not h.foot]
         if not options and not near:
-            options = [h for h in self.holds if top + 1.2 < h.p.y < top + 2.8]
+            options = [h for h in self.holds if top + 1.2 < h.p.y < min(top + 2.8, limit) and not h.foot]
         return max(options, key=lambda h: h.r + self.rng.uniform(0, 0.1)) if options else None
 
-    def dyno(self, show=True):
-        """다이노: 웅크렸다가 튀어 올라 멀리 있는 홀드를 두 손으로 잡고, 매달려 흔들리다 발을 올린다.
-        show 면 오른 높이를 글자로 띄운다 (세션이 일을 끝낼 때)."""
-        self.actions.append("dyno" if show else "dyno_sprint")
+    def dyno(self, show=True, jug=None, label=None):
+        """다이노: 웅크렸다가 튀어 올라 멀리 있는 홀드 (jug, 없으면 dyno_jug) 를 두 손으로 잡고, 매달려 흔들리다
+        발을 올린다. show 면 오른 높이를 글자로 띄운다 (세션이 일을 끝낼 때)."""
+        self.actions.append(label or ("dyno" if show else "dyno_sprint"))
         self.charging = not show    # 일 끝냄 다이노는 덤 (brain 이 다음 동작 전에 되돌린다)
         hands = [self.limbs["LH"], self.limbs["RH"]]
         feet = [self.limbs["LF"], self.limbs["RF"]]
         top = max(self.held_y(l) for l in hands)
-        jug = self.dyno_jug()
+        jug = jug or self.dyno_jug()
         if jug is None:
             self.missing += 1
             jug = self.place_hold(V(self.route.center(top + 2), top + 2), big=True)
@@ -1959,7 +2039,7 @@ class Climber:
             if k > 0.25:
                 for f in feet:
                     if f.mode == "grip":
-                        f.mode, f.vel = "free", self.vel * 0.5
+                        self.let_go(f)
         # 잡기
         for l in hands:
             self.grab(l, jug)
@@ -1973,14 +2053,133 @@ class Climber:
             self.texts.append(Float(jug.p + V(0, 0.6), f"+{max(1, round(jug.p.y - top))}m"))
         yield from self.wait(1.0, stoppable=False)
         for f in sorted(feet, key=lambda f: f.side * swing):
+            below = [h for h in self.holds if h.p.y < jug.p.y - 1.9 and h is not self.other(f).hold]
+            chips = [h for h in below if h.foot and h.p.x * jug.p.x > 0] if jug.crux else []   # 크럭스: 끝 홀드 쪽 턱부터
             options = self.foot_options(f)
-            if options:
+            if chips:
+                hold = min(chips, key=lambda h: (h.grip("F") - f.root(self.body, self.tilt)).len())
+            elif options:
                 hold = max(options)[2]
+            elif below:
+                hold = min(below, key=lambda h: (h.grip("F") - f.root(self.body, self.tilt)).len())
             else:
-                hold = min((h for h in self.holds if h.p.y < jug.p.y - 1.9 and h is not self.other(f).hold),
-                           key=lambda h: (h.grip("F") - f.root(self.body, self.tilt)).len())
+                continue   # 디딜 데가 없으면 (긴 추락 뒤 아래 홀드가 없어졌다) 발은 매달린 채로, 다음 동작이 고른다
             yield from self.move_limb(f.name, hold, 0.32, arc=0.12)
         self.mode = "spring"
+        yield from self.wait(0.3, stoppable=False)
+
+    def let_go(self, foot):
+        """뛰어오르며 발을 홀드에서 뗀다: 다리가 닿는 데까지 당겨 놓고 몸 따라 흔들리게 한다 (몸이 이미 멀어져
+        늘어난 발을 그대로 놓으면 한 프레임에 크게 끌려가 그 빠르기로 엉덩이 위까지 튄다)."""
+        root = foot.root(self.body, self.tilt)
+        d = foot.pos - root
+        dist, hi = d.len() or 1e-6, foot.reach * 0.96
+        if dist > hi:
+            foot.pos = root + d * (hi / dist)
+        foot.mode, foot.vel = "free", self.vel * 0.5
+
+    def crux_ready(self):
+        """크럭스 끝 홀드로 뛸 때면 그 홀드: 손보다 1~3.6m 위에 있고, 손이 더 오를 데가 없고 (제자리로 맴돌기 시작했으면
+        고쳐 잡기도 없다고 친다), 발도 더 올릴 데가 없다."""
+        top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
+        jug = next((h for h in self.holds if h.crux and 1.0 < h.p.y - top < 3.6), None)
+        if jug is None or any(l.hold is jug for l in self.limbs.values()):
+            return None
+        hands = (self.limbs["LH"], self.limbs["RH"])
+        if any(self.hand_options(l, 0) for l in hands) or (self.stall < 2 and any(self.hand_options(l, 1) for l in hands)):
+            return None
+        if self.stall < 3 and any(self.foot_options(f, 0) for f in (self.limbs["LF"], self.limbs["RF"]) if f.mode == "grip"):
+            return None
+        return jug
+
+    def crux(self, jug):
+        """크럭스: 멈칫하며 끝 홀드를 보고, 보통 빠르기면 초크도 바른 뒤 다이노로 몸 반대쪽 끝의 홀드를 잡는다.
+        추락 이벤트를 켰으면 CRUX_MISS 확률로 손끝이 미끄러져 제자리로 떨어졌다가 다시 뛴다. 넘으면 주먹을 쥔다."""
+        self.actions.append("crux")
+        pace = max(1, self.pace)
+        approach = self.moves_since_crux
+        self.look_at = jug.p
+        yield from self.wait(self.rng.uniform(0.8, 1.4) if pace == 1 else 0.4 if pace == 2 else 0.1, stoppable=False)
+        h = self.harness()
+        bolt = next((b for b in self.bolts if not b.clipped and not b.skipped and h.y - 1.5 < b.p.y < h.y + 1.6), None)
+        if self.events and bolt is not None:   # 뛰기 전에 로프를 건다 (뛰고 나면 너무 지나쳐 못 건다)
+            yield from self.clip(bolt)
+            self.look_at = jug.p
+        if pace == 1:
+            yield from self.chalk()
+            self.look_at = jug.p
+            yield from self.wait(0.4, stoppable=False)
+        tries = 1
+        if self.events and self.wrng.random() < CRUX_MISS:
+            yield from self.crux_miss(jug)
+            tries += 1
+            self.look_at = jug.p
+            yield from self.wait(0.9 if pace == 1 else 0.4, stoppable=False)
+        yield from self.dyno(show=False, jug=jug, label="crux_dyno")
+        self.crux_log.append((tries, approach))
+        self.texts.append(Float(jug.p + V(0, 0.8), "크럭스!"))
+        if pace <= 2:
+            yield from self.fist_pump("RH" if jug.p.x < 0 else "LH")   # 벽 안쪽 손으로
+        self.look_at = None
+
+    def crux_miss(self, jug):
+        """크럭스에서 놓침: 끝 홀드로 뛰어 손끝이 닿았다가 미끄러져 원래 잡던 홀드로 떨어진다."""
+        self.actions.append("crux_miss")
+        hands = [self.limbs["LH"], self.limbs["RH"]]
+        feet = [self.limbs["LF"], self.limbs["RF"]]
+        home = {n: (l.mode, l.hold, l.follow) for n, l in self.limbs.items()}
+        yield from self.tween(self, "crouch", self.crouch, 0.6, 0.42)
+        self.mode = "script"
+        start = self.body
+        swing = 1 if start.x < jug.p.x else -1
+        apex = jug.p + V(-swing * 0.45, -1.75)   # 조금 못 미친다
+        hand_from = [l.pos for l in hands]
+        touch = [jug.grip("H", l.side) + V(-swing * 0.12, -0.2) for l in hands]
+        for l in hands:
+            l.mode = "move"
+        self.squash_vel += 2.6
+        dur, t = 0.36, 0.0
+        while t < dur:
+            dt = yield
+            t += dt
+            k = min(1.0, t / dur)
+            old = self.body
+            self.body = start.lerp(apex, 1 - (1 - k) ** 2)
+            self.vel = (self.body - old) * (1 / dt)
+            for l, a, b in zip(hands, hand_from, touch):
+                l.pos = a.lerp(b, smooth(min(1.0, k * 1.25)))
+            if k > 0.25:
+                for f in feet:
+                    if f.mode == "grip":
+                        self.let_go(f)
+        self.puff(jug.p + V(0, 0.1), n=6, speed=1.2, size=0.14, life=0.6)
+        self.texts.append(Float(start + V(0, 1.4), "앗!"))   # 떨어져 돌아갈 자리 위 (높이 상자에 가리지 않게)
+        loose = [(f, f.pos, home[f.name][1]) for f in feet if f.mode == "free" and home[f.name][1] in self.holds]
+        for f, _, _ in loose:
+            f.mode = "move"   # 매달려 흔들리던 발도 손처럼 천천히 원래 홀드로
+        top, dur, t = self.body, 0.34, 0.0
+        while t < dur:   # 미끄러져 떨어진다
+            dt = yield
+            t += dt
+            k = min(1.0, t / dur)
+            old = self.body
+            self.body = top.lerp(start, k * k)
+            self.vel = (self.body - old) * (1 / dt)
+            for l, a, b in zip(hands, hand_from, touch):
+                l.pos = b.lerp(a, smooth(k))
+            for f, a, hold in loose:
+                f.pos = a.lerp(self.grip_point(f, hold), smooth(k))
+        self.crouch = 0.0
+        for name, limb in self.limbs.items():
+            mode, hold, follow = home[name]
+            if mode == "follow" and follow is not None:   # 플래그·벽 딛기로 뺀 발은 뺀 채로
+                limb.mode, limb.follow = "follow", follow
+            elif hold is not None and hold in self.holds:
+                self.grab(limb, hold)
+            else:
+                limb.mode = "free"
+        self.mode, self.vel = "spring", V()
+        self.squash_vel -= 3.0
         yield from self.wait(0.3, stoppable=False)
 
     def exhaust(self, nap=False):
@@ -2052,7 +2251,11 @@ class Climber:
         self.puff(self.bag_mouth(), n=8, speed=1.0, size=0.14, life=0.9)
         if gain:
             self.texts.append(Float(self.body + V(0, 1.5), f"+{gain}%"))
-        name = self.lower_hand()
+        yield from self.fist_pump()
+
+    def fist_pump(self, name=None):
+        """손 (없으면 아래쪽 손) 으로 주먹을 불끈 쥐고 두 번 흔든 뒤 다시 잡는다."""
+        name = name or self.lower_hand()
         limb = self.limbs[name]
         home = limb.hold
         limb.fist = True
