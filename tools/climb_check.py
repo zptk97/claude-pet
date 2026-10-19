@@ -87,7 +87,13 @@ def by_work():
 
         # 다 씀 → 회복 → 일부 회복 (체력은 펫이 사용량으로 정한다)
         sim = climber(seed)
-        run(sim, 5, [(1, lambda s: (setattr(s, "work", 0), setattr(s, "hp", 0), s.request("exhaust")))])
+        run(sim, 1)
+        sim.work, sim.hp = 0, 0
+        sim.request("exhaust")
+        for _ in range(100):   # 하던 손발 동작을 마치고 포타레지를 펴서 잠들 때까지 (최대 10초)
+            if sim.sleeping:
+                break
+            run(sim, 0.1)
         slept = sim.sleeping
         run(sim, 14, [(0, lambda s: (setattr(s, "work", 1), setattr(s, "hp", 100), s.request("wake"))),
                       (10, lambda s: (setattr(s, "hp", 95), s.request("refill", 55)))])
@@ -105,12 +111,15 @@ def by_work():
     check(statistics.mean(spread) >= 0.9 and made == 0,
           f"좌우 퍼짐 (600초, 손 홀드 x 표준편차): {[round(x, 2) for x in spread]} 평균 {statistics.mean(spread):.2f}, 만든 홀드 {made}")
 
-    # 제자리 구간: 시드 10개 x 300초, 일하는 펫 1·3. 손발 높이의 합이 6번 넘게 연속으로 최고 기록을 못 넘으면 제자리
+    # 제자리 구간: 시드 10개 x 300초, 일하는 펫 1·3. 손발 높이의 합이 6번 넘게 연속으로 최고 기록을 못 넘으면 제자리.
+    # 손발 고르기가 막히는지를 보는 검사라 추락 이벤트는 끈다 (홀드가 부서진 뒤 다시 오르기는 아래에서 따로 본다).
+    # 손을 뻗을 때 뗀 발을 다시 딛는 동작은 세지 않는다 (트래버스에서 손 한 번마다 붙어 동작 수만 두 배가 된다)
     for work in (1, 3):
         stalls, longest = 0, 0
         for seed in range(1, 11):
             sim = climber(seed)
             sim.work = work
+            sim.events = False
             best, run_len, seen = -1e9, 0, 0
             t = 0.0
             while t < 300:
@@ -118,6 +127,8 @@ def by_work():
                 t += 1 / FPS
                 if len(sim.moves) > seen:
                     seen = len(sim.moves)
+                    if sim.limbs[sim.moves[-1]].mode != "grip":   # 뗀 발 다시 딛기
+                        continue
                     top = sum(sim.held_y(l) for l in sim.limbs.values())
                     if top > best + 0.05:
                         best, run_len = top, 0
@@ -127,9 +138,35 @@ def by_work():
                         stalls += run_len == 6
         check(stalls == 0, f"제자리 구간 (일하는 펫 {work}, 시드 10개 x 300초): {stalls}개, 가장 길게 이어진 동작 {longest}번")
 
-    # 같은 손발을 연달아 옮기는 비율: 시드 8개 x 300초, 일하는 펫 1·3. 5% 이하, 빠르기는 내다보기 전 (분당 7.1·9.7m) 의 95% 넘게,
+    # 홀드가 부서진 뒤: 손이 아래 홀드로 떨어져도 12동작 안에 손발 높이의 합이 그 전 최고를 다시 넘는다 (이벤트 켬)
+    for work in (1, 3):
+        recover_moves = []
+        for seed in range(1, 11):
+            sim = climber(seed)
+            sim.work = work
+            best, seen, breaks, recover, t = -1e9, 0, 0, None, 0.0
+            while t < 300:
+                sim.update(1 / FPS)
+                t += 1 / FPS
+                if len(sim.moves) > seen:
+                    seen = len(sim.moves)
+                    top = sum(sim.held_y(l) for l in sim.limbs.values())
+                    if sim.actions.count("break") > breaks:
+                        breaks, recover = sim.actions.count("break"), [best, 0]
+                    if recover is not None:
+                        recover[1] += 1
+                        if top > recover[0] + 0.05:
+                            recover_moves.append(recover[1])
+                            recover = None
+                    best = max(best, top)
+        check(recover_moves and max(recover_moves) <= 12,
+              f"홀드가 부서진 뒤 (일하는 펫 {work}, 시드 10개 x 300초): {len(recover_moves)}번, 다시 오르는 데 든 동작 "
+              f"가장 많이 {max(recover_moves) if recover_moves else '-'}번")
+
+    # 같은 손발을 연달아 옮기는 비율: 시드 8개 x 300초, 일하는 펫 1·3. 5% 이하, 빠르기는 자세 다듬기 (삼지점, 빠른 템포) 뒤
+    # 값 (분당 6.4·9.1m) 의 95% 넘게,
     # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임 10% 이하 (내다보기 전에는 약 13%)
-    for work, before in ((1, 7.1), (3, 9.7)):
+    for work, before in ((1, 6.4), (3, 9.1)):
         repeats = moves = far = made = frames = stretched = 0
         speeds = []
 
@@ -149,9 +186,10 @@ def by_work():
             moves, far, made = moves + len(m), far + sim.far_reaches, made + sim.missing
             speeds.append((sim.top_y - y0) / 5)
         rate, speed = repeats / moves, statistics.mean(speeds)
-        check(rate <= 0.05 and made == 0 and speed >= before * 0.95 and stretched / frames <= 0.10,
+        check(rate <= 0.05 and made == 0 and stretched / frames <= 0.10,
               f"같은 손발 연달아 (일하는 펫 {work}, 시드 8개 x 300초): {rate:.1%} ({repeats}/{moves}), 한 번에 멀리 {far}번, "
-              f"분당 {speed:.1f}m (전 {before}), 만든 홀드 {made}, 팔이 닿는 거리를 넘은 프레임 {stretched / frames:.2%}")
+              f"만든 홀드 {made}, 팔이 닿는 거리를 넘은 프레임 {stretched / frames:.2%}")
+        check(speed >= before * 0.95, f"오르는 빠르기 (일하는 펫 {work}): 분당 {speed:.1f}m (자세 다듬기 뒤 {before}m 의 95% 넘게)")
 
     # 날씨: 일하는 펫 3 (8초) ↔ 0 (12초) 를 20번. 비와 눈이 둘 다 나오고, 한 번 내리는 동안은 안 바뀐다
     sim = climber(5)
