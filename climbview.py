@@ -931,9 +931,20 @@ class ClimbWindow(QWidget):
         if not self.timer.isActive():
             self.last = time.monotonic()
             self.night_t = self.last + NIGHT_EVERY
-            self.sim.night = clock_night()   # 첫 프레임부터 지금 시각의 밤 정도로 (숨어 있는 동안 해가 졌을 수 있다)
+            self.sim.night = self.night_now()   # 첫 프레임부터 지금 시각의 밤 정도로 (숨어 있는 동안 해가 졌을 수 있다)
             self.timer.start(FRAME_MS)
         self.update_shape()
+        self.update()
+
+    def night_now(self):
+        """지금 밤 정도: 밤낮을 껐으면 늘 낮 (0)."""
+        enabled = getattr(self.manager, "climb_night_enabled", None)
+        return clock_night() if enabled is None or enabled() else 0.0
+
+    def refresh_night(self):
+        """밤낮을 켜고 끈 뒤 바로 다시 그린다."""
+        self.sim.night = self.night_now()
+        self.night_t = time.monotonic() + NIGHT_EVERY
         self.update()
 
     def retire(self):
@@ -967,7 +978,7 @@ class ClimbWindow(QWidget):
         self.last = now
         if now >= self.night_t:
             self.night_t = now + NIGHT_EVERY
-            self.sim.night = clock_night()
+            self.sim.night = self.night_now()
         steps = math.ceil(dt / STEP_MAX)   # 고르게 나눈다 (아주 짧은 조각이 남으면 몸이 튄다)
         for _ in range(steps):
             self.sim.update(dt / steps)

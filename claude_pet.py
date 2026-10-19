@@ -1528,6 +1528,10 @@ class PetManager(QObject):
         """추락 이벤트: 발·손 미끄러짐, 홀드 부서짐, 낙석, 오류 때 로프 추락 (끄면 볼트와 로프도 안 보인다)."""
         return self.config.get("climb_events") is not False
 
+    def climb_night_enabled(self):
+        """밤낮: 서울에서 해가 지면 오르기 창을 어둡게 하고 아바타가 헤드램프를 켠다 (끄면 늘 낮)."""
+        return self.config.get("climb_night") is not False
+
     def free_layout(self):
         """펫 따로 움직이기. 접혀 있으면 한 마리만 보이므로 줄 자리에 세운다."""
         return self.config.get("free") is True and not self.folded()
@@ -2278,6 +2282,9 @@ class PetManager(QObject):
         events = QAction("추락 이벤트 (미끄러짐·낙석·로프 추락)", menu, checkable=True, checked=self.climb_events_enabled())
         events.triggered.connect(self.set_climb_events)
         menu.addAction(events)
+        night = QAction("밤낮 (해 지면 어둡게·헤드램프)", menu, checkable=True, checked=self.climb_night_enabled())
+        night.triggered.connect(self.set_climb_night)
+        menu.addAction(night)
         self.desktop.watch_clicks(True)
         try:
             menu.exec_(pos)
@@ -2398,6 +2405,12 @@ class PetManager(QObject):
         self.config["climb_events"] = bool(enabled)
         save_config(self.config)
         self.climber.events = bool(enabled)
+
+    def set_climb_night(self, enabled):
+        self.config["climb_night"] = bool(enabled)
+        save_config(self.config)
+        if self.base is not None:
+            self.base.refresh_night()
 
     def set_gist(self, enabled):
         self.config["gist"] = bool(enabled)
