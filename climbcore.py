@@ -72,11 +72,14 @@ PACE_BANK = (8.0, 30.0)                       # 쌓인 높이 (m) 가 이만큼 
 DYNO_MIX = {2: 0.06, 3: 0.18}                 # 빠름·전력 질주에서 손발 동작 대신 다이노를 할 비율
 NAP_AFTER = 180.0                             # 쉬는 자세 (기다림·쉼) 로 이만큼 (초) 있으면 포타레지를 펴고 낮잠을 잔다
 LEFTOVER_WAIT = 20.0                          # 1m 가 안 되게 남은 오를 높이는 토큰이 이만큼 (초) 안 들어오면 마저 오른다
+GROUND = -2.4                 # 땅 높이 (m). 새 벽 첫 자세가 0m 이고 그 발 아래
+GROUND_OK = ("get_up",)       # 바닥에 앉아 있는 동안 받는 동작
+FALL_SPEED = 8.0              # 벽의 끝: 떨어지는 빠르기 (m/s, 처음부터 끝까지 같다. 높이 숫자는 따로 0m 까지 일정하게)
 LAST_ROOM = 0.3                               # 남은 오를 높이가 이보다 적은데 가까운 홀드가 없으면 멈추고 다음 토큰과 합쳐 오른다
 COOLDOWN = {"dyno": 8.0, "chalk": 15.0}      # 잦은 신호는 이 간격 (초) 안이면 버린다 (일 끝냄 → 다이노, 사용량 → 초크)
 SHAKE_EVERY = (40.0, 80.0)                    # 체력 60% 이하면 오르다가 이 간격으로 팔을 턴다
 WORKING = ("running", "background")          # 일하는 펫으로 치는 상태 (날씨)
-AWAKE = ("wake", "refill")                    # 자는 동안에도 받는 동작
+AWAKE = ("wake", "refill", "wall_end")        # 자는 동안에도 받는 동작
 FREE_FOOT = 0.75                              # 손을 뻗을 때 한 발을 떼어 (삼지점) 플래그·벽 딛기로 균형을 잡을 비율
 FREE_HOLD = 0.3                               # 뗀 발은 손을 잡고 적어도 이만큼 (초) 더 균형을 잡은 뒤 홀드로 옮긴다
 FOOT_SPAN = 3.6                               # 편한 자세에서 아래쪽 손과 발 사이 높이 (팔 펴고 다리로 민다, 무릎 약 100°)
@@ -582,7 +585,19 @@ class Climber:
         self.stall = 0              # 제자리 (손발 높이 합이 안 오름) 로 이어진 손발 동작 수
         self.best_top = -1e9        # 손발 높이 합의 최고 기록
         self.moves, self.grabs, self.actions = [], [], []
-        self.route = Route(self.rng, random.Random(seed + 3))
+        self.falling = False        # 벽의 끝으로 떨어지는 중 (카메라가 몸에 붙어 따라 내려간다)
+        self.rope_cut = None        # 끊어진 줄이 남은 퀵드로 자리 (벽의 끝)
+        self.wall_pending = False   # 벽이 끝나 새 벽을 기다린다 (떨어지는 장면을 아직 안 보였다)
+        self.carry = 0.0            # 벽이 끝난 뒤 떨어지는 동안 받은 오를 높이 (새 벽으로 넘긴다)
+        self.grounded = False       # 벽이 끝나 땅에 앉아 있다 (주간 사용량이 돌아오면 일어나 새 벽을 오른다)
+        self.start_pose = None      # 새 벽의 첫 자세 (몸 자리, {손발: 홀드}) — 일어나 붙을 곳
+        self.lay_wall(random.Random(seed + 3))
+        self.brain_task = self.brain()
+        next(self.brain_task)
+
+    def lay_wall(self, xrng):
+        """길과 홀드를 깔고 (크럭스는 xrng) 바닥에서 손발을 가까운 홀드에 붙여 세운다."""
+        self.route = Route(self.rng, xrng)
         self.route.fill(self, self.cam + FILL_AHEAD)
         self.body = V(self.route.center(0.0), 0.0)
         self.limbs = {name: Limb(name) for name in LIMBS}
@@ -599,8 +614,118 @@ class Climber:
         self.top_y = self.body.y    # 몸이 가장 높이 올라간 자리
         for bolt in self.bolts:   # 시작할 때 이미 지나온 볼트에는 로프가 걸려 있다
             bolt.clipped = bolt.p.y < self.body.y
-        self.brain_task = self.brain()
-        next(self.brain_task)
+
+    def new_wall(self, restart=True, grounded=False, banner=True, keep=None):
+        """새 벽: 길·홀드·볼트를 새로 깔고 바닥 (0m) 에서 다시 시작한다. 높이 기록도 새로 세고, 못 오른 높이는 버린다.
+        지난 벽 높이를 말풍선으로 띄운다. restart 면 하던 동작을 버리고 처음부터 (brain 안에서 부를 때는 False).
+        grounded 면 벽에 붙지 않고 땅에 앉는다 (keep = (카메라 - 몸 높이, 몸 x) 면 화면 속 자리를 그대로)."""
+        last = self.peak
+        self.holds, self.bolts, self.rocks, self.particles, self.texts, self.requests = [], [], [], [], [], []
+        self.cam, self.falling, self.rope_cut, self.wall_pending = 0.45, False, None, False
+        self.mode, self.vel, self.tilt, self.tilt_vel, self.crouch = "spring", V(), 0.0, 0.0, 0.0
+        self.phase_target = self.look_at = self.lamp = self.rope = self.rope_hand = self.ledge = None
+        self.sleeping = self.nap = self.resting = self.parked = False
+        self.lids, self.idle_since, self.wait_for = 0.0, None, 0.0
+        self.bank, self.carry, self.token_buf = self.carry, 0.0, 0   # 지난 벽에서 못 오른 높이는 버리고, 끝난 뒤 받은 것만
+        self.best_top, self.stall, self.moves_since_crux, self.switch_foot = -1e9, 0, 0, None
+        self.lay_wall(random.Random(self.rng.random()))
+        self.jump(0.0, 0.0)
+        self.start_pose = (self.body, {n: l.hold for n, l in self.limbs.items()})
+        self.grounded = grounded
+        if grounded:
+            self.sit(keep[1] if keep else self.body.x)
+            self.cam = self.body.y + (keep[0] if keep else 1.0)
+        if banner:
+            self.banner = [f"새 벽! 지난 벽 {fmt_alt(last)}", 0.0]
+        if self.hp <= 0 and not grounded:
+            self.requests.append(("exhaust", ()))   # 5시간 사용량도 다 썼으면 새 벽에서 다시 잔다
+        if restart:
+            self.brain_task = self.brain()
+            next(self.brain_task)
+
+    def end_wall(self, animate=True, locked=True):
+        """주간 사용량을 다 썼거나 주간 리셋: 지금 벽을 끝낸다. animate 면 다음 동작으로 빌레이 줄이 끊어져 땅까지
+        떨어진다 (wall_end). 아니면 (창이 숨어 있다) 바로 새 벽: locked (주간을 다 써서 못 쓴다) 면 땅에 앉아서, 아니면
+        벽에 붙어서. 이미 땅에 앉아 있으면 조용히 벽만 새로."""
+        if self.grounded:
+            self.new_wall(grounded=True, banner=False)
+        elif animate:
+            self.wall_pending = True
+            self.requests.insert(0, ("wall_end", ()))
+        else:
+            self.new_wall(grounded=locked)
+
+    def ground_y(self):
+        """땅의 y (높이 GROUND)."""
+        return GROUND - self.alt0
+
+    def sit(self, x):
+        """땅에 주저앉는다: 몸통이 땅에 닿고 다리는 양옆으로 뻗고 손은 옆 땅을 짚는다."""
+        self.body = V(max(-WALL_HALF + 0.6, min(WALL_HALF - 0.6, x)), self.ground_y() + 1.0)
+        self.mode, self.vel, self.tilt, self.tilt_vel = "script", V(), 0.0, 0.0
+        for name, (dx, dy) in {"LF": (-1.0, 0.1), "RF": (1.0, 0.1), "LH": (-1.25, 0.25), "RH": (1.25, 0.25)}.items():
+            limb = self.limbs[name]
+            limb.mode, limb.tucked = "follow", False
+            limb.follow = lambda dx=dx, dy=dy: V(self.body.x + dx, self.ground_y() + dy)
+            limb.pos = limb.follow()
+
+    def rise(self, animate=True):
+        """주간 사용량이 돌아왔다: 땅에서 일어나 새 벽에 붙는다 (animate 면 걸어가 첫 홀드를 잡는 get_up, 아니면 바로)."""
+        if not self.grounded or any(r[0] == "get_up" for r in self.requests):
+            return
+        if animate:
+            self.requests.append(("get_up", ()))
+        else:
+            body, holds = self.start_pose
+            self.body, self.mode, self.vel, self.grounded = body, "spring", V(), False
+            for name, hold in holds.items():
+                self.grab(self.limbs[name], hold)
+            self.cam = self.body.y + 0.45
+
+    def get_up(self):
+        """땅에서 영차 일어나 벽 앞으로 걸어가 첫 홀드를 잡고 올라선다."""
+        if not self.grounded:
+            return
+        self.actions.append("get_up")
+        self.lids, self.look_at = 0.0, None
+        self.texts.append(Float(self.body + V(0, 1.6), "영차!"))
+        body, holds = self.start_pose
+
+        def stand(x):
+            return lambda: V(x, self.ground_y() + 2.15)
+        feet = {"LF": lambda: V(self.body.x - 0.35, self.ground_y() + 0.05),
+                "RF": lambda: V(self.body.x + 0.35, self.ground_y() + 0.05),
+                "LH": lambda: V(self.body.x - 0.75, self.body.y - 0.55), "RH": lambda: V(self.body.x + 0.75, self.body.y - 0.55)}
+        yield from self.move_all(feet, 0.7, body_to=stand(self.body.x), tilt_to=0.0)   # 일어선다
+        steps = max(1, round(abs(body.x - self.body.x) / 0.6))
+        x0 = self.body.x
+        for i in range(steps):   # 벽 앞으로 걸어간다 (콩콩)
+            yield from self.move_all({}, 0.28, body_to=stand(x0 + (body.x - x0) * (i + 1) / steps), hop=0.12)
+        self.face = 1 if body.x < self.body.x else self.face
+        yield from self.move_all(dict(holds), 0.9, body_to=lambda: body, tilt_to=0.0)   # 첫 홀드를 잡고 올라선다
+        self.mode, self.grounded = "spring", False
+        self.top_y = max(self.top_y, self.body.y)
+        if self.hp <= 0:
+            self.requests.append(("exhaust", ()))
+
+    def ground_wait(self):
+        """땅에서 기다린다: 가끔 벽을 올려다보며 한숨 (5시간 사용량도 다 썼으면 꾸벅꾸벅 존다)."""
+        if self.hp <= 0:
+            if self.lids < 0.85:
+                yield from self.tween(self, "lids", self.lids, 0.9, 0.8)
+            self.texts.append(Float(self.body + V(-0.5 * self.face, 1.0), self.wrng.choice(("z", "Z")), "z"))
+            yield from self.wait(2.4, until=lambda: bool(self.requests) or self.hp > 0)
+            return
+        if self.lids > 0.1:
+            yield from self.tween(self, "lids", self.lids, 0.0, 0.4)
+        yield from self.wait(self.wrng.uniform(4.0, 8.0), until=lambda: bool(self.requests) or self.hp <= 0)
+        if self.requests or self.hp <= 0:
+            return
+        self.look_at = self.body + V(-0.6 * self.face, 4.0)   # 벽을 올려다본다
+        yield from self.wait(1.4, until=lambda: bool(self.requests))
+        self.look_at = None
+        if self.wrng.random() < 0.5:
+            self.texts.append(Float(self.body + V(0, 1.4), "휴…"))
 
     # ---- 바깥에서 부르는 것 ---------------------------------------------------
 
@@ -623,6 +748,8 @@ class Climber:
     def request(self, name, *args):
         if self.sleeping and name not in AWAKE:
             return   # 자는 동안은 깨우기만 받는다
+        if self.grounded and name not in GROUND_OK:
+            return   # 땅에 앉아 있는 동안은 일어나기만 받는다
         self.requests.append((name, args))
 
     @property
@@ -635,6 +762,8 @@ class Climber:
         """출력 토큰을 받아 오를 높이로 쌓는다."""
         self.tokens += tokens
         self.bank += tokens * M_PER_TOKEN
+        if self.wall_pending:
+            self.carry += tokens * M_PER_TOKEN
         if self.room() >= self.wait_for:   # 크럭스 앞에서 기다리면 끝 홀드까지 오를 만큼 모여야 다시 오른다
             self.parked, self.wait_for = False, 0.0
         self.token_buf += tokens
@@ -642,6 +771,8 @@ class Climber:
 
     def has_climb(self):
         """더 오를지. 토큰으로 오를 때는 쌓인 높이가 남았거나 추락해서 다시 올라야 할 때, 아니면 일하는 펫이 있을 때."""
+        if self.grounded:
+            return False
         if self.tokens_on:
             return (self.bank > 0.05 and not self.parked) or self.body.y < self.top_y - 1.5   # 쉬는 자세로 낮춘 몸 (약 0.9m) 은 추락으로 치지 않는다
         return self.work > 0
@@ -655,6 +786,8 @@ class Climber:
     def climb_ready(self):
         """쉬다가 다시 오를지. 토큰은 1m 넘게 모였거나 (조금씩 들어올 때 한 동작만 하고 또 쉬지 않게 모아서 오른다),
         1m 가 안 되게 남았는데 토큰이 LEFTOVER_WAIT 초 동안 더 안 들어왔으면 남은 것을 마저 오른다."""
+        if self.grounded:
+            return False
         if self.tokens_on:
             if self.parked and self.wait_for:
                 return self.room() >= self.wait_for or self.body.y < self.top_y - 1.5
@@ -664,6 +797,8 @@ class Climber:
 
     def state_label(self):
         """높이 상자에 보이는 지금 상태: 잠, 쉬는 자세면 기다림 (일하는 펫 있음)·쉼, 오르는 중이면 빠르기."""
+        if self.grounded:
+            return "바닥"
         if self.sleeping:
             return "낮잠" if self.nap else "잠"
         if self.resting:
@@ -697,6 +832,8 @@ class Climber:
 
     def snapshot(self):
         """저장할 기록: 높이 (이번 길에서 가장 높이 올라간 자리), 최고 높이, 쌓인 높이, 받은 토큰 합."""
+        if self.wall_pending or self.grounded:   # 벽이 끝났다 (떨어지는 장면 전에 꺼져도 다음에는 새 벽 땅에서)
+            return {"height": 0.0, "peak": 0.0, "bank": 0.0, "tokens": self.tokens, "grounded": True}
         return {"height": round(self.alt0 + self.top_y, 2), "peak": round(self.peak, 2),
                 "bank": round(self.bank, 3), "tokens": self.tokens}
 
@@ -710,6 +847,8 @@ class Climber:
         self.bank = number("bank")
         tokens = saved.get("tokens") if isinstance(saved, dict) else None
         self.tokens = tokens if isinstance(tokens, int) and tokens >= 0 else 0
+        if isinstance(saved, dict) and saved.get("grounded") is True:   # 벽이 끝나 땅에서 기다리던 중
+            self.new_wall(grounded=True, banner=False)
 
     def next_milestone(self):
         return MILESTONES[self.passed] if self.passed < len(MILESTONES) else None
@@ -747,7 +886,7 @@ class Climber:
             if self.tokens_on and self.charging and self.ledge is None:   # 포타레지에 오르내리기·덤 다이노는 안 쓴다
                 self.bank -= self.body.y - self.top_y
             self.top_y = self.body.y
-        if self.token_buf and self.t - self.token_float_t > 0.7:   # 받은 토큰을 글자로 띄운다 (잦으면 모아서)
+        if self.token_buf and self.t - self.token_float_t > 0.7 and not self.falling:   # 받은 토큰을 글자로 띄운다 (잦으면 모아서)
             side = 1.3 if len(self.texts) % 2 else -1.3
             self.texts.append(Float(self.body + V(side, 0.9), f"+{self.token_buf:,} 토큰", "token"))
             self.token_buf, self.token_float_t = 0, self.t
@@ -764,7 +903,10 @@ class Climber:
         self.move_weather(dt)
         self.move_milestones(dt)
         self.move_events(dt)
-        self.cam += (self.body.y + 0.45 - self.cam) * (1 - math.exp(-2.6 * dt))
+        if self.falling:   # 떨어지는 동안은 wall_end 가 카메라를 옮긴다
+            pass
+        else:
+            self.cam += (self.body.y + 0.45 - self.cam) * (1 - math.exp(-2.6 * dt))
         keep = {id(l.hold) for l in self.limbs.values()}
         if self.ledge and self.ledge.home:
             keep |= {id(h) for h in self.ledge.home[1].values()}
@@ -1146,7 +1288,7 @@ class Climber:
         else:
             look = 0.0
         self.look_tilt += (look - self.look_tilt) * (1 - math.exp(-8 * dt))
-        if self.night > 0.05 and not self.sleeping:   # 헤드램프: 보는 곳 (없으면 앞 위쪽) 을 부드럽게 따라 비춘다
+        if self.night > 0.05 and not self.sleeping and not self.falling:   # 헤드램프: 보는 곳 (없으면 앞 위쪽) 을 부드럽게 따라 비춘다
             aim = self.look_at if self.look_at is not None else self.body + V(-self.face * 0.9, 1.4)
             self.lamp = aim if self.lamp is None else self.lamp + (aim - self.lamp) * (1 - math.exp(-6 * dt))
         else:
@@ -1346,9 +1488,12 @@ class Climber:
             self.charging = True
             if self.requests:
                 name, args = self.requests.pop(0)
-                if self.sleeping and name not in AWAKE:
-                    continue   # 잠들기 전에 받아 둔 동작은 버린다
+                if (self.sleeping and name not in AWAKE) or (self.grounded and name not in GROUND_OK):
+                    continue   # 잠들기 전·땅에 떨어지기 전에 받아 둔 동작은 버린다
                 yield from getattr(self, name)(*args)
+                continue
+            if self.grounded:   # 벽이 끝나 땅에서 기다린다
+                yield from self.ground_wait()
                 continue
             if self.sleeping:
                 if self.nap and self.climb_ready():   # 낮잠: 토큰이 모였으면 깨어나 다시 오른다
@@ -2077,6 +2222,64 @@ class Climber:
         if dist > hi:
             foot.pos = root + d * (hi / dist)
         foot.mode, foot.vel = "free", self.vel * 0.5
+
+    def wall_end(self):
+        """벽의 끝: 빌레이 줄이 툭 끊어지고 (추락 이벤트를 켰으면 끊어진 줄이 보인다) 허우적대며 같은 빠르기로 떨어진다.
+        카메라가 따라 내려가며 벽이 흘러가고, 높이 숫자와 배경은 4~7초 (높을수록 조금 길게) 동안 0m 까지
+        내려가고, 마지막 12m 는 떨어지는 빠르기대로라 땅이 아래에서 올라와 닿는다. 쿵 하고 새 벽의 땅에 주저앉는다.
+        포타레지에서 자고 있었으면 깨어 떨어진다."""
+        self.actions.append("wall_end")
+        if self.ledge is not None:   # 침낭에서 빠져 떨어진다 (빈 포타레지는 남는다)
+            self.ledge.bag, self.ledge.carry = 0.0, None
+        self.sleeping, self.nap, self.lids = False, False, 0.0
+        self.texts = [f for f in self.texts if f.style != "z"]
+        clipped = [b for b in self.bolts if b.clipped]
+        if self.events and clipped:
+            top = max(clipped, key=lambda b: b.p.y)
+            self.rope_cut = top.rope_point()
+            self.texts.append(Float(top.p + V(0.5, 0.2), "툭!"))
+            self.puff(self.rope_cut, n=6, speed=1.0, size=0.12, life=0.6)
+        self.phase_target = self.look_at = None
+        for limb in self.limbs.values():   # 허우적
+            limb.mode, limb.tucked = "free", False
+            limb.vel = V(self.wrng.uniform(-2.0, 2.0), self.wrng.uniform(1.5, 3.5))
+        self.mode, self.falling = "script", True
+        self.texts.append(Float(self.body + V(0, 1.4), "으아아!"))
+        height = max(0.0, self.altitude())
+        land = GROUND + 1.0   # 몸통이 땅에 닿는 높이
+        final = min(height, 12.0)   # 마지막 이만큼은 떨어지는 빠르기대로 (땅이 아래에서 올라와 닿는다)
+        head = 2.5 + 0.6 * math.log10(height / 10 + 1) if height > final + 0.5 else 0.0   # 그 위는 높이 숫자만 빠르게
+        dur = max(0.6, head + (final - land) / FALL_SPEED)
+        decor = random.Random(int(self.t * 1000))   # 지나가는 벽의 홀드 (그림만)
+        fill, t = self.body.y - 6.0, 0.0
+        while t < dur:
+            dt = yield
+            t = min(dur, t + dt)
+            old = self.body
+            self.body = self.body + V(math.sin(t * 2.0) * 0.4 * dt, -FALL_SPEED * dt)
+            self.vel = (self.body - old) * (1 / dt)
+            self.tilt += 1.2 * dt   # 천천히 돈다
+            for i, limb in enumerate(self.limbs.values()):   # 팔다리를 허우적댄다
+                limb.vel = limb.vel + V(math.sin(t * 11 + i * 1.7), math.cos(t * 9 + i * 2.3)) * (40.0 * dt)
+            alt = height + (final - height) * t / head if t < head else final - (t - head) * FALL_SPEED
+            self.alt0 = max(land, alt) - self.body.y   # 높이 숫자와 배경이 내려가고 마지막에 땅이 올라온다
+            near = smooth(max(0.0, min(1.0, (t - head) / max(0.01, dur - head))))   # 마지막: 카메라가 느려지며 땅 쪽에 선다
+            aim = self.body.y + 1.0 + (self.ground_y() + 1.45 - self.body.y - 1.0) * near
+            self.cam += (aim - self.cam) * (1 - math.exp(-8.0 * dt))
+            while fill > self.body.y - 8.0:   # 아래로 지나갈 벽에 홀드를 깔고, 지나간 위쪽은 버린다
+                cx = 1.2 * math.sin(fill * 0.35)
+                for _ in range(decor.choice((2, 3, 3))):
+                    x = max(-WALL_HALF + 0.3, min(WALL_HALF - 0.3, cx + decor.uniform(-1.15, 1.15)))
+                    self.holds.append(Hold(V(x, fill - decor.uniform(0, Route.BAND)), decor.uniform(0.19, 0.27), decor))
+                fill -= Route.BAND
+            self.holds = [h for h in self.holds if h.p.y < self.cam + 15]
+            self.bolts = [b for b in self.bolts if b.p.y < self.cam + 15]
+        self.new_wall(restart=False, grounded=True, keep=(self.cam - self.body.y, self.body.x))   # 땅에 주저앉는다
+        self.puff(self.body + V(0, -0.9), n=16, speed=2.2, size=0.22, life=0.9)   # 쿵
+        self.texts.append(Float(self.body + V(0, 1.6), "쿵!"))
+        self.squash_vel -= 4.0
+        yield from self.wait(1.0, stoppable=False)
+        self.texts.append(Float(self.body + V(0.6, 1.3), "아야…"))
 
     def crux_ready(self):
         """크럭스 끝 홀드로 뛸 때면 그 홀드: 손보다 1~3.6m 위에 있고, 손이 더 오를 데가 없고 (제자리로 맴돌기 시작했으면

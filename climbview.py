@@ -138,6 +138,8 @@ class Look:
         mp.end()
         rng = random.Random(3)
         self.stars = [(rng.random(), rng.random() * 0.8, rng.uniform(0.6, 1.4), rng.uniform(0, 6.3)) for _ in range(28)]
+        self.pebbles = [(rng.random(), rng.uniform(0.15, 1.2), rng.uniform(0.06, 0.16), rng.choice((92, 108, 124)))
+                        for _ in range(22)]   # 땅의 돌 (가로 자리 0~1, 땅 아래 깊이 m, 크기 m, 밝기)
         self.hold_cache = {}        # id(홀드) → (홀드, 그린 상태, 그림, pad)
         self.layer_drawn = None     # 지금 바위 층을 그린 상태 (layer_key)
         self.hud_key = self.hud = None   # 높이 상자 그림과 그린 내용
@@ -214,8 +216,8 @@ class Look:
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         night = self.night_amount(sim)
-        if night > 0.01:   # 밤: 헤드램프가 비추는 벽, 어둡게 한 아바타, 램프 빛
-            lamp = sim.lamp is not None
+        if night > 0.01 or sim.falling:   # 밤: 헤드램프가 비추는 벽, 어둡게 한 아바타, 램프 빛 / 벽의 끝: 가장자리에서 흐리게
+            lamp = night > 0.01 and sim.lamp is not None
             if lamp:
                 self.paint_light(painter, sim, cam, night)
             area = self.actor_region(sim).boundingRect()   # 아바타 둘레만 비우고 어둡게 해서 붙인다
@@ -230,8 +232,12 @@ class Look:
             ap.setRenderHint(QPainter.Antialiasing)
             ap.setRenderHint(QPainter.SmoothPixmapTransform)
             self.paint_actors(ap, sim, cam, night)
-            ap.setCompositionMode(QPainter.CompositionMode_SourceAtop)
-            ap.fillRect(area, QColor(*NIGHT_TINT, round(130 * night)))
+            if night > 0.01:
+                ap.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+                ap.fillRect(area, QColor(*NIGHT_TINT, round(130 * night)))
+            if sim.falling:   # 떨어지는 몸과 줄도 창 가장자리에서는 흐려진다
+                ap.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+                ap.drawImage(area.topLeft(), self.mask, area)
             ap.end()
             painter.drawImage(area.topLeft(), image, area)
             if lamp:
@@ -249,6 +255,8 @@ class Look:
         R = self.R
         if sim.ledge is not None:
             self.paint_ledge(painter, sim, cam, front=False)
+        if sim.events and sim.rope_cut is not None:
+            self.paint_rope(painter, sim, cam)   # 끊어진 줄은 몸 뒤에
         self.paint_climber(painter, sim, cam, night)
         if sim.ledge is not None:
             self.paint_ledge(painter, sim, cam, front=True)
@@ -272,7 +280,7 @@ class Look:
                 painter.setBrush(QColor(255, 255, 255, round(210 * (1 - k) ** 1.5)))
                 s = p.size * R * (0.6 + k * 1.2)
                 painter.drawEllipse(pt, s, s)
-        if sim.events:
+        if sim.events and sim.rope_cut is None and not sim.grounded:   # 땅에 앉아 있는 동안은 로프를 풀어 둔다
             self.paint_rope(painter, sim, cam)
         for rock in sim.rocks:
             self.paint_rock(painter, rock, cam)
@@ -382,6 +390,13 @@ class Look:
             for bolt in sim.bolts:
                 if bottom_y - 1 < bolt.p.y < top_y + 1:
                     self.paint_bolt(lp, bolt, cam)
+        ground = self.to_screen(V(0, sim.ground_y()), cam).y()
+        if ground < H:   # 벽 맨 아래 땅 (새 벽을 시작할 때와 벽 끝에서 떨어져 닿을 때 보인다)
+            lp.setClipping(False)
+            self.paint_ground(lp, ground)
+            clip = QPainterPath(clip)
+            clip.addRect(QRectF(0, ground - R * 0.15, W, H))
+            self.clip = clip   # 밤에 헤드램프가 땅도 비춘다
         night = self.night_amount(sim)
         if night > 0.01:   # 밤: 헤드램프가 비출 밝은 바위를 남겨 두고, 바위도 어둡게 (하늘보다 덜, 홀드가 보이게)
             lp.end()
@@ -400,6 +415,28 @@ class Look:
         lp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
         lp.drawImage(0, 0, self.mask)   # 창 가장자리를 흐린다
         lp.end()
+
+    def paint_ground(self, p, top):
+        """땅: 위 끝 top (창 y) 에 풀 띠, 아래로 흙과 돌."""
+        R, W, H = self.R, self.W, self.wall_h
+        g = QLinearGradient(0, top, 0, H)
+        g.setColorAt(0.0, QColor(112, 92, 62))
+        g.setColorAt(1.0, QColor(72, 58, 40))
+        p.setPen(Qt.NoPen)
+        p.fillRect(QRectF(0, top, W, H - top + 1), QBrush(g))
+        for x, depth, size, light in self.pebbles:
+            y = top + depth * R
+            if y - size * R < H:
+                p.setBrush(QColor(light, light - 6, light - 14))
+                p.drawEllipse(QPointF(x * W, y), size * R * 1.3, size * R * 0.8)
+        grass = QPen(QColor(92, 132, 64), max(2.0, R * 0.16))
+        grass.setCapStyle(Qt.RoundCap)
+        p.setPen(grass)
+        p.drawLine(QPointF(0, top), QPointF(W, top))
+        p.setPen(QPen(QColor(120, 160, 80), max(1.0, R * 0.05)))
+        for i in range(int(W / (R * 0.35)) + 1):   # 풀잎
+            x = i * R * 0.35 + (i * 37 % 11) * 0.03 * R
+            p.drawLine(QPointF(x, top), QPointF(x + R * 0.06, top - R * (0.12 + (i * 53 % 7) * 0.02)))
 
     def band_at(self, alt):
         """높이 alt 의 배경 구간 번호와 구간 안에서 간 정도 (0~1, 로그 눈금)."""
@@ -482,7 +519,9 @@ class Look:
         small.setBold(False)
         small.setPixelSize(max(9, round(self.small.pixelSize() * 0.8)))
         rows = [(fmt_alt(alt), self.small, QColor(255, 240, 210), None)]   # (글자, 글꼴, 색, (채움, 막대 색) 또는 None)
-        if nxt:
+        if sim.grounded:
+            rows.append(("주간 사용량이 돌아오면 다시 올라요", small, QColor(230, 215, 190), None))
+        elif nxt and not sim.falling:
             rows.append((f"다음: {nxt[1]}까지 {fmt_alt(nxt[0] - alt)}", small, QColor(230, 215, 190), None))
         if sim.tokens_on:
             state = sim.state_label()
@@ -618,15 +657,32 @@ class Look:
         p.drawEllipse(QRectF(b.x() - R * 0.06, b.y() - R * 0.09, R * 0.12, R * 0.18))
 
     def paint_rope(self, p, sim, cam):
-        """로프: 하네스 (또는 로프를 쥔 손) → 건 퀵드로들 (위에서 아래로) → 화면 아래 빌레이어."""
+        """로프: 하네스 (또는 로프를 쥔 손) → 건 퀵드로들 (위에서 아래로) → 화면 아래 빌레이어.
+        줄이 끊어졌으면 (벽의 끝) 하네스에 끌려 나부끼는 줄과 퀵드로에 남은 짧은 끝만."""
         R = self.R
+        if sim.rope_cut is not None:
+            h = sim.harness()
+            k = max(0.0, min(1.0, -sim.vel.y / 8.0))   # 하네스에 남은 줄: 처음엔 늘어지고 빨리 떨어질수록 위로 나부낀다
+            tail = [h + V(0.25 * math.sin(sim.t * 9 + i * 0.9) * (i / 6), 0.45 * i * (2 * k - 1)) for i in range(7)]
+            cut = sim.rope_cut   # 빌레이어 쪽 줄: 아래 퀵드로들을 지나 끊어진 끝이 맨 위 퀵드로에 늘어진다
+            lower = sorted((b for b in sim.bolts if b.clipped and b.rope_point().y < cut.y - 0.01), key=lambda b: -b.p.y)
+            belay = [cut + V(0.12 * math.sin(sim.t * 7), -0.4), cut] + [b.rope_point() for b in lower]
+            belay.append(V(belay[-1].x * 0.6, max(cam - VIEW_H, sim.ground_y())))
+            for line in (tail, belay):
+                poly = QPolygonF([self.to_screen(q, cam) for q in line])
+                p.setBrush(QColor(0, 0, 0, 0))
+                p.setPen(QPen(QColor(20, 40, 60, 160), max(2.0, R * 0.08)))
+                p.drawPolyline(poly)
+                p.setPen(QPen(QColor(40, 170, 220), max(1.0, R * 0.05)))
+                p.drawPolyline(poly)
+            return
         pts = [sim.harness()]
         if sim.rope_hand is not None:
             pts.append(sim.limbs[sim.rope_hand].pos)
         clipped = sorted((b for b in sim.bolts if b.clipped), key=lambda b: -b.p.y)
         pts += [b.rope_point() for b in clipped]
         last = pts[-1]
-        pts.append(V(last.x * 0.6, cam - VIEW_H))
+        pts.append(V(last.x * 0.6, max(cam - VIEW_H, sim.ground_y())))   # 아래 빌레이어 (땅이 보이면 땅까지)
         poly = QPolygonF([self.to_screen(q, cam) for q in pts])
         p.setBrush(QColor(0, 0, 0, 0))
         p.setPen(QPen(QColor(20, 40, 60, 160), max(2.0, R * 0.08)))
@@ -816,7 +872,11 @@ class Look:
                 continue   # 침낭 안
             a, b = ARM if limb.kind == "H" else LEG
             root = limb.root(body, tilt)
-            elbow, tip = two_bone(root, limb.pos, a, b, limb.side, limb.kind, limb.drop)
+            if sim.falling:   # 빙글 돌며 떨어지는 동안은 몸 기준으로 (팔꿈치가 한 프레임에 뒤집히지 않게)
+                elbow, tip = two_bone(root, root + (limb.pos - root).rot(-tilt), a, b, limb.side, limb.kind, limb.drop)
+                elbow, tip = root + (elbow - root).rot(tilt), root + (tip - root).rot(tilt)
+            else:
+                elbow, tip = two_bone(root, limb.pos, a, b, limb.side, limb.kind, limb.drop)
             if tremble and limb.mode == "grip":
                 elbow = elbow + V(math.sin(sim.t * 47 + i * 1.7), math.cos(sim.t * 53 + i)) * 0.035
             pts = [self.to_screen(q, cam) for q in (root, elbow, tip)]
@@ -951,6 +1011,8 @@ class ClimbWindow(QWidget):
         """숨는다 (클라이밍 보기를 껐거나 펫·사용량이 없을 때). 계산도 멈추고, 받아 둔 동작은 버린다
         (몇 시간 뒤 다시 보일 때 그때 일을 하지 않게. 토큰은 PetManager 가 계속 쌓는다)."""
         self.timer.stop()
+        if self.sim.wall_pending:   # 벽이 끝났는데 떨어지는 장면을 못 보였으면 바로 새 벽으로
+            self.sim.new_wall()
         self.sim.requests.clear()
         self.hide()
 
@@ -964,7 +1026,7 @@ class ClimbWindow(QWidget):
         이 있으면 None (창 전체), 아니면 아바타·로프·포타레지 둘레 (지난번 자리까지) 와 높이 상자 (QRegion)."""
         sim, look = self.sim, self.look
         if (look.layer_key(sim) != look.layer_drawn or sim.drops or sim.flash > 0 or sim.rocks
-                or sim.rope is not None or sim.banner is not None):
+                or sim.rope is not None or sim.banner is not None or sim.falling):
             self.actor = None
             return None
         actor = look.actor_region(sim)

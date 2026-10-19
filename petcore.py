@@ -1038,6 +1038,9 @@ HP_WARNINGS = (20, 10)  # 팀 HP 가 이 이하로 내려갈 때 기지가 알�
 POTION_RISE = 10        # 리셋으로 팀 HP 가 이만큼(%p) 이상 오르면 다 같이 기뻐한다
 HP_WARNING = "팀 HP {hp}% 남았어요!"
 GAME_OVER = ("failed", "한도를 다 썼어요…", 3000)  # 팀 HP 가 0 이 되는 순간 보이는 펫들이
+WEEK_OVER = ("failed", "이번 주 한도를 다 썼어요…", 3500)   # 주간 사용량을 다 써서 벽이 끝날 때
+WEEK_FULL = 99.5        # 주간 사용량이 이만큼 (%) 넘으면 다 쓴 것 (벽의 끝, week_end)
+WEEK_SLACK_S = 6 * 3600   # 주간 리셋 시각이 이만큼 안에서 바뀌면 같은 주기 (새 주기는 7일 뒤로 크게 옮겨 간다)
 POTION = ("jumping", "다시 힘이 나요!", 2000)      # 리셋으로 다시 살아날 때 보이는 펫들이
 
 
@@ -1067,20 +1070,52 @@ def hold_peaks(limits, peaks):
 
 
 def team_hp(limits, now_ms):
-    """(팀 HP 0~100 정수, 그 창의 리셋 epoch 초 또는 None). 5시간·주간 중 더 적게 남은 쪽이다. 모르면 None.
-    리셋 시각이 지난 창은 새 값이 오기 전까지 0% 로 본다. 카드의 사용 % 와 더해 100 이 되게 사용 % 를 반올림해 뺀다.
-    둘이 같으면 늦게 리셋되는 쪽 (그때까지는 HP 가 오르지 않는다)."""
-    best = None
-    for key in ("five_hour", "seven_day"):
-        pct, reset = (limits[f"{key}_pct"], limits[f"{key}_reset"]) if limits else (None, None)
-        if pct is None:
-            continue
-        if reset is not None and reset * 1000 <= now_ms:
-            pct = 0
-        hp = max(0, min(100, 100 - int(pct + 0.5)))
-        if best is None or (hp, -(reset or 0)) < (best[0], -(best[1] or 0)):
-            best = (hp, reset)
-    return best
+    """(체력 0~100 정수, 5시간 창의 리셋 epoch 초 또는 None). 5시간 사용량만 본다 (주간 사용량은 벽의 끝, week_end).
+    계정 사용량을 아예 모르면 None. 5시간 값만 모르거나 리셋 시각이 지났으면 (새 값이 오기 전까지) 100.
+    카드의 사용 % 와 더해 100 이 되게 사용 % 를 반올림해 뺀다."""
+    if not limits or (limits["five_hour_pct"] is None and limits["seven_day_pct"] is None):
+        return None
+    pct, reset = limits["five_hour_pct"], limits["five_hour_reset"]
+    if pct is None or (reset is not None and reset * 1000 <= now_ms):
+        return 100, reset
+    return max(0, min(100, 100 - int(pct + 0.5))), reset
+
+
+def week_locked(limits, now_ms):
+    """주간 사용량을 다 써서 리셋 전까지 못 쓰는지."""
+    if not limits or limits["seven_day_pct"] is None or limits["seven_day_reset"] is None:
+        return False
+    return limits["seven_day_pct"] >= WEEK_FULL and limits["seven_day_reset"] * 1000 > now_ms
+
+
+def week_end(state, limits, now_s):
+    """주간 창으로 지금 벽이 끝날지: (새 state, "full" (주간 사용량을 다 씀) / "reset" (주간 리셋) / None).
+    state 는 {"seen": 보고 있는 주기의 리셋 epoch 초, "ended": 벽을 끝낸 주기의 리셋 epoch 초} (기록 파일에 남긴다).
+    한 주기에 한 번만 끝난다 (다 써서 끝났으면 뒤따르는 리셋에는 안 끝난다). 리셋 시각이 지났거나 더 늦은 리셋이 보이면
+    그 주기는 리셋으로 끝난다 (꺼져 있던 동안 여러 주기가 지나도 한 번). 리셋 시각이 WEEK_SLACK_S 안이면 같은 주기."""
+    seen, ended = state.get("seen"), state.get("ended")
+    pct, reset = (limits["seven_day_pct"], limits["seven_day_reset"]) if limits else (None, None)
+    full = pct is not None and pct >= WEEK_FULL and reset is not None and now_s < reset
+
+    def same(a, b):
+        return a is not None and b is not None and abs(a - b) <= WEEK_SLACK_S
+
+    if seen is None:   # 처음 (옛 기록 파일): 기준만 잡는다. 이미 지난 주기거나 다 쓴 주기면 끝낸 것으로 친다
+        if reset is None:
+            return {"seen": None, "ended": ended}, None
+        return {"seen": reset, "ended": reset if full or now_s >= reset else ended}, None
+    if same(reset, seen):   # 같은 주기: 리셋 시각이 조금씩 흔들려도 따라간다
+        if same(ended, seen):
+            ended = reset
+        seen = reset
+    newer = reset is not None and reset > seen + WEEK_SLACK_S
+    if not same(seen, ended) and (now_s >= seen or newer):   # 지난 주기가 리셋으로 끝났다 (새 주기를 이미 다 썼어도 한 번만)
+        return {"seen": reset if newer else seen, "ended": reset if newer and full else seen}, "reset"
+    if newer:
+        seen = reset   # 새 주기 (지난 주기는 이미 끝났다)
+    if full and not same(reset, ended):
+        return {"seen": seen, "ended": reset}, "full"
+    return {"seen": seen, "ended": ended}, None
 
 
 def hp_events(prev, hp):

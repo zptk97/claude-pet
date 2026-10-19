@@ -108,6 +108,7 @@ GROWTH_SAVE_MS = 60_000  # 작업 중에는 성장 기록을 이 간격으로 �
 GROWTH_COLOR = "#D69E2E"  # 카드의 경험치 막대
 BASE_ID = CARD_ID       # 마우스 올림 카드에서 끝없이 오르기 창을 가리키는 이름
 TOKEN_POLL_MS = 2000    # 이 간격으로 Claude Code 기록 파일에서 새 출력 토큰을 읽는다
+WALLS_KEEP = 100        # 기록 파일에 남길 끝난 벽 수 (등반 일지용)
 CLIMB_SAVE_MS = 60_000  # 오르기 기록 (높이, 쌓인 높이, 기록 파일을 읽은 자리) 을 이 간격으로 저장한다
 
 # 상태별 말풍선 (배경, 테두리)
@@ -1506,6 +1507,7 @@ class PetManager(QObject):
         self.watcher.directoryChanged.connect(self.refresh)
         self.tick = QTimer(self, interval=1000, timeout=self.refresh)
         self.tick.start()
+        self.read_tokens()   # 꺼져 있던 동안 쓴 토큰을 먼저 지금 벽에 넣고 (주간이 바뀌었으면 벽과 함께 끝난다)
         self.refresh()
 
     # ---- 설정 --------------------------------------------------------------
@@ -1619,6 +1621,10 @@ class PetManager(QObject):
                 print(f"claude-pet: 깨진 오르기 기록을 남기지 못함: {err}", file=sys.stderr)
         climber = climbcore.Climber(seed=random.randrange(1 << 30))
         climber.restore(data.get("climb"))
+        week = data.get("week") if isinstance(data.get("week"), dict) else {}
+        self.week = {k: week.get(k) if isinstance(week.get(k), (int, float)) else None for k in ("seen", "ended")}
+        walls = data.get("walls") if isinstance(data.get("walls"), list) else []
+        self.walls = [w for w in walls if isinstance(w, dict)][-WALLS_KEEP:]
         return climber, climbcore.TokenMeter(saved=data.get("meter"))
 
     def save_climb(self):
@@ -1627,7 +1633,8 @@ class PetManager(QObject):
         self.climb_snapshot = self.climber.snapshot()
         self.climb_dirty = False
         try:
-            climbcore.save_state(self.climb_file(), {"climb": self.climb_snapshot, "meter": self.meter.state()})
+            climbcore.save_state(self.climb_file(), {"climb": self.climb_snapshot, "meter": self.meter.state(),
+                                                     "week": self.week, "walls": self.walls})
         except OSError as err:
             print(f"claude-pet: 오르기 기록 저장 실패: {err}", file=sys.stderr)
 
@@ -1808,13 +1815,15 @@ class PetManager(QObject):
             self.save_growth()
 
     def update_team(self, now):
-        """계정 사용량으로 체력 (팀 HP) 을 구해 아바타에게 주고, 바뀐 만큼 신호를 보낸다 (줄면 초크, 0 이면 포타레지에서 잠,
-        0 에서 오르면 기상, 10 넘게 오르면 초크백이 차오름). 일하는 펫 수 (작업 중·백그라운드) 로 날씨를 정한다.
-        줄을 다시 세워야 하면 True. 클라이밍 보기를 껐거나, 펫이 없거나, 사용량을 모르면 (상태줄 중계를 안 쓰면)
-        창을 숨긴다 (아바타도 멈추고, 토큰은 read_tokens 가 계속 쌓는다)."""
+        """계정 5시간 사용량으로 체력을 구해 아바타에게 주고, 바뀐 만큼 신호를 보낸다 (줄면 초크, 0 이면 포타레지에서 잠,
+        0 에서 오르면 기상, 10 넘게 오르면 초크백이 차오름). 주간 사용량은 벽의 끝 (check_week). 일하는 펫 수 (작업 중·
+        백그라운드) 로 날씨를 정한다. 줄을 다시 세워야 하면 True. 클라이밍 보기를 껐거나, 펫이 없거나, 사용량을 모르면
+        (상태줄 중계를 안 쓰면) 창을 숨긴다 (아바타도 멈추고, 토큰은 read_tokens 가 계속 쌓는다)."""
+        limits = self.account_limits()
+        week = self.check_week(limits, now)
         team = None
         if self.climb_enabled() and self.order:
-            team = petcore.team_hp(self.account_limits(), now)
+            team = petcore.team_hp(limits, now)
         if team is None:
             self.team_prev = None
             was_on, self.base_on = self.base_on, False
@@ -1838,14 +1847,39 @@ class PetManager(QObject):
             for name, *args in climbcore.hp_signals(prev, hp):
                 climber.signal(name, *args)
         mood = petcore.hp_events(prev, hp)[2]
-        if mood == "over":
+        locked = petcore.week_locked(limits, now)   # 주간을 다 써서 못 쓰는 동안은 5시간 리셋에 기뻐하지 않는다
+        if mood == "over" and week != "full":   # 같은 때 주간도 다 썼으면 주간 알림을 남긴다
             for window in list(self.windows.values()):
                 window.announce(*petcore.GAME_OVER, style="error")
-        elif mood == "potion":
+        elif mood == "potion" and not locked:
             for window in list(self.windows.values()):
                 window.announce(*petcore.POTION, style="level")
         resized = self.base.set_scale(self.scale())
         return resized or not was_on
+
+    def check_week(self, limits, now):
+        """주간 사용량을 다 썼거나 주간 리셋이 오면 지금 벽을 끝낸다: 창이 보이면 빌레이 줄이 끊어져 땅까지 떨어지고,
+        숨어 있으면 바로 새 벽 (다 쓴 주면 땅에 앉아서). 땅에 앉아 있다가 주간 사용량이 돌아오면 일어나 새 벽에 붙는다.
+        한 주기에 한 번 (petcore.week_end, 기록 파일에 남긴다). 끝난 벽은 walls 에 쌓는다.
+        끝났으면 그 까닭 ("full"/"reset"), 아니면 None."""
+        state, reason = petcore.week_end(self.week, limits, now / 1000)
+        changed, self.week = state != self.week, state
+        climber = self.climber
+        locked = petcore.week_locked(limits, now)
+        visible = self.base_on and self.base is not None and self.base.isVisible()
+        if reason is not None and not climber.wall_pending:   # 떨어지는 장면을 기다리는 중이면 한 번으로
+            self.walls.append({"end": round(now / 1000), "height": round(max(climber.peak, climber.shown_altitude()), 1),
+                               "reason": reason})
+            del self.walls[:-WALLS_KEEP]
+            climber.end_wall(animate=visible, locked=locked)
+            if reason == "full" and self.climb_enabled():
+                for window in list(self.windows.values()):
+                    window.announce(*petcore.WEEK_OVER, style="error")
+        if climber.grounded and not locked and not climber.wall_pending:   # 주간 사용량이 돌아왔다: 일어나 새 벽으로
+            climber.rise(animate=visible)
+        if changed:
+            self.save_climb()
+        return reason
 
     def idle_play(self, now):
         """쉬는 펫: 오래 쉬면 졸고, 좀 쉬면 가끔 옆으로 걸어갔다 오거나 가까운 펫에게 인사하러 간다.

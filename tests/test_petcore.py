@@ -970,25 +970,73 @@ class TeamTest(unittest.TestCase):
         limits, _ = petcore.hold_peaks(self.limits(7, None), {"five_hour": (reset, 50)})  # 주기를 모르면 그대로
         self.assertEqual(limits["five_hour_pct"], 7)
 
-    def test_team_hp_uses_the_lower_remaining(self):
+    def test_team_hp_is_the_five_hour_window(self):
         week_reset, five_reset = self.NOW_S + 86400, self.NOW_S + 3600
-        self.assertEqual(petcore.team_hp(self.limits(28.4, five_reset, 41, week_reset), self.NOW_MS), (59, week_reset))
+        self.assertEqual(petcore.team_hp(self.limits(28.4, five_reset, 41, week_reset), self.NOW_MS), (72, five_reset))
         self.assertEqual(petcore.team_hp(self.limits(71.5, five_reset, 41, week_reset), self.NOW_MS), (28, five_reset))
-        self.assertEqual(petcore.team_hp(self.limits(None, None, 41, None), self.NOW_MS), (59, None))
+        self.assertEqual(petcore.team_hp(self.limits(10, five_reset, 100, week_reset), self.NOW_MS), (90, five_reset))  # 주간은 안 본다
+        self.assertEqual(petcore.team_hp(self.limits(None, None, 41, None), self.NOW_MS), (100, None))  # 5시간을 모르면 가득
         self.assertIsNone(petcore.team_hp(self.limits(), self.NOW_MS))
         self.assertIsNone(petcore.team_hp(None, self.NOW_MS))
 
-    def test_team_hp_after_reset_and_ties(self):
+    def test_team_hp_after_reset(self):
         week_reset = self.NOW_S + 86400
-        # 5시간이 리셋되면 새 값이 오기 전까지 0% 로 보고 주간이 HP 를 정한다
+        # 5시간이 리셋되면 새 값이 오기 전까지 0% 로 본다
         self.assertEqual(petcore.team_hp(self.limits(100, self.NOW_S - 1, 41, week_reset), self.NOW_MS),
-                         (59, week_reset))
-        # 둘 다 다 썼으면 늦게 리셋되는 쪽까지 기다려야 한다
-        self.assertEqual(petcore.team_hp(self.limits(100, self.NOW_S + 60, 100, week_reset), self.NOW_MS),
-                         (0, week_reset))
+                         (100, self.NOW_S - 1))
         self.assertEqual(petcore.team_hp(self.limits(130, self.NOW_S + 60), self.NOW_MS), (0, self.NOW_S + 60))
         self.assertEqual(petcore.team_hp(self.limits(50, self.NOW_S), self.NOW_MS), (100, self.NOW_S))  # 리셋 시각 = 지금
         self.assertEqual(petcore.team_hp(self.limits(99.5, self.NOW_S + 60), self.NOW_MS)[0], 0)  # 반올림해 100%
+
+    def test_week_end_once_per_cycle(self):
+        now, week = self.NOW_S, self.NOW_S + 86400
+        state, reason = petcore.week_end({}, self.limits(10, None, 40, week), now)   # 처음은 기준만
+        self.assertEqual((state, reason), ({"seen": week, "ended": None}, None))
+        state, reason = petcore.week_end(state, self.limits(10, None, 99.4, week + 600), now)   # 리셋 시각이 흔들려도 같은 주기
+        self.assertEqual((state, reason), ({"seen": week + 600, "ended": None}, None))
+        state, reason = petcore.week_end(state, self.limits(10, None, 100, week), now)   # 다 썼다
+        self.assertEqual((state, reason), ({"seen": week, "ended": week}, "full"))
+        for shift in (60, 3000, 9000, 15000):   # 다 쓴 뒤 리셋 시각이 흔들려도 다시 끝나지 않는다
+            state, reason = petcore.week_end(state, self.limits(10, None, 100, week + shift), now + 60)
+            self.assertIsNone(reason)
+        state, reason = petcore.week_end(state, self.limits(10, None, 100, week + 15000), week + 15005)   # 리셋 시각이 지나도
+        self.assertIsNone(reason)
+        state, reason = petcore.week_end(state, self.limits(10, None, 2, week + 7 * 86400), week + 15010)
+        self.assertEqual((state, reason), ({"seen": week + 7 * 86400, "ended": week + 15000}, None))   # 새 주기를 본다
+
+    def test_week_end_on_reset(self):
+        now, week = self.NOW_S, self.NOW_S + 86400
+        state = {"seen": week, "ended": None}
+        state, reason = petcore.week_end(state, self.limits(10, None, 60, week), week + 1)   # 리셋 시각이 지났다 (새 값은 아직)
+        self.assertEqual((state, reason), ({"seen": week, "ended": week}, "reset"))
+        state, reason = petcore.week_end(state, self.limits(10, None, 3, week + 7 * 86400), week + 30)
+        self.assertEqual((state, reason), ({"seen": week + 7 * 86400, "ended": week}, None))   # 새 값이 와도 다시 안 끝난다
+        # 꺼져 있던 동안 두 주기가 지났다: 한 번만 끝나고 지금 주기를 본다
+        state, reason = petcore.week_end({"seen": week, "ended": None}, self.limits(10, None, 30, week + 14 * 86400), week + 8 * 86400)
+        self.assertEqual((state, reason), ({"seen": week + 14 * 86400, "ended": week}, "reset"))
+        state, reason = petcore.week_end(state, self.limits(10, None, 30, week + 14 * 86400), week + 8 * 86400)
+        self.assertIsNone(reason)
+        # 꺼져 있던 동안 리셋이 지나고 새 주기도 이미 다 썼다: 한 번만
+        state, reason = petcore.week_end({"seen": week, "ended": None}, self.limits(10, None, 100, week + 7 * 86400), week + 86400)
+        self.assertEqual(reason, "reset")
+        state, reason = petcore.week_end(state, self.limits(10, None, 100, week + 7 * 86400), week + 86400 + 1)
+        self.assertIsNone(reason)
+        # 사용량을 모르게 돼도 리셋 시각이 지나면 끝난다
+        state, reason = petcore.week_end({"seen": week, "ended": None}, None, week + 1)
+        self.assertEqual(reason, "reset")
+        self.assertEqual(petcore.week_end({}, None, now), ({"seen": None, "ended": None}, None))
+
+    def test_week_end_first_run_never_ends(self):
+        """옛 기록 파일로 처음 켰을 때: 지난 주기의 값만 남았거나 이미 다 쓴 주기여도 켜자마자 끝내지 않는다."""
+        now = self.NOW_S
+        state, reason = petcore.week_end({}, self.limits(10, None, 70, now - 3600), now)   # 지난 주기의 묵은 값
+        self.assertEqual((state, reason), ({"seen": now - 3600, "ended": now - 3600}, None))
+        state, reason = petcore.week_end(state, self.limits(10, None, 70, now - 3600), now + 5)
+        self.assertIsNone(reason)
+        state, reason = petcore.week_end({}, self.limits(10, None, 100, now + 3600), now)   # 이미 다 쓴 주기
+        self.assertEqual((state, reason), ({"seen": now + 3600, "ended": now + 3600}, None))
+        state, reason = petcore.week_end(state, self.limits(10, None, 100, now + 3600), now + 5)
+        self.assertIsNone(reason)
 
     def test_hp_events(self):
         self.assertEqual(petcore.hp_events(None, 72), (0, False, None))  # 처음 값은 기준만

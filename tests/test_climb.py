@@ -572,6 +572,143 @@ class CruxTest(unittest.TestCase):
             climbcore.CRUX_MISS = saved
 
 
+class WallTest(unittest.TestCase):
+    """벽의 끝 (주간 사용량): 빌레이 줄이 끊어져 화면 아래로 떨어진 뒤 새 벽 바닥 (0m) 에서 다시 시작한다."""
+
+    def finish(self, sim, seconds=15.0):
+        seen = {"cut": False, "alts": [], "track": 0.0, "times": []}
+        t = 0.0
+        while t < seconds:
+            run(sim, 0.05)
+            t += 0.05
+            seen["cut"] |= sim.rope_cut is not None
+            if sim.falling:
+                seen["times"].append(sim.t)
+                seen["alts"].append(sim.altitude())
+                seen["track"] = max(seen["track"], abs(sim.cam - sim.body.y))
+            if not sim.wall_pending and not sim.falling and sim.banner is not None:
+                break
+        return seen
+
+    def check_fall(self, seen, height):
+        alts, times = seen["alts"], seen["times"]
+        dur = times[-1] - times[0]
+        self.assertTrue(3.0 <= dur <= 7.5 if height > 15 else dur <= 3.0, dur)   # 높으면 4~7초, 낮으면 짧게
+        self.assertTrue(all(b <= a + 0.05 for a, b in zip(alts, alts[1:])))   # 높이는 줄기만 한다
+        tail = [a for a in alts if a < 11.0]   # 마지막 12m 는 떨어지는 빠르기대로 (땅이 아래에서 올라온다)
+        if len(tail) > 3:
+            steps = [(a - b) / 0.0667 for a, b in zip(tail, tail[1:-1])]
+            self.assertTrue(all(5.0 < v < 11.0 for v in steps), steps)
+        self.assertLess(alts[-1], 0.0)   # 땅까지
+        self.assertLess(seen["track"], 2.5)   # 카메라가 몸을 따라간다
+
+    def check_new_wall(self, sim, grounded=True):
+        self.assertFalse(sim.wall_pending)
+        self.assertLess(sim.shown_altitude(), 1.0)
+        self.assertLess(sim.peak, 1.0)   # 기록을 새로 센다
+        self.assertEqual((sim.passed, sim.bank), (0, 0.0))
+        self.assertIn("새 벽", sim.banner[0])
+        self.assertTrue(all(h.p.y < 20 for h in sim.holds))
+        self.assertEqual(sim.grounded, grounded)
+        if grounded:   # 땅에 주저앉아 있다
+            self.assertAlmostEqual(sim.body.y, sim.ground_y() + 1.0, delta=0.05)
+            self.assertTrue(all(l.mode == "follow" for l in sim.limbs.values()))
+        else:
+            self.assertTrue(all(l.mode == "grip" for l in sim.limbs.values()) or sim.sleeping or sim.ledge is not None)
+
+    def check_climbs_again(self, sim):
+        sim.rise()
+        run(sim, 6.0)
+        self.assertFalse(sim.grounded)
+        self.assertIn("get_up", sim.actions)
+        run(sim, 60.0)   # 새 벽을 다시 오른다
+        self.assertGreater(sim.altitude(), 5.0)
+        self.assertEqual(sim.missing, 0)
+
+    def test_rope_snaps_falls_to_the_ground_and_climbs_again_later(self):
+        sim = Climber(5)
+        sim.tokens_on, sim.work = False, 1
+        run(sim, 65.0)
+        self.assertGreater(sim.altitude(), 5.0)
+        sim.end_wall()
+        self.assertEqual(sim.snapshot()["height"], 0.0)   # 떨어지는 장면 전에 꺼져도 다음에는 새 벽
+        height = sim.altitude()
+        seen = self.finish(sim)
+        self.assertTrue(seen["cut"])
+        self.check_fall(seen, height)
+        self.assertIn("wall_end", sim.actions)
+        self.check_new_wall(sim)
+        run(sim, 30.0)   # 주간 사용량이 돌아오기 전에는 땅에서 기다린다 (일하는 펫이 있어도)
+        self.assertTrue(sim.grounded)
+        self.assertAlmostEqual(sim.body.y, sim.ground_y() + 1.0, delta=0.05)
+        for name in ("chalk", "dyno", "fall", "wake"):   # 다른 동작은 받지 않는다
+            sim.request(name)
+        self.assertEqual(sim.requests, [])
+        self.check_climbs_again(sim)
+
+    def test_waits_on_the_ground_across_restore(self):
+        sim = Climber(5)
+        sim.tokens_on, sim.work = False, 1
+        run(sim, 30.0)
+        sim.end_wall(animate=False, locked=True)   # 창이 숨어 있으면 바로 땅에
+        self.check_new_wall(sim)
+        saved = sim.snapshot()
+        self.assertTrue(saved["grounded"])
+        again = Climber(6)
+        again.tokens_on, again.work = False, 1
+        again.restore(saved)
+        self.assertTrue(again.grounded)
+        run(again, 20.0)
+        self.assertTrue(again.grounded)
+        self.assertFalse(again.has_climb())
+        self.check_climbs_again(again)
+
+    def test_wall_ends_while_sleeping_and_dozes_on_the_ground(self):
+        sim = Climber(7)
+        sim.hp = 0
+        sim.signal("exhaust")
+        run(sim, 15.0)
+        self.assertTrue(sim.sleeping)
+        sim.end_wall()
+        self.finish(sim)
+        self.check_new_wall(sim)
+        run(sim, 10.0)
+        self.assertTrue(sim.grounded and sim.lids > 0.8)   # 5시간 사용량도 다 썼으면 땅에서 존다
+        sim.rise()
+        run(sim, 20.0)
+        self.assertFalse(sim.grounded)
+        self.assertTrue(sim.sleeping)   # 일어나 벽에 붙은 뒤 포타레지에서 잔다
+
+    def test_hidden_or_without_events(self):
+        sim = Climber(3)
+        sim.tokens_on, sim.work = False, 1
+        run(sim, 30.0)
+        sim.end_wall(animate=False, locked=False)   # 숨어 있는 동안 주간 리셋: 바로 새 벽에 붙어서
+        self.check_new_wall(sim, grounded=False)
+        sim = Climber(3)
+        sim.tokens_on, sim.work, sim.events = False, 1, False
+        run(sim, 30.0)
+        height = sim.altitude()
+        sim.end_wall()
+        seen = self.finish(sim)
+        self.assertFalse(seen["cut"])   # 추락 이벤트를 끄면 줄은 안 보이고 떨어지기만
+        self.check_fall(seen, height)
+        self.check_new_wall(sim)
+
+    def test_falls_from_a_high_wall_through_the_bands(self):
+        sim = Climber(9)
+        sim.tokens_on, sim.work = False, 1
+        sim.jump(5000.0, 5000.0)
+        run(sim, 20.0)
+        height = sim.altitude()
+        sim.end_wall()
+        seen = self.finish(sim)
+        self.check_fall(seen, height)
+        self.assertGreater(seen["alts"][0], 4500)
+        self.assertTrue(any(300 < a < 2000 for a in seen["alts"]))   # 언덕 구간도 지난다
+        self.check_new_wall(sim)
+
+
 class StateFileTest(unittest.TestCase):
 
     def test_save_and_load(self):
