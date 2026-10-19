@@ -87,7 +87,8 @@ gnome-extension/claude-pet-focus@claude-pet/   펫 클릭 시 창 올리기, 메
 pets/              직접 만든 펫
 pets-downloaded/   Petdex 등에서 받은 펫 (git 제외)
 assets/defense/    팀 HP 기지 그림 (평소, GAME OVER)
-tools/             펫 만들기 도구 (docs/making-pets.md), 작업 요약 사용량 재기 gist_usage.py (docs/gist-usage.md)
+tools/             펫 만들기 도구 (docs/making-pets.md), 작업 요약 사용량 재기 gist_usage.py (docs/gist-usage.md),
+                   확인용 가짜 세션 fake_session.py 와 시험 모드 pet_test_mode.sh (아래 "확인하기")
 tests/             python3 -m unittest discover -s tests
 install.sh         설치·점검
 ```
@@ -168,6 +169,22 @@ SessionStart 와 UserPromptSubmit hook 의 출력은 모델 컨텍스트로 들�
 
 - 받기: [petdex.dev](https://petdex.dev) 에서 `pet.json` 과 `spritesheet.webp` 를 받아 `pets-downloaded/<id>/` 에 넣는다.
 - 만들기: [docs/making-pets.md](docs/making-pets.md)
+
+## 확인하기
+
+진짜 Claude 세션 없이 펫 반응을 보려면 가짜 세션과 가짜 계정 사용량을 쓴다 (hook 이 쓰는 것과 같은 상태 파일만 쓴다).
+
+```bash
+tools/pet_test_mode.sh on                 # 펫을 시험용 폴더로 다시 띄운다 (실제 세션 펫과 기록은 그대로)
+tools/fake_session.py start a             # 새 세션 (쉬는 중)
+tools/fake_session.py set a running       # 작업 중 (새 프롬프트로 친다)
+tools/fake_session.py set a done          # 다 했어요
+tools/fake_session.py usage 81 10         # 계정 사용량 5시간 81% · 주간 10%
+tools/fake_session.py clear               # 가짜 세션·사용량·기록 지우기
+tools/pet_test_mode.sh off                # 실제 상태로 돌아가기
+```
+
+시험 모드 없이 쓰면 실제 상태 폴더에 가짜 세션이 생긴다. 자세한 옵션은 각 파일 맨 위 설명을 본다.
 
 ## 끄기
 
