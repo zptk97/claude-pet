@@ -357,6 +357,21 @@ class ClimberTest(unittest.TestCase):
         self.assertTrue(sim.nap)
         self.assertGreater(sim.weather, 0.6)
 
+    def test_holds_break_only_when_climbing_onto_new_holds(self):
+        chance = climbcore.BREAK_CHANCE
+        try:
+            climbcore.BREAK_CHANCE = 1.0
+            sim = Climber(7)
+            sim.work = 1
+            run(sim, 40)      # 쌓인 높이가 없어 기다리며 초크·털기로 같은 홀드를 다시 잡는다
+            self.assertTrue(any(a.startswith("idle_") for a in sim.actions))
+            self.assertNotIn("break", sim.actions)
+            sim.deposit(1000)
+            run(sim, 20)      # 오르며 새 홀드를 잡으면 부서진다
+            self.assertIn("break", sim.actions)
+        finally:
+            climbcore.BREAK_CHANCE = chance
+
     def test_sprint_never_makes_holds(self):
         for seed in range(4):
             sim = Climber(seed)

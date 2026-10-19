@@ -79,6 +79,7 @@ FOOT_SPAN = 3.6                               # 편한 자세에서 아래쪽 �
 FOOT_HIGH = 2.6                               # 가끔 발을 높이 올릴 때
 FOOT_CEIL = 0.55                              # 발은 매달린 엉덩이보다 적어도 이만큼 아래에 둔다
 FOOT_WIDTH = 0.35                             # 발을 몸 가운데에서 옆으로 두는 거리 (엉덩이 너비 가까이)
+BREAK_CHANCE = 1 / 1000                       # 오르며 손으로 새 홀드를 잡을 때 그 홀드가 부서질 확률
 DROP_KNEE = 0.75                               # 옆으로 멀리 뻗는데 같은 쪽 발이 높으면 드롭니를 할 비율
 SWAY = 0.35                                   # 손을 떼면 몸이 남은 손 쪽으로 기우는 정도 (플래그 중이면 0.35 배)
 FACE_HOLD = 2.5                               # 길이 한쪽으로 이만큼 (초) 넘게 이어져야 몸을 돌린다
@@ -1337,7 +1338,8 @@ class Climber:
             limb.mode, limb.follow = "follow", (lambda p=end(): p)
 
     def grab(self, limb, hold):
-        if hold is not limb.hold and limb.hold is not None:
+        new = hold is not limb.hold   # 새 홀드 (초크·털기 뒤 같은 홀드를 다시 잡는 게 아니라)
+        if new and limb.hold is not None:
             limb.recent.append(limb.hold)
         limb.mode, limb.hold = "grip", hold
         limb.pos = self.grip_point(limb, hold)
@@ -1350,8 +1352,9 @@ class Climber:
             if self.wrng.random() < 0.35:
                 self.puff(limb.pos, n=2, speed=0.5, size=0.1, life=0.5)
             shared = self.other(limb).hold is hold
-            if self.events and not hold.big and not shared and self.rope is None and self.wrng.random() < 1 / 80:
-                self.requests.insert(0, ("break_hold", (limb, hold)))   # 사암 홀드가 부서진다
+            if (self.events and new and not self.resting and not hold.big and not shared and self.rope is None
+                    and self.wrng.random() < BREAK_CHANCE):
+                self.requests.insert(0, ("break_hold", (limb, hold)))   # 오르며 새로 잡은 사암 홀드가 드물게 부서진다
 
     def move_all(self, goals, dur, body_to=None, tilt_to=None, hop=0.0):
         """여러 손발 (과 몸) 을 한꺼번에 옮긴다. goals: {이름: Hold 또는 점을 돌려주는 함수}."""
