@@ -15,7 +15,7 @@ import math
 import os
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---- 몸 치수 (몸통 반지름 = 1) ----------------------------------------------
@@ -36,6 +36,9 @@ FILL_AHEAD = VIEW_TOP + 2.5  # 홀드를 미리 깔아 두는 높이 (화면 위
 
 SCENE_W = 1.8               # 창 폭 = 바위 기둥 폭의 몇 배 (양옆으로 배경과 날씨가 보인다)
 HIGH = 9500                 # 이 높이 (m) 위로는 비·눈이 없고 흐리지도 않다 (구름바다 위)
+SEOUL = (37.57, 126.98)     # 해 뜨고 지는 시각을 셀 곳 (위도, 경도)
+KST = timezone(timedelta(hours=9))   # 서울 시각
+DUSK = 0.5                  # 해가 지기 이만큼 (시간) 전부터 진 뒤 이만큼까지 어두워진다 (뜰 때는 거꾸로 밝아진다)
 BANDS = [(0, "city"), (300, "hills"), (2000, "mountains"), (9500, "clouds"), (12000, "strato"), (100000, "space")]
 MILESTONES = [  # (높이 m, 짧은 이름, 넘을 때 말풍선)
     (30, "아파트 10층", "아파트 10층(30m)보다 높아요!"),
@@ -126,6 +129,35 @@ def fmt_alt(m):
 def smooth(k):
     """천천히 출발해 천천히 멈춘다 (smootherstep)."""
     return k * k * k * (k * (6 * k - 15) + 10)
+
+
+def sun_times(day, tz=9.0, lat=SEOUL[0], lon=SEOUL[1]):
+    """그날 해 뜨는·지는 시각 (그날 0시부터 시간, UTC+tz 시각). NOAA 간이식이라 몇 분 안쪽으로 맞는다."""
+    g = 2 * math.pi / 365 * (day.timetuple().tm_yday - 1)
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
+                       - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+    decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g) - 0.006758 * math.cos(2 * g)
+            + 0.000907 * math.sin(2 * g) - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g))
+    phi = math.radians(lat)
+    c = math.cos(math.radians(90.833)) / (math.cos(phi) * math.cos(decl)) - math.tan(phi) * math.tan(decl)
+    half = math.degrees(math.acos(max(-1.0, min(1.0, c)))) * 4   # 해가 떠 있는 시간의 절반 (분)
+    noon = 720 - 4 * lon - eqtime   # 남중 (UTC, 분)
+    return (noon - half) / 60 + tz, (noon + half) / 60 + tz
+
+
+def night_level(when=None):
+    """밤 정도 (0 낮 ~ 1 밤). 서울 기준으로 해가 지기 DUSK 시간 전부터 진 뒤 DUSK 시간까지 어두워지고, 뜰 때는
+    거꾸로 밝아진다. when 은 datetime (한국 시각으로 바꿔 본다. 시간대가 없으면 한국 시각), 없으면 지금."""
+    if when is None:
+        when = datetime.now(KST)
+    elif when.tzinfo is not None:
+        when = when.astimezone(KST)
+    rise, sset = sun_times(when.date())
+    h = when.hour + when.minute / 60 + when.second / 3600
+
+    def ramp(start):
+        return smooth(max(0.0, min(1.0, (h - start) / (2 * DUSK))))
+    return 1.0 - ramp(rise - DUSK) * (1.0 - ramp(sset - DUSK))
 
 
 def edge_x(y, side):
@@ -479,6 +511,8 @@ class Climber:
         self.face_want, self.face_since = None, 0.0   # 돌아보려는 쪽과 그렇게 된 때
         self.look_at = None         # 보고 있는 곳 (다음 홀드)
         self.look_tilt = 0.0        # 보는 쪽으로 몸통 그림을 기울인 정도 (그림만)
+        self.night = 0.0            # 밤 정도 (0 낮 ~ 1 밤, 창이 시계를 보고 정한다. night_level)
+        self.lamp = None            # 헤드램프가 비추는 곳 (밤에 깨어 있을 때만, 보는 곳을 부드럽게 따라간다)
         self.relaxed = 0            # 조건을 풀어서 고른 횟수
         self.far_reaches = 0        # 같은 손발을 또 옮기지 않으려고 한 번에 멀리 간 횟수
         self.burst_left = 4         # 둘러보며 쉬기 전에 이어서 할 손발 동작 수 (보통 빠르기)
@@ -1052,6 +1086,11 @@ class Climber:
         else:
             look = 0.0
         self.look_tilt += (look - self.look_tilt) * (1 - math.exp(-8 * dt))
+        if self.night > 0.05 and not self.sleeping:   # 헤드램프: 보는 곳 (없으면 앞 위쪽) 을 부드럽게 따라 비춘다
+            aim = self.look_at if self.look_at is not None else self.body + V(-self.face * 0.9, 1.4)
+            self.lamp = aim if self.lamp is None else self.lamp + (aim - self.lamp) * (1 - math.exp(-6 * dt))
+        else:
+            self.lamp = None
         step = 7.0 * dt
         self.face_now = max(self.face_now - step, self.face) if self.face < self.face_now else min(self.face_now + step, self.face)
         self.hp_shown += max(-60 * dt, min(45 * dt, self.hp - self.hp_shown))

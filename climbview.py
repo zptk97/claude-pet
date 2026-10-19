@@ -3,23 +3,26 @@
 그림은 assets/climb/ (바위 rock.jpg, 높이 구간별 배경 bg/*.jpg) 과 내 아바타 avatar/body.png + avatar.json
 (개인 캐릭터라 git 에 넣지 않는다, tools/avatar_prep.py 로 만든다. 없으면 회색 공을 그린다).
 창 폭은 바위 기둥의 SCENE_W 배라 양옆으로 배경과 날씨가 보이고, 클릭은 바위 기둥과 높이 상자에서만 받는다
-(X11 입력 모양, 양옆은 아래 창으로 지나간다). 늘 60fps 로 그리고 숨기면 멈춘다 (계산도 멈춘다). 왼쪽 버튼으로 끌면
+(X11 입력 모양, 양옆은 아래 창으로 지나간다). 늘 60fps 로 그리고 숨기면 멈춘다 (계산도 멈춘다). 밤 (서울 해 지는
+시각, climbcore.night_level) 에는 하늘·바위·아바타를 어둡게 하고 별을 띄우고, 아바타가 헤드램프로 다음 홀드 쪽을 비춘다. 왼쪽 버튼으로 끌면
 펫처럼 줄 전체를 옮긴다. 바위 층은 바뀔 때만 다시 그리고, 카메라가 멈춰 있고 비·눈이 없으면 아바타 둘레와
 높이 상자만 다시 그린다 (창 관리자가 다시 합성할 넓이도 줄어든다).
 """
 import json
 import math
+import os
 import random
 import time
+from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QLineF, QPointF, QRect, QRectF, Qt, QTimer
+from PyQt5.QtCore import QLineF, QPoint, QPointF, QRect, QRectF, Qt, QTimer
 from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
-                         QPixmap, QPolygonF, QRegion)
+                         QPixmap, QPolygonF, QRadialGradient, QRegion, QTransform)
 from PyQt5.QtWidgets import QWidget
 
-from climbcore import (ARM, BANDS, LEG, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF, edge_x,
-                       fmt_alt, smooth, two_bone)
+from climbcore import (ARM, BANDS, KST, LEG, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF, edge_x,
+                       fmt_alt, night_level, smooth, two_bone)
 
 APP_DIR = Path(__file__).resolve().parent
 ASSET_DIR = APP_DIR / "assets" / "climb"
@@ -27,6 +30,23 @@ AVATAR_DIR = APP_DIR / "avatar"   # 내 아바타 (git 제외): body.png (투명
 UNIT_PX = 50                      # 몸통 반지름 (px, 펫 크기 배율을 곱한다: 보통이면 25 → 창 높이 300)
 FRAME_MS = 16                     # 늘 60fps (쉬거나 잘 때 낮추면 비·눈이 끊겨 보인다)
 STEP_MAX = 0.05                   # 계산 한 번에 넘기는 시간 (초). 프레임이 길면 나눠서 넘긴다
+NIGHT_EVERY = 5.0                 # 시계를 보고 밤 정도를 다시 정하는 간격 (초)
+NIGHT_TINT = (8, 12, 30)          # 밤에 덮는 색 (하늘·바위·아바타)
+LAMP = (-0.40, -0.70)             # 헤드램프 자리 (몸통 공 중심에서, 반지름 단위, 그림 좌표: 왼쪽 위가 -)
+LAMP_POOL = 1.3                   # 헤드램프가 벽을 비추는 웅덩이 반지름 (m)
+
+
+def clock_night():
+    """지금 밤 정도 (night_level). CLAUDE_PET_HOUR (0~24, 소수 가능) 가 있으면 오늘 그 시각으로 본다 (밤 화면 미리 보기)."""
+    now = datetime.now(KST)
+    try:
+        hour = float(os.environ.get("CLAUDE_PET_HOUR", ""))
+    except ValueError:
+        return night_level(now)
+    if not 0 <= hour < 24:   # 숫자가 아니거나 (nan) 0~24 밖이면 지금 시각
+        return night_level(now)
+    minutes = int(hour * 60)
+    return night_level(now.replace(hour=minutes // 60, minute=minutes % 60, second=0))
 
 
 def load_avatar():
@@ -88,6 +108,9 @@ class Look:
         self.small.setPixelSize(max(10, round(9 + 8 * scale)))
         self.small.setBold(True)
         self.layer = QImage(self.W, self.wall_h, QImage.Format_ARGB32_Premultiplied)
+        self.lit = None             # 밤에 바위를 어둡게 하기 전 바위 층 (헤드램프가 비추는 곳에 붙인다)
+        self.light = self.light_key = None   # 헤드램프 빛 웅덩이 그림과 그린 상태
+        self.actors = QImage(self.W, self.wall_h, QImage.Format_ARGB32_Premultiplied)   # 밤에 아바타를 어둡게 할 때 먼저 그리는 곳
         self.clip = None
         # 높이 구간별 배경 (창 폭에 맞춰 키우고, 남는 위아래는 오를수록 천천히 가라앉는 데 쓴다)
         self.backs = {}
@@ -144,7 +167,17 @@ class Look:
             ledge = sim.ledge
             region = region.united(QRegion(box([ledge.anchor + V(0, 0.4), ledge.bed + V(-1.5, -1.2),
                                                 ledge.bed + V(1.5, 1.2)], 0.3 * R)))
+        for rock in sim.rocks:   # 떨어지는 돌 (돌이 있으면 창 전체를 다시 그리지만, 밤에 아바타 둘레만 어둡게 그릴 때 쓴다)
+            region = region.united(QRegion(box([rock[0]], rock[4] * 1.1 * R + 2)))
+        if sim.lamp is not None and self.night_amount(sim) > 0.01:   # 헤드램프 빛 (몸에서 비추는 곳까지, 웅덩이만큼)
+            region = region.united(QRegion(box([sim.body, sim.lamp], (LAMP_POOL + 0.1) * R)))
         return region
+
+    def night_amount(self, sim):
+        """밤에 어둡게 할 정도 (0~1). 우주는 원래 어두워서 덜 어둡게 한다."""
+        if sim.night <= 0.01:
+            return 0.0
+        return sim.night * (1.0 if sim.altitude() < 100000 else 0.6)
 
     def view_cam(self, sim):
         """그릴 때 쓰는 카메라: 정수 픽셀에 맞춘다. Qt 는 그림 (바위 무늬·홀드·배경) 을 옮겨 붙일 때 자리를 정수로
@@ -168,10 +201,10 @@ class Look:
         ledge = (sim.ledge.anchor.x, sim.ledge.anchor.y) if sim.ledge is not None else None
         snow = round(sim.precip() * 60) if sim.weather_kind == "snow" else 0
         return (round(cam * self.R), round(k * 4000), round(sim.gloom() * 60), snow, holds, bolts, ledge,
-                round(sim.t * 30) if moving else 0)
+                round(sim.t * 30) if moving else 0, round(self.night_amount(sim) * 60))
 
     def paint(self, painter, sim):
-        R, cam = self.R, self.view_cam(sim)
+        cam = self.view_cam(sim)
         key = self.layer_key(sim)
         if key != self.layer_drawn:
             self.layer_drawn = key
@@ -180,9 +213,43 @@ class Look:
         painter.drawImage(0, 0, self.layer)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        night = self.night_amount(sim)
+        if night > 0.01:   # 밤: 헤드램프가 비추는 벽, 어둡게 한 아바타, 램프 빛
+            lamp = sim.lamp is not None
+            if lamp:
+                self.paint_light(painter, sim, cam, night)
+            area = self.actor_region(sim).boundingRect()   # 아바타 둘레만 비우고 어둡게 해서 붙인다
+            if area.isEmpty():   # 빈 사각형을 drawImage 에 주면 그림 전체를 붙인다
+                area = QRect(0, 0, self.W, self.H)
+            image = self.actors
+            ap = QPainter(image)
+            ap.setCompositionMode(QPainter.CompositionMode_Source)
+            ap.fillRect(area, Qt.transparent)
+            ap.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            ap.setClipRect(area)
+            ap.setRenderHint(QPainter.Antialiasing)
+            ap.setRenderHint(QPainter.SmoothPixmapTransform)
+            self.paint_actors(ap, sim, cam, night)
+            ap.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+            ap.fillRect(area, QColor(*NIGHT_TINT, round(130 * night)))
+            ap.end()
+            painter.drawImage(area.topLeft(), image, area)
+            if lamp:
+                self.paint_beam(painter, sim, cam, night)
+        else:
+            self.paint_actors(painter, sim, cam, 0.0)
+        for f in sim.texts:
+            self.paint_float(painter, f, cam)
+        self.paint_weather(painter, sim)
+        self.paint_altitude(painter, sim)
+        painter.restore()
+
+    def paint_actors(self, painter, sim, cam, night):
+        """벽 위에서 움직이는 것: 포타레지, 아바타, 가루·땀·색종이, 로프, 떨어지는 돌."""
+        R = self.R
         if sim.ledge is not None:
             self.paint_ledge(painter, sim, cam, front=False)
-        self.paint_climber(painter, sim, cam)
+        self.paint_climber(painter, sim, cam, night)
         if sim.ledge is not None:
             self.paint_ledge(painter, sim, cam, front=True)
         for p in sim.particles:
@@ -209,11 +276,64 @@ class Look:
             self.paint_rope(painter, sim, cam)
         for rock in sim.rocks:
             self.paint_rock(painter, rock, cam)
-        for f in sim.texts:
-            self.paint_float(painter, f, cam)
-        self.paint_weather(painter, sim)
-        self.paint_altitude(painter, sim)
-        painter.restore()
+
+    def paint_light(self, p, sim, cam, night):
+        """헤드램프가 비추는 벽: 어둡게 하기 전 바위 층 (self.lit) 을 가운데가 밝고 가장자리로 흐려지게 붙인다
+        (빛 안의 홀드가 낮처럼 보인다). 바위 밖 하늘은 비추지 않는다."""
+        if self.lit is None or self.clip is None:
+            return
+        c = self.to_screen(sim.lamp, cam)
+        r = LAMP_POOL * self.R
+        rect = QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r).toAlignedRect().intersected(QRect(0, 0, self.W, self.H))
+        if rect.isEmpty():
+            return
+        key = (rect.getRect(), round(c.x()), round(c.y()), round(night * 60), self.layer_drawn)
+        if key != self.light_key:   # 바위 층과 비추는 곳이 그대로면 (쉬는 동안) 그려 둔 것을 쓴다
+            self.light_key = key
+            spot = self.light = QImage(rect.size(), QImage.Format_ARGB32_Premultiplied)
+            spot.fill(Qt.transparent)
+            sp = QPainter(spot)
+            sp.drawImage(QPoint(0, 0), self.lit, rect)
+            sp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+            g = QRadialGradient(c - QPointF(rect.topLeft()), r)
+            g.setColorAt(0.0, QColor(0, 0, 0, round(235 * night)))
+            g.setColorAt(0.55, QColor(0, 0, 0, round(150 * night)))
+            g.setColorAt(1.0, QColor(0, 0, 0, 0))
+            sp.fillRect(QRectF(0, 0, rect.width(), rect.height()), QBrush(g))
+            sp.end()
+        p.save()
+        p.setClipPath(self.clip)
+        p.drawImage(rect.topLeft(), self.light)
+        warm = QRadialGradient(c, r)   # 램프 빛 색 (따뜻한 흰빛)
+        warm.setColorAt(0.0, QColor(255, 226, 160, round(45 * night)))
+        warm.setColorAt(1.0, QColor(255, 226, 160, 0))
+        p.fillRect(QRectF(rect), QBrush(warm))
+        p.restore()
+
+    def paint_beam(self, p, sim, cam, night):
+        """램프 렌즈의 빛과 비추는 곳까지 옅은 빛줄기 (어둡게 한 아바타 위에 그린다)."""
+        R = self.R
+        lamp = self.body_transform(sim, cam).map(QPointF(LAMP[0] * R, LAMP[1] * R))
+        c = self.to_screen(sim.lamp, cam)
+        d = c - lamp
+        length = math.hypot(d.x(), d.y())
+        p.save()
+        p.setPen(Qt.NoPen)
+        if length > 1:
+            n = QPointF(-d.y() / length, d.x() / length)
+            w = LAMP_POOL * R * 0.7
+            g = QLinearGradient(lamp, c)
+            g.setColorAt(0.0, QColor(255, 240, 200, round(70 * night)))
+            g.setColorAt(1.0, QColor(255, 240, 200, 0))
+            p.setBrush(QBrush(g))
+            p.drawPolygon(QPolygonF([lamp + n * (R * 0.05), c + n * w, c - n * w, lamp - n * (R * 0.05)]))
+        glow = QRadialGradient(lamp, R * 0.3)
+        glow.setColorAt(0.0, QColor(255, 250, 228, round(255 * night)))
+        glow.setColorAt(0.35, QColor(255, 236, 170, round(190 * night)))
+        glow.setColorAt(1.0, QColor(255, 220, 140, 0))
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(lamp, R * 0.3, R * 0.3)
+        p.restore()
 
     def paint_layer(self, sim):
         """바위 층: 높이에 맞는 배경, 울퉁불퉁한 바위 기둥 (위아래는 흐려진다), 홀드·볼트·포타레지 앵커, 흐림."""
@@ -262,6 +382,14 @@ class Look:
             for bolt in sim.bolts:
                 if bottom_y - 1 < bolt.p.y < top_y + 1:
                     self.paint_bolt(lp, bolt, cam)
+        night = self.night_amount(sim)
+        if night > 0.01:   # 밤: 헤드램프가 비출 밝은 바위를 남겨 두고, 바위도 어둡게 (하늘보다 덜, 홀드가 보이게)
+            lp.end()
+            self.lit = layer.copy()
+            lp = QPainter(layer)
+            lp.setRenderHint(QPainter.Antialiasing)
+            lp.setClipPath(clip)
+            lp.fillRect(QRectF(0, 0, W, H), QColor(*NIGHT_TINT, round(180 * night)))
         lp.setClipping(False)
         self.forget_holds(sim.holds)
         gloom = sim.gloom()
@@ -302,19 +430,28 @@ class Look:
         draw(BANDS[i][1], k, 1.0)
         if i + 1 < len(BANDS) and k > 0.95:   # 구간 끝 5% 에서 다음 구간으로
             draw(BANDS[i + 1][1], 0.0, (k - 0.95) / 0.05)
-        stars = 0.0 if alt < 12000 else 0.5 if alt < 100000 else 1.0
-        if stars:   # 별 반짝임
+        night = self.night_amount(sim)
+        if night > 0.01:   # 밤: 하늘과 풍경을 어둡게
+            p.fillRect(QRectF(0, 0, W, H), QColor(*NIGHT_TINT, round(205 * night)))
+        level = 0.0 if alt < 12000 else 0.5 if alt < 100000 else 1.0
+        stars = max(level, night)
+        if stars:   # 별 (늘 보이는 높이에서는 반짝이고 층을 매번 그린다. 밤에만 보이는 별은 가만히 있다)
             p.setPen(QColor(0, 0, 0, 0))
             for x, y, size, phase in self.stars:
-                a = stars * (0.5 + 0.5 * math.sin(sim.t * 2.2 + phase))
+                if not level and y > 0.4:
+                    continue   # 밤에만 보이는 별은 하늘 위쪽에만 (건물·산에 겹치지 않게)
+                a = stars * (0.5 + 0.5 * math.sin((sim.t * 2.2 if level else 0.0) + phase))
                 p.setBrush(QColor(255, 255, 240, round(220 * a)))
                 r = max(0.8, self.R * 0.035 * size)
                 p.drawEllipse(QPointF(x * W, y * H), r, r)
         name = BANDS[i][1]
+        if night > 0.01:
+            p.setOpacity(1.0 - 0.7 * night)   # 밤에는 지나가는 것도 어둡게
         if name == "clouds":   # 지나가는 여객기
             self.paint_plane(p, ((sim.t / 22.0) % 1.4 - 0.2) * W, H * 0.28)
         if name == "space" and 150000 < alt < 2000000:   # 지나가는 국제우주정거장
             self.paint_iss(p, ((sim.t / 30.0) % 1.4 - 0.2) * W, H * 0.22)
+        p.setOpacity(1.0)
 
     def paint_plane(self, p, x, y):
         s = self.R * 0.22
@@ -630,7 +767,26 @@ class Look:
             painter.setOpacity(1.0)
         painter.restore()
 
-    def paint_climber(self, p, sim, cam):
+    def body_pose(self, sim):
+        """몸통 그림의 (세로 배율: 숨쉬기·찌그러짐, 가로 방향: 돌아보기)."""
+        tired = sim.hp <= 30 and not sim.sleeping
+        period = 4.0 if sim.sleeping else 1.2 if tired else 2.6
+        depth = 0.035 if sim.sleeping else 0.04 if tired else 0.018
+        sy = sim.squash * (1 + depth * math.sin(sim.t * 2 * math.pi / period))
+        fx = sim.face_now if abs(sim.face_now) > 0.12 else math.copysign(0.12, sim.face_now or 1)
+        return sy, fx
+
+    def body_transform(self, sim, cam):
+        """몸통 그림 좌표 (공 중심 원점, px) → 창 좌표. paint_climber 의 몸통과 같은 순서로 옮기고 돌리고 늘인다."""
+        sy, fx = self.body_pose(sim)
+        bpt = self.to_screen(sim.body, cam)
+        t = QTransform()
+        t.translate(bpt.x(), bpt.y())
+        t.rotate(-math.degrees(sim.tilt + sim.look_tilt))
+        t.scale(fx / math.sqrt(sy), sy)
+        return t
+
+    def paint_climber(self, p, sim, cam, night=0.0):
         R = self.R
         tilt = sim.tilt
         body = sim.body
@@ -681,16 +837,26 @@ class Look:
                 toe = tip + V(limb.side * 0.24, -0.04)
                 p.drawLine(pts[2], self.to_screen(toe, cam))
         # 몸통 (숨쉬기·찌그러짐·돌아보기)
-        tired = sim.hp <= 30 and not sim.sleeping
-        period = 4.0 if sim.sleeping else 1.2 if tired else 2.6
-        depth = 0.035 if sim.sleeping else 0.04 if tired else 0.018
-        sy = sim.squash * (1 + depth * math.sin(sim.t * 2 * math.pi / period))
-        fx = sim.face_now if abs(sim.face_now) > 0.12 else math.copysign(0.12, sim.face_now or 1)
+        sy, fx = self.body_pose(sim)
         p.save()
         p.translate(bpt)
         p.rotate(-math.degrees(tilt + sim.look_tilt))
         p.scale(fx / math.sqrt(sy), sy)
         p.drawPixmap(QPointF(-self.anchor[0], -self.anchor[1]), self.body)
+        if night > 0.01:   # 헤드램프 띠와 몸통 (빛은 아바타를 어둡게 한 뒤 paint_beam 이 그린다)
+            strap = QPen(QColor(40, 44, 52), max(1.5, R * 0.1))
+            strap.setCapStyle(Qt.FlatCap)
+            band = QPainterPath(QPointF(-0.9 * R, -0.42 * R))
+            band.quadTo(QPointF(-0.45 * R, -0.82 * R), QPointF(0.35 * R, -0.93 * R))
+            p.setPen(strap)
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(band)
+            lx, ly = LAMP[0] * R, LAMP[1] * R
+            p.setPen(QPen(QColor(25, 25, 30), max(1.0, R * 0.04)))
+            p.setBrush(QColor(70, 74, 84))
+            p.drawRoundedRect(QRectF(lx - 0.15 * R, ly - 0.11 * R, 0.3 * R, 0.22 * R), 0.05 * R, 0.05 * R)
+            p.setBrush(QColor(255, 244, 200) if sim.lamp is not None else QColor(110, 110, 104))
+            p.drawEllipse(QPointF(lx, ly), 0.075 * R, 0.075 * R)
         closure = sim.closure()
         if closure > 0.03:   # 눈꺼풀
             for ex, ey, rx, ry, color in self.eyes:
@@ -736,6 +902,7 @@ class ClimbWindow(QWidget):
         self.actor = None           # 지난번에 다시 그린 아바타 둘레 (None 이면 창 전체를 그렸다)
         self.timer = QTimer(self, timeout=self.tick)
         self.timer.setTimerType(Qt.PreciseTimer)   # 프레임 간격을 고르게 (기본 타이머는 5% 까지 어긋난다)
+        self.night_t = 0.0          # 다음에 시계를 보고 밤 정도를 정할 때 (monotonic)
 
     def set_scale(self, scale):
         """펫 크기 배율에 맞춰 그림을 다시 만든다. 바뀌었으면 True (줄을 다시 세워야 한다)."""
@@ -763,6 +930,8 @@ class ClimbWindow(QWidget):
             self.shape = None       # 창을 다시 보이면 클릭 영역을 다시 건다
         if not self.timer.isActive():
             self.last = time.monotonic()
+            self.night_t = self.last + NIGHT_EVERY
+            self.sim.night = clock_night()   # 첫 프레임부터 지금 시각의 밤 정도로 (숨어 있는 동안 해가 졌을 수 있다)
             self.timer.start(FRAME_MS)
         self.update_shape()
         self.update()
@@ -796,6 +965,9 @@ class ClimbWindow(QWidget):
         now = time.monotonic()
         dt = min(0.5, now - (self.last or now))   # 멈춰 있다 돌아오면 (메뉴 등) 한꺼번에 넘기지 않는다
         self.last = now
+        if now >= self.night_t:
+            self.night_t = now + NIGHT_EVERY
+            self.sim.night = clock_night()
         steps = math.ceil(dt / STEP_MAX)   # 고르게 나눈다 (아주 짧은 조각이 남으면 몸이 튄다)
         for _ in range(steps):
             self.sim.update(dt / steps)

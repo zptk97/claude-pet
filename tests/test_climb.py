@@ -3,6 +3,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -401,6 +402,65 @@ class SignalTest(unittest.TestCase):
     def test_working_count_includes_background(self):
         states = {"a": "running", "b": "background", "c": "waiting", "d": "idle", "e": "done"}
         self.assertEqual(climbcore.working_count(states), 2)
+
+
+class NightTest(unittest.TestCase):
+    """서울 해 뜨고 지는 시각, 밤 정도, 헤드램프."""
+
+    def test_sun_times_seoul(self):
+        for day, rise, sset in ((date(2026, 6, 21), 5 + 11 / 60, 19 + 57 / 60),
+                                (date(2026, 12, 21), 7 + 43 / 60, 17 + 17 / 60)):
+            r, s = climbcore.sun_times(day)
+            self.assertAlmostEqual(r, rise, delta=5 / 60)
+            self.assertAlmostEqual(s, sset, delta=5 / 60)
+
+    def test_night_level(self):
+        level = climbcore.night_level
+        self.assertEqual(level(datetime(2026, 6, 21, 13, 0)), 0.0)
+        self.assertEqual(level(datetime(2026, 6, 21, 23, 0)), 1.0)
+        self.assertEqual(level(datetime(2026, 6, 21, 3, 0)), 1.0)
+        self.assertEqual(level(datetime(2026, 6, 21, 18, 0)), 0.0)    # 여름 18시는 아직 낮
+        self.assertEqual(level(datetime(2026, 12, 21, 18, 0)), 1.0)   # 겨울 18시는 밤
+        evening = [level(datetime(2026, 10, 19, h, m)) for h in (17, 18) for m in range(0, 60, 5)]
+        self.assertEqual(evening, sorted(evening))   # 해 질 무렵 천천히 어두워진다
+        self.assertTrue(any(0.1 < v < 0.9 for v in evening))
+        morning = [level(datetime(2026, 10, 19, h, m)) for h in (6, 7) for m in range(0, 60, 5)]
+        self.assertEqual(morning, sorted(morning, reverse=True))
+        for utc_hour, want in ((14, 1.0), (4, 0.0), (22, 0.0)):   # 시간대가 다른 시각은 서울 시각으로 바꿔 본다
+            self.assertEqual(level(datetime(2026, 6, 21, utc_hour, tzinfo=timezone.utc)), want)
+
+    def test_lamp_follows_next_hold_and_sleeps(self):
+        sim = Climber(3)
+        sim.tokens_on, sim.work = False, 1
+        run(sim, 2.0)
+        self.assertIsNone(sim.lamp)
+        sim.night = 1.0
+        near = 0
+        for _ in range(60):   # 오르는 동안 다음 홀드 (보는 곳) 를 따라 비춘다
+            run(sim, 0.1)
+            self.assertIsNotNone(sim.lamp)
+            if sim.look_at is not None and (sim.lamp - sim.look_at).len() < 0.3:
+                near += 1
+        self.assertGreater(near, 5)
+        sim.hp = 0
+        sim.signal("exhaust")
+        run(sim, 12.0)
+        self.assertTrue(sim.sleeping)
+        self.assertIsNone(sim.lamp)
+        sim.hp = 100
+        sim.signal("wake")
+        run(sim, 3.0)
+        self.assertFalse(sim.sleeping)
+        self.assertIsNotNone(sim.lamp)
+
+    def test_night_does_not_change_climbing(self):
+        ends = []
+        for night in (0.0, 1.0):
+            sim = Climber(11)
+            sim.tokens_on, sim.work, sim.night = False, 1, night
+            run(sim, 60.0)
+            ends.append((round(sim.body.x, 6), round(sim.body.y, 6), list(sim.moves), list(sim.actions)))
+        self.assertEqual(ends[0], ends[1])
 
 
 class StateFileTest(unittest.TestCase):
