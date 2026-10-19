@@ -67,6 +67,7 @@ PACE_NAME = {1: "보통", 2: "빠름", 3: "전력 질주"}
 M_PER_TOKEN = 2 / 1000                        # 출력 토큰 1,000개 = 2m
 PACE_BANK = (8.0, 30.0)                       # 쌓인 높이 (m) 가 이만큼 넘으면 빠름, 전력 질주
 DYNO_MIX = {2: 0.06, 3: 0.18}                 # 빠름·전력 질주에서 손발 동작 대신 다이노를 할 비율
+LEFTOVER_WAIT = 20.0                          # 1m 가 안 되게 남은 오를 높이는 토큰이 이만큼 (초) 안 들어오면 마저 오른다
 COOLDOWN = {"dyno": 8.0, "chalk": 15.0}      # 잦은 신호는 이 간격 (초) 안이면 버린다 (일 끝냄 → 다이노, 사용량 → 초크)
 SHAKE_EVERY = (40.0, 80.0)                    # 체력 60% 이하면 오르다가 이 간격으로 팔을 턴다
 WORKING = ("running", "background")          # 일하는 펫으로 치는 상태 (날씨)
@@ -449,6 +450,7 @@ class Climber:
         self.bank = 0.0             # 쌓인 오를 높이 (m). 몸이 가장 높이 올라간 자리를 넘을 때마다 줄어든다
         self.tokens = 0             # 받은 토큰 합 (검사용)
         self.token_buf, self.token_float_t = 0, -1.0   # 아직 글자로 띄우지 않은 토큰
+        self.deposit_t = 0.0        # 마지막으로 토큰을 받은 때
         self.resting = False
         self.charging = True        # 몸이 가장 높은 자리를 넘으면 쌓인 높이를 쓴다 (일 끝냄 다이노는 덤이라 안 쓴다)
         self.k_now = 1.0            # 지금 동작의 시간 배율 (빠를수록 몸도 또렷하게 따라간다)
@@ -459,6 +461,7 @@ class Climber:
         self.look_at = None         # 보고 있는 곳 (다음 홀드)
         self.look_tilt = 0.0        # 보는 쪽으로 몸통 그림을 기울인 정도 (그림만)
         self.relaxed = 0            # 조건을 풀어서 고른 횟수
+        self.far_reaches = 0        # 같은 손발을 또 옮기지 않으려고 한 번에 멀리 간 횟수
         self.stall = 0              # 제자리 (손발 높이 합이 안 오름) 로 이어진 손발 동작 수
         self.best_top = -1e9        # 손발 높이 합의 최고 기록
         self.moves, self.grabs, self.actions = [], [], []
@@ -513,6 +516,7 @@ class Climber:
         self.tokens += tokens
         self.bank += tokens * M_PER_TOKEN
         self.token_buf += tokens
+        self.deposit_t = self.t
 
     def has_climb(self):
         """더 오를지. 토큰으로 오를 때는 쌓인 높이가 남았거나 추락해서 다시 올라야 할 때, 아니면 일하는 펫이 있을 때."""
@@ -520,11 +524,26 @@ class Climber:
             return self.bank > 0.05 or self.body.y < self.top_y - 1.5   # 쉬는 자세로 낮춘 몸 (약 0.9m) 은 추락으로 치지 않는다
         return self.work > 0
 
-    def climb_ready(self, waited=0.0):
-        """쉬다가 다시 오를지. 토큰은 1m 넘게 쌓였거나, 조금이라도 6초 넘게 기다렸으면 (한 동작만 하고 또 쉬지 않게)."""
+    def climb_ready(self):
+        """쉬다가 다시 오를지. 토큰은 1m 넘게 모였거나 (조금씩 들어올 때 한 동작만 하고 또 쉬지 않게 모아서 오른다),
+        1m 가 안 되게 남았는데 토큰이 LEFTOVER_WAIT 초 동안 더 안 들어왔으면 남은 것을 마저 오른다."""
         if self.tokens_on:
-            return self.bank >= 0.99 or (self.bank > 0.05 and waited >= 6.0) or self.body.y < self.top_y - 1.5
+            return (self.bank >= 0.99 or (self.bank > 0.05 and self.t - self.deposit_t >= LEFTOVER_WAIT)
+                    or self.body.y < self.top_y - 1.5)
         return self.work > 0
+
+    def state_label(self):
+        """높이 상자에 보이는 지금 상태: 잠, 쉬는 자세면 기다림 (일하는 펫 있음)·쉼, 오르는 중이면 빠르기."""
+        if self.sleeping:
+            return "잠"
+        if self.resting:
+            return "기다림" if self.work > 0 else "쉼"
+        return PACE_NAME[max(1, self.pace)]
+
+    def shown_altitude(self):
+        """높이 상자에 보이는 높이: 이번 길에서 가장 높이 올라간 자리 (일어섰다 앉을 때마다 숫자가 오르내리지 않게).
+        1.5m 넘게 떨어졌으면 (추락) 지금 높이."""
+        return self.alt0 + self.top_y if self.body.y >= self.top_y - 1.5 else self.altitude()
 
     def reroll_weather(self, other=False):
         """비·눈을 다시 뽑는다 (other 면 지금과 다른 쪽으로)."""
@@ -647,9 +666,13 @@ class Climber:
         return hold.grip(limb.kind, side)
 
     def hand_options(self, limb, relax=0, up_only=False):
-        """손이 갈 만한 홀드들 (점수, id, 홀드). relax 면 조건을 풀어 옆으로 고쳐 잡기까지 넣는다."""
+        """손이 갈 만한 홀드들 (점수, id, 홀드). relax 면 조건을 풀어 옆으로 고쳐 잡기까지 넣는다.
+        지금 발로 몸을 세울 수 있는 데까지 세워도 팔 97% 안에 닿지 않는 홀드는 뺀다 (손과 발 사이가 너무 벌어져
+        팔이 늘어난 채 매달리지 않게. 조건을 다 푼 relax 2 는 막히지 않게 뺀지 않는다)."""
         other = self.other(limb)
         shoulder = limb.root(self.body, self.tilt) + V(0, 0.25)   # 손을 뻗는 동안 몸도 따라 올라온다
+        top = self.feet_top() if relax < 2 else None
+        stand = limb.root(V(self.body.x, top), self.tilt) if top is not None else None
         my_y, other_y = self.held_y(limb), self.held_y(other)
         out = []
         for h in self.holds:
@@ -663,6 +686,8 @@ class Climber:
             if limb.side * (h.p.x - other.pos.x) < -0.25 - 0.25 * relax:   # 팔을 크게 엇갈리지 않는다
                 continue
             if (h.grip("H") - shoulder).len() > limb.reach * 0.97 + 0.15 + 0.2 * relax:
+                continue
+            if stand is not None and (h.grip("H") - stand).len() > limb.reach * 0.97:
                 continue
             c = self.route.center(h.p.y)
             score = -abs(gain - 0.75) * 1.4 - abs(h.p.x - (c + limb.side * 0.6)) * 0.7 + self.rng.uniform(0, 0.6)
@@ -731,12 +756,15 @@ class Climber:
             order = [self.rng.choice(feet), hands[0], hands[1]]     # 발 고쳐 딛기
         else:
             order = [hands[0], hands[1], feet[0], feet[1]]
+        last = self.limbs.get(self.moves[-1]) if self.moves else None
+        if last in order:   # 방금 옮긴 손발은 맨 뒤로 (다른 손발에 갈 데가 있으면 그쪽이 먼저)
+            order = [l for l in order if l is not last] + [last]
         for relax in (0, 1, 2):   # 맞는 데가 없으면 조건을 풀어 고쳐 잡기·고쳐 딛기, 그래도 없으면 멀리 뻗어 몸을 당겨 올리기
             for limb in (order if relax == 0 else order + [l for l in hands + feet if l not in order]):
                 options = self.hand_options(limb, relax) if limb.kind == "H" else self.foot_options(limb, relax)
                 if options:
                     self.relaxed += relax > 0
-                    return limb, max(options)[2]
+                    return limb, self.pick_ahead(limb, options)
         for limb in order + [l for l in hands + feet if l not in order]:   # 따라잡기: 닿는 홀드라면 지금보다 위 아무 데나
             options = self.catch_up_options(limb)
             if options:
@@ -755,6 +783,39 @@ class Climber:
             hold = Hold(V(x, y), 0.22, self.rng)
             self.holds.append(hold)
         return limb, hold
+
+    def pick_ahead(self, limb, options):
+        """options 중 limb 이 갈 홀드. 좋은 순서대로 거기로 옮겼다고 치고, 다른 손발에 갈 데가 생기는 첫 홀드를 고른다
+        (안 생기면 다음에도 같은 손발을 옮겨야 한다). 닿는 데 중 그런 홀드가 없으면 조금 더 먼 홀드 중 다른 손발을
+        풀어 주는 가장 가까운 곳, 그것도 없으면 가장 먼 곳으로 한 번에 간다 (같은 손발을 두 번 옮기지 않게)."""
+        ranked = [o[2] for o in sorted(options, key=lambda o: (o[0], o[1]), reverse=True)]
+        for hold in ranked:
+            if self.frees_others(limb, hold):
+                return hold
+        far = self.hand_options(limb, 1, up_only=True) if limb.kind == "H" else self.foot_options(limb, 1)
+        far = sorted((o[2] for o in far if o[2].p.y > ranked[0].p.y), key=lambda h: h.p.y)
+        if not far:
+            return ranked[0]
+        self.far_reaches += 1
+        return next((hold for hold in far if self.frees_others(limb, hold)), far[-1])
+
+    def feet_top(self):
+        """지금 딛은 발로 몸을 세울 수 있는 가장 높은 몸 높이 (다리 95%). 딛은 발이 없으면 None."""
+        feet = [f for f in self.limbs.values() if f.kind == "F" and f.mode == "grip"]
+        if not feet:
+            return None
+        return min(f.pos.y - HIP[1] + math.sqrt(max(0.01, (f.reach * 0.95) ** 2 - (f.pos.x - self.body.x - f.side * HIP[0]) ** 2))
+                   for f in feet)
+
+    def frees_others(self, limb, hold):
+        """limb 을 hold 로 옮겼다고 치면 다른 손발에 갈 데가 있는지 (몸은 그대로 둔 채로 본다)."""
+        saved = limb.hold, limb.mode, limb.pos
+        limb.hold, limb.mode, limb.pos = hold, "grip", self.grip_point(limb, hold)
+        try:
+            return any(self.hand_options(o, 0) if o.kind == "H" else self.foot_options(o, 0)
+                       for o in self.limbs.values() if o is not limb)
+        finally:
+            limb.hold, limb.mode, limb.pos = saved
 
     def reach_options(self, limbs):
         """작은 다이노: 위쪽의 가장 가까운 홀드까지 뻗어 몸을 끌어올린다. (홀드, 손발) 또는 None."""
@@ -1473,7 +1534,7 @@ class Climber:
         팔을 쭉 펴고 엉덩이를 낮춰 매달려 쉰다. 일하는 펫은 있는데 토큰을 기다리는 중이면 쉬는 동작을 짧게 자주 한다."""
         self.actions.append("rest")
         self.resting, start = True, self.t
-        ready = lambda: self.climb_ready(self.t - start)
+        ready = self.climb_ready
         try:
             hands_low = min(self.held_y(l) for l in self.limbs.values() if l.kind == "H")
             for foot in (self.limbs["LF"], self.limbs["RF"]):   # 높이 올렸거나 멀리 뻗은 발은 편한 자리로

@@ -3,8 +3,8 @@
 그림은 assets/climb/ (바위 rock.jpg, 높이 구간별 배경 bg/*.jpg) 과 내 아바타 avatar/body.png + avatar.json
 (개인 캐릭터라 git 에 넣지 않는다, tools/avatar_prep.py 로 만든다. 없으면 회색 공을 그린다).
 창 폭은 바위 기둥의 SCENE_W 배라 양옆으로 배경과 날씨가 보이고, 클릭은 바위 기둥과 높이 상자에서만 받는다
-(X11 입력 모양, 양옆은 아래 창으로 지나간다). 움직이는 동안 (오르기, 쉬는 동작) 60fps, 가만히 쉬면 15fps, 자면 10fps 로 그리고
-숨기면 멈춘다 (계산도 멈춘다). 바위 층은 바뀔 때만 다시 그리고, 카메라가 멈춰 있고 비·눈이 없으면 아바타 둘레와
+(X11 입력 모양, 양옆은 아래 창으로 지나간다). 늘 60fps 로 그리고 숨기면 멈춘다 (계산도 멈춘다). 왼쪽 버튼으로 끌면
+펫처럼 줄 전체를 옮긴다. 바위 층은 바뀔 때만 다시 그리고, 카메라가 멈춰 있고 비·눈이 없으면 아바타 둘레와
 높이 상자만 다시 그린다 (창 관리자가 다시 합성할 넓이도 줄어든다).
 """
 import json
@@ -18,14 +18,14 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGra
                          QPixmap, QPolygonF, QRegion)
 from PyQt5.QtWidgets import QWidget
 
-from climbcore import (ARM, BANDS, LEG, PACE_BANK, PACE_NAME, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF, edge_x,
+from climbcore import (ARM, BANDS, LEG, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF, edge_x,
                        fmt_alt, smooth, two_bone)
 
 APP_DIR = Path(__file__).resolve().parent
 ASSET_DIR = APP_DIR / "assets" / "climb"
 AVATAR_DIR = APP_DIR / "avatar"   # 내 아바타 (git 제외): body.png (투명 배경), avatar.json (몸통 공·눈 자리)
 UNIT_PX = 50                      # 몸통 반지름 (px, 펫 크기 배율을 곱한다: 보통이면 25 → 창 높이 300)
-FRAME_MS = {"move": 16, "rest": 16, "still": 66, "sleep": 100}   # 오를 때·쉬는 동작 60fps, 가만히 15fps, 잘 때 10fps
+FRAME_MS = 16                     # 늘 60fps (쉬거나 잘 때 낮추면 비·눈이 끊겨 보인다)
 STEP_MAX = 0.05                   # 계산 한 번에 넘기는 시간 (초). 프레임이 길면 나눠서 넘긴다
 
 
@@ -339,7 +339,7 @@ class Look:
 
     def paint_altitude(self, p, sim):
         """왼쪽 위 상자: 높이와 다음 기록, 쌓인 오를 높이와 빠르기 (막대), 체력 (막대). 기록을 넘을 때 말풍선."""
-        alt = max(0.0, sim.altitude())
+        alt = max(0.0, sim.shown_altitude())
         nxt = sim.next_milestone()
         small = QFont(self.small)
         small.setBold(False)
@@ -348,8 +348,7 @@ class Look:
         if nxt:
             rows.append((f"다음: {nxt[1]}까지 {fmt_alt(nxt[0] - alt)}", small, QColor(230, 215, 190), None))
         if sim.tokens_on:
-            state = ("잠" if sim.sleeping else PACE_NAME[sim.pace] if sim.has_climb()
-                     else "기다림" if sim.work > 0 else "쉼")
+            state = sim.state_label()
             fill = max(0.0, min(1.0, sim.bank / (PACE_BANK[1] * 1.5)))   # 전력 질주 기준의 1.5배가 가득
             rows.append((f"오를 높이 {max(0.0, sim.bank):,.1f}m · {state}", small, QColor(170, 235, 255),
                          (fill, {1: (110, 200, 120), 2: (240, 200, 70), 3: (255, 120, 60)}[sim.pace])))
@@ -764,7 +763,7 @@ class ClimbWindow(QWidget):
             self.shape = None       # 창을 다시 보이면 클릭 영역을 다시 건다
         if not self.timer.isActive():
             self.last = time.monotonic()
-            self.timer.start(FRAME_MS["move"])
+            self.timer.start(FRAME_MS)
         self.update_shape()
         self.update()
 
@@ -779,19 +778,6 @@ class ClimbWindow(QWidget):
         """화면 좌표 point 가 클릭을 받는 곳 (바위 기둥·높이 상자·말풍선) 인지."""
         local = point - self.pos()
         return self.isVisible() and any(QRect(*r).contains(local) for r in (self.shape or ()))
-
-    def frame_ms(self):
-        """지금 그릴 간격: 오르거나 손발을 움직이면 짧게, 가만히 쉬거나 자면 길게 (땀방울·Z 는 느려도 된다)."""
-        sim = self.sim
-        busy = (any(p.kind != "sweat" for p in sim.particles) or sim.rocks or sim.banner is not None
-                or any(f.style != "z" for f in sim.texts) or sim.requests or sim.rope is not None)
-        if busy:
-            return FRAME_MS["move"]
-        if sim.sleeping:
-            return FRAME_MS["sleep"]
-        if not sim.resting:
-            return FRAME_MS["move"]
-        return FRAME_MS["still"] if all(l.mode == "grip" for l in sim.limbs.values()) else FRAME_MS["rest"]
 
     def dirty(self):
         """이번에 다시 그릴 곳. 바위 층이 바뀌었거나 창 전체에 걸치는 것 (비·눈, 번개, 낙석, 추락 중 로프, 말풍선)
@@ -813,9 +799,6 @@ class ClimbWindow(QWidget):
         steps = math.ceil(dt / STEP_MAX)   # 고르게 나눈다 (아주 짧은 조각이 남으면 몸이 튄다)
         for _ in range(steps):
             self.sim.update(dt / steps)
-        ms = self.frame_ms()
-        if self.timer.interval() != ms:
-            self.timer.setInterval(ms)
         self.update_shape()
         region = self.dirty()
         if region is None:
@@ -841,6 +824,19 @@ class ClimbWindow(QWidget):
             return
         painter = QPainter(self)
         self.look.paint(painter, self.sim)
+
+    def mousePressEvent(self, event):
+        """왼쪽 버튼으로 끌면 펫처럼 줄 전체를 옮긴다 (누르기만 하면 아무것도 하지 않는다)."""
+        if event.button() == Qt.LeftButton:
+            self.manager.drag_begin(CARD_ID, event.globalPos())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self.manager.drag_move(event.globalPos())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.manager.drag_origin is not None:
+            self.manager.drag_end()
 
     def enterEvent(self, _event):
         self.manager.hover_enter(CARD_ID)

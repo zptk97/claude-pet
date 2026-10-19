@@ -2088,7 +2088,7 @@ class PetManager(QObject):
             return
         rows, note = petcore.limit_rows(limits, now)
         climber = self.climber
-        title = f"끝없이 오르기 · {climbcore.fmt_alt(max(0.0, climber.altitude()))}"
+        title = f"끝없이 오르기 · {climbcore.fmt_alt(max(0.0, climber.shown_altitude()))}"
         subtitle = (f"체력 {team[0]}% · 최고 {climbcore.fmt_alt(climber.peak)} · "
                     f"받은 토큰 {petcore.format_tokens(climber.tokens)}")
         self.card.set_content(title, subtitle, rows, note)

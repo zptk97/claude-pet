@@ -127,6 +127,32 @@ def by_work():
                         stalls += run_len == 6
         check(stalls == 0, f"제자리 구간 (일하는 펫 {work}, 시드 10개 x 300초): {stalls}개, 가장 길게 이어진 동작 {longest}번")
 
+    # 같은 손발을 연달아 옮기는 비율: 시드 8개 x 300초, 일하는 펫 1·3. 5% 이하, 빠르기는 내다보기 전 (분당 7.1·9.7m) 의 95% 넘게,
+    # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임 10% 이하 (내다보기 전에는 약 13%)
+    for work, before in ((1, 7.1), (3, 9.7)):
+        repeats = moves = far = made = frames = stretched = 0
+        speeds = []
+
+        def watch(s, t):   # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임
+            nonlocal frames, stretched
+            frames += 1
+            stretched += any(l.mode == "grip" and (l.pos - l.root(s.body, s.tilt)).len() > l.reach * 1.02
+                             for l in s.limbs.values() if l.kind == "H")
+
+        for seed in range(1, 9):
+            sim = climber(seed)
+            sim.work = work
+            y0 = sim.top_y
+            run(sim, 300, feed=watch)
+            m = sim.moves
+            repeats += sum(m[i] == m[i - 1] for i in range(1, len(m)))
+            moves, far, made = moves + len(m), far + sim.far_reaches, made + sim.missing
+            speeds.append((sim.top_y - y0) / 5)
+        rate, speed = repeats / moves, statistics.mean(speeds)
+        check(rate <= 0.05 and made == 0 and speed >= before * 0.95 and stretched / frames <= 0.10,
+              f"같은 손발 연달아 (일하는 펫 {work}, 시드 8개 x 300초): {rate:.1%} ({repeats}/{moves}), 한 번에 멀리 {far}번, "
+              f"분당 {speed:.1f}m (전 {before}), 만든 홀드 {made}, 팔이 닿는 거리를 넘은 프레임 {stretched / frames:.2%}")
+
     # 날씨: 일하는 펫 3 (8초) ↔ 0 (12초) 를 20번. 비와 눈이 둘 다 나오고, 한 번 내리는 동안은 안 바뀐다
     sim = climber(5)
     kinds, mixed = [], 0

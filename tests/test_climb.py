@@ -282,6 +282,19 @@ class ClimberTest(unittest.TestCase):
         self.assertFalse(sim.sleeping)
         self.assertIsNone(sim.ledge)
 
+    def test_same_limb_rarely_moves_twice(self):
+        repeats = moves = far = 0
+        for seed in (2, 5):
+            sim = Climber(seed)
+            sim.tokens_on, sim.work = False, 1
+            run(sim, 150)
+            m = sim.moves
+            repeats += sum(m[i] == m[i - 1] for i in range(1, len(m)))
+            moves, far = moves + len(m), far + sim.far_reaches
+            self.assertEqual(sim.missing, 0)
+        self.assertLessEqual(repeats / moves, 0.06)
+        self.assertGreater(far, 0)   # 같은 손발을 또 옮기지 않으려고 한 번에 멀리 간 적이 있다
+
     def test_sprint_never_makes_holds(self):
         for seed in range(4):
             sim = Climber(seed)
