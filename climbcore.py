@@ -1,0 +1,1778 @@
+"""끝없이 오르기 계산 (Qt 를 쓰지 않는다. 그리기는 climbview.py).
+
+내 아바타가 흐르는 자연 암벽을 끝없이 오른다. Claude 가 써낸 출력 토큰 1,000개마다 2m 를 오를 높이로 쌓고
+(TokenMeter 가 Claude Code 기록 파일을 읽기만 해서 센다), 쌓인 높이가 많을수록 빠르게 오른다. 다 쓰면
+일하는 펫이 있으면 기다리고 없으면 쉰다. 일하는 펫 수는 날씨, 계정 사용량은 체력이고, 펫 상태에서 온 신호
+(Climber.signal) 로 다이노·로프 추락·초크·잠·기상 같은 동작을 끼워 넣는다. 높이 기록 (아파트 10층 ~ 달) 을
+넘으면 한 번씩 말풍선을 띄운다.
+
+길이는 몸통 반지름을 1 로 둔 단위 (높이는 1 = 1m 로 센다), y 는 위가 +.
+동작은 제너레이터로 쓰고 한 프레임마다 dt 를 보낸다 (yield from 으로 잇는다).
+"""
+import collections
+import json
+import math
+import os
+import random
+import time
+from datetime import datetime
+from pathlib import Path
+
+# ---- 몸 치수 (몸통 반지름 = 1) ----------------------------------------------
+
+SHOULDER = (0.60, 0.26)     # 어깨 (몸 중심에서, x 는 좌우 대칭)
+HIP = (0.40, -0.60)
+ARM = (0.84, 0.84)          # 위팔, 아래팔
+LEG = (0.80, 0.86)          # 넓적다리, 정강이
+HAND_UP = 1.30              # 편한 자세에서 손 높이 (몸 중심 위)
+FOOT_DOWN = 1.62            # 편한 자세에서 발 높이 (몸 중심 아래)
+WALL_HALF = 2.35            # 홀드를 둘 수 있는 벽 반폭
+LIMBS = {"LH": (-1, "H"), "RH": (1, "H"), "LF": (-1, "F"), "RF": (1, "F")}
+GRAVITY = 40.0
+
+VIEW_H = 12.0               # 화면에 보이는 벽 높이
+VIEW_TOP = VIEW_H * 0.58    # 카메라에서 화면 위 끝까지
+FILL_AHEAD = VIEW_TOP + 2.5  # 홀드를 미리 깔아 두는 높이 (화면 위 끝보다 위)
+
+SCENE_W = 1.8               # 창 폭 = 바위 기둥 폭의 몇 배 (양옆으로 배경과 날씨가 보인다)
+HIGH = 9500                 # 이 높이 (m) 위로는 비·눈이 없고 흐리지도 않다 (구름바다 위)
+BANDS = [(0, "city"), (300, "hills"), (2000, "mountains"), (9500, "clouds"), (12000, "strato"), (100000, "space")]
+MILESTONES = [  # (높이 m, 짧은 이름, 넘을 때 말풍선)
+    (30, "아파트 10층", "아파트 10층(30m)보다 높아요!"),
+    (56, "피사의 사탑", "피사의 사탑(56m)보다 높아요!"),
+    (93, "자유의 여신상", "자유의 여신상(93m)보다 높아요!"),
+    (249, "63빌딩", "63빌딩(249m)보다 높아요!"),
+    (330, "에펠탑", "에펠탑(330m)보다 높아요!"),
+    (555, "롯데월드타워", "롯데월드타워(555m)보다 높아요!"),
+    (828, "부르즈 할리파", "부르즈 할리파(828m)보다 높아요!"),
+    (836, "북한산", "북한산(836m)보다 높아요!"),
+    (1708, "설악산", "설악산(1,708m)보다 높아요!"),
+    (1947, "한라산", "한라산(1,947m)보다 높아요!"),
+    (3776, "후지산", "후지산(3,776m)보다 높아요!"),
+    (4806, "몽블랑", "몽블랑(4,806m)보다 높아요!"),
+    (5895, "킬리만자로", "킬리만자로(5,895m)보다 높아요!"),
+    (8849, "에베레스트", "에베레스트(8,849m)보다 높아요!"),
+    (10000, "여객기 순항 고도", "여객기 순항 고도(약 10km)예요!"),
+    (12000, "성층권", "성층권에 들어왔어요! (약 12km)"),
+    (25000, "오존층", "오존층을 지나요! (약 25km)"),
+    (100000, "카르만 선", "우주에 닿았어요! 카르만 선 100km"),
+    (400000, "국제우주정거장", "국제우주정거장 높이예요! (약 400km)"),
+    (384400000, "달", "달에 도착했어요! (384,400km)"),
+]
+CONFETTI = [(255, 196, 0), (255, 90, 90), (80, 200, 255), (120, 220, 120), (200, 120, 255)]
+
+PACE_DUR = {1: 1.0, 2: 0.72, 3: 0.5}         # 오르는 빠르기별 동작 시간 배율 (3 = 전력 질주, 토큰이 많이 쌓였을 때)
+PACE_PAUSE = {1: (0.1, 0.28), 2: (0.02, 0.08), 3: (0.0, 0.03)}   # 동작 사이 숨 고르기 (초)
+PACE_NAME = {1: "보통", 2: "빠름", 3: "전력 질주"}
+M_PER_TOKEN = 2 / 1000                        # 출력 토큰 1,000개 = 2m
+PACE_BANK = (8.0, 30.0)                       # 쌓인 높이 (m) 가 이만큼 넘으면 빠름, 전력 질주
+DYNO_MIX = {2: 0.06, 3: 0.18}                 # 빠름·전력 질주에서 손발 동작 대신 다이노를 할 비율
+COOLDOWN = {"dyno": 8.0, "chalk": 15.0}      # 잦은 신호는 이 간격 (초) 안이면 버린다 (일 끝냄 → 다이노, 사용량 → 초크)
+SHAKE_EVERY = (40.0, 80.0)                    # 체력 60% 이하면 오르다가 이 간격으로 팔을 턴다
+WORKING = ("running", "background")          # 일하는 펫으로 치는 상태 (날씨)
+AWAKE = ("wake", "refill")                    # 자는 동안에도 받는 동작
+WEATHER = {0: 0.0, 1: 0.3, 2: 0.65, 3: 1.0}  # 일하는 펫 수 → 날씨 세기 (0 맑음, 0.3 흐림, 비·눈, 폭풍우·눈보라)
+
+
+class V:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x=0.0, y=0.0):
+        self.x, self.y = x, y
+
+    def __add__(self, o):
+        return V(self.x + o.x, self.y + o.y)
+
+    def __sub__(self, o):
+        return V(self.x - o.x, self.y - o.y)
+
+    def __mul__(self, k):
+        return V(self.x * k, self.y * k)
+
+    def len(self):
+        return math.hypot(self.x, self.y)
+
+    def rot(self, a):
+        c, s = math.cos(a), math.sin(a)
+        return V(self.x * c - self.y * s, self.x * s + self.y * c)
+
+    def lerp(self, o, t):
+        return V(self.x + (o.x - self.x) * t, self.y + (o.y - self.y) * t)
+
+
+def ease_out(k):
+    """빠르게 출발해 천천히 닿는다 (손 뻗기: 데드포인트)."""
+    return 1 - (1 - k) ** 3
+
+
+def fmt_alt(m):
+    """높이 글자: 10km 아래는 m, 위는 km."""
+    return f"{m:,.0f}m" if m < 10000 else f"{m / 1000:,.1f}km".replace(".0km", "km")
+
+
+def smooth(k):
+    """천천히 출발해 천천히 멈춘다 (smootherstep)."""
+    return k * k * k * (k * (6 * k - 15) + 10)
+
+
+def edge_x(y, side):
+    """바위 기둥 옆 가장자리 (울퉁불퉁)."""
+    return side * (WALL_HALF + 0.5 + 0.22 * math.sin(y * 0.9 + side * 2.1) + 0.12 * math.sin(y * 2.3 + side * 0.7))
+
+
+def two_bone(root, end, a, b, side, kind):
+    """팔꿈치·무릎 자리와 실제 손끝 (닿지 않으면 그쪽으로 쭉 뻗는다). 팔꿈치는 바깥·아래, 무릎은 바깥·위로."""
+    d = end - root
+    dist = d.len() or 1e-6
+    reach = max(abs(a - b) + 1e-3, min(a + b - 1e-3, dist))
+    tip = root + d * (reach / dist)
+    base = math.atan2(d.y, d.x)
+    alpha = math.acos(max(-1.0, min(1.0, (a * a + reach * reach - b * b) / (2 * a * reach))))
+    up = -0.35 if kind == "H" else 0.35
+    best = None
+    for ang in (base + alpha, base - alpha):
+        e = root + V(math.cos(ang), math.sin(ang)) * a
+        score = side * (e.x - root.x) + up * (e.y - root.y)
+        if best is None or score > best[0]:
+            best = (score, e)
+    return best[1], tip
+
+
+class Hold:
+    def __init__(self, p, r, rng, big=False):
+        self.p, self.r, self.big = p, r, big
+        self.chalk = 0.0
+        self.snow = 0.0
+        self.made_t = self.made_cam = 0.0
+        n = 7
+        self.shape = []
+        for i in range(n):
+            a = 2 * math.pi * (i + rng.uniform(-0.25, 0.25)) / n
+            k = rng.uniform(0.78, 1.12)
+            y = math.sin(a) * 0.62 * (0.75 if math.sin(a) > 0 else 1.0)  # 위는 납작한 턱
+            self.shape.append((math.cos(a) * k, y * k))
+
+    def grip(self, kind, side=0):
+        if kind == "H":
+            return self.p + V(side * self.r * 0.45, self.r * 0.25)
+        return self.p + V(side * 0.04, self.r * 0.32)
+
+
+class Route:
+    """벽에 홀드를 미리 깔아 둔다. 길(홀드가 몰린 줄기)은 높이 1.5~4m 마다 벽 폭 안의 새 지점으로 굽이치고,
+    가끔 짧은 높이 안에서 반대편으로 길게 옆으로 간다 (트래버스)."""
+    BAND = 0.5
+
+    def __init__(self, rng):
+        self.rng = rng
+        self.top = -5.0
+        self.a = (self.top, 0.0)            # 지금 구간의 시작 (높이, x)
+        self.b = (self.top + 3.0, 0.0)      # 지금 구간의 끝
+        self.centers = [(self.top, 0.0)]
+        self.next_bolt = -1.5       # 다음 볼트 높이 (약 3m 마다)
+
+    def center(self, y):
+        cs = self.centers
+        if y <= cs[0][0]:
+            return cs[0][1]
+        if y >= cs[-1][0]:
+            return cs[-1][1]
+        i = max(0, min(len(cs) - 2, int((y - cs[0][0]) / self.BAND)))
+        (y0, x0), (y1, x1) = cs[i], cs[i + 1]
+        return x0 + (x1 - x0) * (y - y0) / (y1 - y0)
+
+    def next_point(self):
+        rng = self.rng
+        limit = WALL_HALF - 0.55
+        y, x = self.b
+        # 아바타가 옆으로 따라갈 수 있게 옆으로 1m 가는 데 높이를 1m 넘게 쓴다
+        if rng.random() < 0.25:   # 트래버스: 반대편 끝 쪽으로, 따라갈 수 있는 가장 가파른 기울기로
+            nx = -math.copysign(rng.uniform(limit * 0.6, limit), x or rng.choice((-1, 1)))
+            return y + abs(nx - x) * 1.05, nx
+        while True:   # 벽 양쪽으로 자주 간다 (가운데에만 머물지 않는다)
+            nx = rng.choice((-1, 1)) * limit * (rng.uniform(0.5, 1.0) if rng.random() < 0.8 else rng.uniform(0, 0.5))
+            if abs(nx - x) > 0.8:
+                return y + max(rng.uniform(1.5, 4.0), abs(nx - x) * 1.2), nx
+
+    def fill(self, sim, upto):
+        rng = self.rng
+        while self.top < upto:
+            y0 = self.top
+            self.top += self.BAND
+            while self.top > self.b[0]:
+                self.a, self.b = self.b, self.next_point()
+            (ya, xa), (yb, xb) = self.a, self.b
+            cx = xa + (xb - xa) * smooth((self.top - ya) / (yb - ya))
+            self.centers.append((self.top, cx))
+            for _ in range(rng.choice((2, 3, 3))):
+                sim.place_hold(V(cx + rng.uniform(-1.15, 1.15), y0 + rng.uniform(0, self.BAND)), big=rng.random() < 0.08)
+            if rng.random() < 0.2:   # 길 밖의 바위 턱
+                sim.place_hold(V(rng.uniform(-WALL_HALF + 0.3, WALL_HALF - 0.3), y0 + rng.uniform(0, self.BAND)))
+            if self.top >= self.next_bolt:   # 볼트는 길 가운데 근처에 약 3m 마다
+                sim.bolts.append(Bolt(V(cx + sim.wrng.uniform(-0.4, 0.4), self.next_bolt)))
+                self.next_bolt += sim.wrng.uniform(2.6, 3.4)
+
+
+class Limb:
+    def __init__(self, name):
+        self.name = name
+        self.side, self.kind = LIMBS[name]
+        self.pos = V()
+        self.vel = V()
+        self.mode = "grip"          # grip (홀드), move (옮기는 중), follow (몸에 붙은 자리), free (매달려 흔들림)
+        self.hold = None
+        self.recent = collections.deque(maxlen=3)   # 최근에 잡았던 홀드 (제자리에서 왔다 갔다 하지 않게)
+        self.goal = None            # 옮기는 중인 홀드 (몸이 미리 그쪽으로 옮겨 간다)
+        self.target = None          # 옮기는 중인 홀드를 잡을 자리 (동작 후반부터 몸을 당긴다)
+        self.progress = 0.0
+        self.follow = None
+        self.tucked = False         # 침낭 안에 넣었다 (안 그린다)
+        self.fist = False
+        self.wiggle = 0.0           # 잡은 뒤 손가락을 고쳐 쥐는 남은 시간 (그림만)
+
+    @property
+    def reach(self):
+        return sum(ARM if self.kind == "H" else LEG)
+
+    def root(self, body, tilt):
+        base = SHOULDER if self.kind == "H" else HIP
+        return body + V(base[0] * self.side, base[1]).rot(tilt)
+
+
+class Particle:
+    __slots__ = ("p", "v", "age", "life", "size", "kind", "color")
+
+    def __init__(self, p, v, life, size, kind="chalk", color=None):
+        self.p, self.v, self.age, self.life, self.size, self.kind, self.color = p, v, 0.0, life, size, kind, color
+
+
+class Float:
+    """떠오르는 글자 (+2m, z)."""
+
+    def __init__(self, p, text, style="gold"):
+        self.p, self.text, self.style, self.age = p, text, style, 0.0
+        self.life = 2.4 if style == "z" else 1.6
+
+
+class Bolt:
+    """벽에 박힌 볼트와 퀵드로. 지나가며 로프를 건다 (clipped)."""
+
+    def __init__(self, p):
+        self.p = p
+        self.clipped = False
+        self.skipped = False        # 손이 안 닿거나 너무 지나쳐서 걸지 않고 넘어갔다
+
+    def rope_point(self):
+        return self.p + V(0, -0.32)   # 퀵드로 아래 카라비너
+
+
+class Ledge:
+    """포타레지 (벽에 매다는 침대). anchor 에 걸고, bed 는 침대 바닥 가운데."""
+
+    def __init__(self, anchor):
+        self.anchor = anchor
+        self.bed = anchor + V(0, -2.5)
+        self.carry = None           # 꾸러미를 든 손 이름
+        self.hung = False           # 앵커에 걸렸다
+        self.open = 0.0             # 펼친 정도
+        self.bag = 0.0              # 침낭을 끌어올린 정도
+        self.stow = None            # 접어 넣는 중 (0~1)
+        self.home = None            # 자기 전 자리 (몸, {손발: 홀드})
+
+
+class TokenMeter:
+    """Claude Code 기록 파일에서 출력 토큰 (생각 포함) 을 센다. 읽기만 한다.
+
+    ~/.claude/projects/<프로젝트>/<세션>.jsonl 과 서브에이전트 기록 <세션>/subagents/*.jsonl 을 본다.
+    응답 하나가 여러 줄에 같은 값으로 남고, 서브에이전트 기록에는 응답 도중의 덜 센 값도 남아서
+    응답 id 마다 가장 큰 값을 기억하고 늘어난 만큼만 더한다.
+
+    처음 쓰면 (saved 가 없으면) 지금 있는 기록은 세지 않고 그 뒤에 쓰인 줄만 센다. state() 를 저장해 두었다가
+    saved 로 주면 파일마다 읽던 자리부터 이어 읽어서, 펫이 꺼져 있던 동안 쓰인 토큰도 빠짐없이 한 번만 센다
+    (그사이 새로 생긴 파일은 처음부터 읽되, 저장한 때보다 옛 줄은 다른 파일에서 옮겨 적힌 것으로 보고 뺀다).
+    기록 폴더는 root, 없으면 CLAUDE_PET_PROJECTS 환경 변수 (시험 모드), 없으면 ~/.claude/projects."""
+
+    SEEN_KEEP = 5000            # 기억하는 응답 id 수
+    SEEN_SAVE = 300             # 저장하는 응답 id 수 (끄기 직전 응답이 이어서 더 늘어날 수 있다)
+    POLL_BYTES = 4 << 20        # 한 번에 읽는 양 (오래 꺼져 있다 켜지면 밀린 기록을 여러 번에 나눠 읽는다)
+
+    def __init__(self, root=None, saved=None):
+        root = root or os.environ.get("CLAUDE_PET_PROJECTS")
+        self.root = Path(root) if root else Path.home() / ".claude" / "projects"
+        self.offsets = {}           # 파일 → 읽은 바이트 수
+        self.rest = {}              # 파일 → 아직 줄바꿈이 오지 않은 끝부분
+        self.seen = collections.OrderedDict()   # 응답 id → 지금까지 본 출력 토큰
+        self.total = 0
+        saved = saved if isinstance(saved, dict) else {}
+        offsets, seen = saved.get("offsets"), saved.get("seen")
+        since = saved.get("ts")
+        if isinstance(offsets, dict) and isinstance(since, (int, float)):
+            self.start = since
+            self.offsets = {Path(p): o for p, o in offsets.items() if isinstance(p, str) and isinstance(o, int) and o >= 0}
+            if isinstance(seen, dict):
+                self.seen.update((k, v) for k, v in seen.items() if isinstance(k, str) and isinstance(v, int))
+        else:
+            self.start = time.time()
+            for path in self.files():
+                try:
+                    self.offsets[path] = path.stat().st_size   # 지난 기록은 세지 않는다
+                except OSError:
+                    pass
+        self.polled = self.start    # 마지막으로 읽은 때
+
+    def files(self):
+        return list(self.root.glob("*/*.jsonl")) + list(self.root.glob("*/*/subagents/*.jsonl"))
+
+    def state(self):
+        """저장할 것: 파일마다 읽은 자리 (다 쓰이지 않은 끝줄은 다시 읽게 뺀다), 마지막으로 읽은 때, 최근 응답 id."""
+        offsets = {str(p): o - len(self.rest.get(p, b"")) for p, o in self.offsets.items()}
+        seen = dict(list(self.seen.items())[-self.SEEN_SAVE:])
+        return {"ts": self.polled, "offsets": offsets, "seen": seen}
+
+    def poll(self):
+        """새로 쓰인 줄을 읽고 늘어난 출력 토큰 수를 돌려준다."""
+        added = 0
+        now = time.time()
+        present = set()
+        budget = self.POLL_BYTES
+        for path in self.files():
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            present.add(path)
+            done = self.offsets.get(path, 0)   # 처음 보는 파일은 그 뒤에 생긴 것이라 처음부터
+            if size < done:                    # 파일이 새로 바뀌었다
+                done = 0
+                self.rest.pop(path, None)
+            if size == done or budget <= 0:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    f.seek(done)
+                    data = f.read(min(size - done, budget))
+            except OSError:
+                continue
+            budget -= len(data)
+            self.offsets[path] = done + len(data)
+            lines = (self.rest.pop(path, b"") + data).split(b"\n")
+            if lines[-1]:
+                self.rest[path] = lines[-1]    # 아직 다 쓰이지 않은 줄
+            for line in lines[:-1]:
+                added += self.read_line(line)
+        for path in [p for p in self.offsets if p not in present]:   # 지워진 기록
+            del self.offsets[path]
+            self.rest.pop(path, None)
+        self.total += added
+        if budget > 0:   # 밀린 기록을 다 읽었을 때만 (다 못 읽고 저장했다가 다시 켜면 그 줄들이 옛 줄로 빠지지 않게)
+            self.polled = now
+        return added
+
+    def read_line(self, line):
+        if b'"output_tokens"' not in line:
+            return 0
+        try:
+            entry = json.loads(line)
+        except (ValueError, RecursionError):
+            return 0
+        message = entry.get("message") if isinstance(entry, dict) else None
+        if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
+            return 0
+        out = message["usage"].get("output_tokens")
+        key = message.get("id") or entry.get("requestId")
+        if not isinstance(out, int) or isinstance(out, bool) or not isinstance(key, str) or not key:
+            return 0
+        stamp = entry.get("timestamp")
+        if isinstance(stamp, str):   # 다른 파일에서 옮겨 적힌 옛 줄은 세지 않는다
+            try:
+                if datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() < self.start - 60:
+                    return 0
+            except ValueError:
+                pass
+        old = self.seen.get(key, 0)
+        if out <= old:
+            return 0
+        self.seen[key] = out
+        self.seen.move_to_end(key)
+        while len(self.seen) > self.SEEN_KEEP:
+            self.seen.popitem(last=False)
+        return out - old
+
+
+class Climber:
+    """오르는 아바타 한 마리. update(dt) 로 움직이고, request() 로 동작을 끼워 넣는다."""
+
+    def __init__(self, seed=7):
+        self.rng = random.Random(seed)
+        self.wrng = random.Random(seed + 1)   # 날씨·눈 깜빡임 (등반 결정과 따로)
+        self.t = 0.0
+        self.cam = 0.45
+        self.mode = "spring"        # spring (손발로 버팀), hang (손만, 중력), script (동작이 직접 옮김)
+        self.vel = V()
+        self.tilt = self.tilt_vel = 0.0
+        self.squash, self.squash_vel = 1.0, 0.0
+        self.face, self.face_now = 1, 1.0   # 1 = 왼쪽을 봄 (그림 그대로), -1 = 오른쪽
+        self.crouch = 0.0
+        self.work = 1               # 일하는 펫 수 (0 이면 쉰다)
+        self.hp = self.hp_shown = 100
+        self.sleeping = False
+        self.ledge = None
+        self.lids, self.blink_t, self.blink_age = 0.0, 2.0, None
+        self.z_t = 0.0
+        self.weather_kind = "rain"
+        self.weather = WEATHER[1]
+        self.drops = []
+        self.drops_kind = self.weather_kind
+        self.precipitating = False
+        self.wind = 0.0
+        self.flash, self.flash_t, self.flash2 = 0.0, 4.0, None
+        self.holds, self.particles, self.texts = [], [], []
+        self.requests = []
+        self.sweat_t = 0.0
+        self.alt0 = 0.0             # 높이 (m) = alt0 + 몸 높이
+        self.peak = 0.0             # 가장 높이 올라간 높이 (기록은 이걸로 센다)
+        self.passed = 0             # 넘은 기록 수 (MILESTONES 앞에서부터)
+        self.banner = None          # [말풍선, 나이]
+        self.banners = []           # 넘은 기록 높이 (검사용)
+        self.drop_scale = 1.0       # 창이 넓으면 빗방울도 그만큼 많이 (Look 이 정한다)
+        self.events = True          # 추락 이벤트 (발·손 미끄러짐, 홀드 부서짐, 낙석, 로프 추락) 켜기
+        self.bolts = []
+        self.rope = None            # 추락 중 로프 (걸린 점, 길이)
+        self.rope_hand = None       # 로프를 걸려고 쥔 손 이름
+        self.rocks = []             # 떨어지는 돌 [자리, 속도, 각도, 도는 빠르기, 크기, 튕김]
+        self.rock_t = 8.0
+        self.slip_t = 20.0
+        self.duck, self.duck_t = 0.0, 0.0
+        self.tokens_on = True       # 토큰으로 오르기 (끄면 일하는 펫 수로 오른다: 검사용)
+        self.signal_t = {}          # 신호별 마지막으로 받은 때 (COOLDOWN)
+        self.shake_t = 0.0          # 다음 팔 털기 (체력 60% 이하)
+        self.bank = 0.0             # 쌓인 오를 높이 (m). 몸이 가장 높이 올라간 자리를 넘을 때마다 줄어든다
+        self.tokens = 0             # 받은 토큰 합 (검사용)
+        self.token_buf, self.token_float_t = 0, -1.0   # 아직 글자로 띄우지 않은 토큰
+        self.resting = False
+        self.charging = True        # 몸이 가장 높은 자리를 넘으면 쌓인 높이를 쓴다 (일 끝냄 다이노는 덤이라 안 쓴다)
+        self.k_now = 1.0            # 지금 동작의 시간 배율 (빠를수록 몸도 또렷하게 따라간다)
+        self.missing = 0            # 잡을 데가 없어 그 자리에 만든 홀드 수 (0 이어야 한다)
+        self.phase_target = None    # 손발을 옮기는 동작 단계가 정한 몸 자리 (함수)
+        self.move_start = 0.0
+        self.flagging = False
+        self.look_at = None         # 보고 있는 곳 (다음 홀드)
+        self.look_tilt = 0.0        # 보는 쪽으로 몸통 그림을 기울인 정도 (그림만)
+        self.relaxed = 0            # 조건을 풀어서 고른 횟수
+        self.stall = 0              # 제자리 (손발 높이 합이 안 오름) 로 이어진 손발 동작 수
+        self.best_top = -1e9        # 손발 높이 합의 최고 기록
+        self.moves, self.grabs, self.actions = [], [], []
+        self.route = Route(self.rng)
+        self.route.fill(self, self.cam + FILL_AHEAD)
+        self.body = V(self.route.center(0.0), 0.0)
+        self.limbs = {name: Limb(name) for name in LIMBS}
+        taken = set()
+        for limb in self.limbs.values():
+            ideal = self.body + V(limb.side * 0.7, HAND_UP if limb.kind == "H" else -FOOT_DOWN)
+            root = limb.root(self.body, 0.0)
+            near = [h for h in self.holds if id(h) not in taken and (h.p - root).len() < limb.reach * 0.9
+                    and limb.side * (h.p.x - self.body.x) > -0.2] or [h for h in self.holds if id(h) not in taken]
+            hold = min(near, key=lambda h: (h.p - ideal).len())
+            taken.add(id(hold))
+            limb.hold, limb.pos = hold, hold.grip(limb.kind)
+        self.body = self.stance_target()[0]
+        self.top_y = self.body.y    # 몸이 가장 높이 올라간 자리
+        for bolt in self.bolts:   # 시작할 때 이미 지나온 볼트에는 로프가 걸려 있다
+            bolt.clipped = bolt.p.y < self.body.y
+        self.brain_task = self.brain()
+        next(self.brain_task)
+
+    # ---- 바깥에서 부르는 것 ---------------------------------------------------
+
+    def signal(self, name, *args):
+        """펫 상태에서 온 신호로 동작을 끼워 넣는다 (dyno, fall, chalk, exhaust, wake, refill).
+        잦은 신호 (COOLDOWN) 는 그 간격 안이면 버린다. 끼워 넣었으면 True."""
+        wait = COOLDOWN.get(name)
+        if wait is not None:
+            if self.t - self.signal_t.get(name, -1e9) < wait:
+                return False
+            self.signal_t[name] = self.t
+        if self.sleeping and name not in AWAKE:
+            return False
+        self.request(name, *args)
+        return True
+
+    def request(self, name, *args):
+        if self.sleeping and name not in AWAKE:
+            return   # 자는 동안은 깨우기만 받는다
+        self.requests.append((name, args))
+
+    @property
+    def pace(self):
+        if self.tokens_on:   # 쌓인 높이가 많을수록 빠르게
+            return 1 if self.bank < PACE_BANK[0] else 2 if self.bank < PACE_BANK[1] else 3
+        return 0 if self.work <= 0 else 1 if self.work <= 2 else 2
+
+    def deposit(self, tokens):
+        """출력 토큰을 받아 오를 높이로 쌓는다."""
+        self.tokens += tokens
+        self.bank += tokens * M_PER_TOKEN
+        self.token_buf += tokens
+
+    def has_climb(self):
+        """더 오를지. 토큰으로 오를 때는 쌓인 높이가 남았거나 추락해서 다시 올라야 할 때, 아니면 일하는 펫이 있을 때."""
+        if self.tokens_on:
+            return self.bank > 0.05 or self.body.y < self.top_y - 1.5   # 쉬는 자세로 낮춘 몸 (약 0.9m) 은 추락으로 치지 않는다
+        return self.work > 0
+
+    def climb_ready(self, waited=0.0):
+        """쉬다가 다시 오를지. 토큰은 1m 넘게 쌓였거나, 조금이라도 6초 넘게 기다렸으면 (한 동작만 하고 또 쉬지 않게)."""
+        if self.tokens_on:
+            return self.bank >= 0.99 or (self.bank > 0.05 and waited >= 6.0) or self.body.y < self.top_y - 1.5
+        return self.work > 0
+
+    def reroll_weather(self, other=False):
+        """비·눈을 다시 뽑는다 (other 면 지금과 다른 쪽으로)."""
+        if other:
+            self.weather_kind = "snow" if self.weather_kind == "rain" else "rain"
+        else:
+            self.weather_kind = self.wrng.choice(("rain", "snow"))
+
+    def altitude(self):
+        return self.alt0 + self.body.y
+
+    def jump(self, target, peak=None):
+        """높이를 target (m) 으로 옮긴다 (다시 켤 때, 검사). peak 까지의 기록은 말풍선 없이 넘은 걸로 친다."""
+        self.alt0 = target - self.body.y
+        self.top_y = self.body.y
+        self.peak = max(target, peak or 0.0)
+        self.passed = sum(1 for m in MILESTONES if m[0] <= self.peak)
+        self.banner = None
+        if target >= HIGH:
+            self.drops = []   # 구름 위로 건너뛰면 아래에서 내리던 비·눈은 없다
+
+    def snapshot(self):
+        """저장할 기록: 높이 (이번 길에서 가장 높이 올라간 자리), 최고 높이, 쌓인 높이, 받은 토큰 합."""
+        return {"height": round(self.alt0 + self.top_y, 2), "peak": round(self.peak, 2),
+                "bank": round(self.bank, 3), "tokens": self.tokens}
+
+    def restore(self, saved):
+        """snapshot() 으로 저장한 기록으로 되돌린다. 깨진 값은 처음 값으로 둔다."""
+        def number(key):
+            value = saved.get(key) if isinstance(saved, dict) else None
+            return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else 0.0
+        height = max(0.0, number("height"))
+        self.jump(height, max(height, number("peak")))
+        self.bank = number("bank")
+        tokens = saved.get("tokens") if isinstance(saved, dict) else None
+        self.tokens = tokens if isinstance(tokens, int) and tokens >= 0 else 0
+
+    def next_milestone(self):
+        return MILESTONES[self.passed] if self.passed < len(MILESTONES) else None
+
+    def precip(self):
+        """비·눈의 양 (흐림까지는 0, 구름 위로는 없다)."""
+        if self.altitude() >= HIGH:
+            return 0.0
+        return max(0.0, (self.weather - 0.35) / 0.65)
+
+    def gloom(self):
+        """흐려서 어두운 정도 (구름 위로 올라갈수록 옅다)."""
+        alt = self.altitude()
+        return self.weather if alt < HIGH else 0.0
+
+    def closure(self):
+        """눈꺼풀이 감긴 정도."""
+        blink = math.sin(math.pi * self.blink_age / 0.16) if self.blink_age is not None else 0.0
+        return max(self.lids, blink, 0.8 * self.duck)   # 돌을 피할 때 질끈
+
+    def update(self, dt):
+        dt = min(dt, 0.05)
+        if dt <= 0:
+            return
+        self.t += dt
+        self.route.fill(self, self.cam + FILL_AHEAD)
+        self.brain_task.send(dt)
+        steps = max(1, math.ceil(dt * (30 if self.resting else 60)))   # 쉬는 동안은 몸 계산을 덜 잘게
+        for _ in range(steps):
+            self.move_body(dt / steps)
+            self.move_free_limbs(dt / steps)
+        if self.body.y > self.top_y:   # 가장 높이 올라간 자리를 넘은 만큼 쌓인 높이를 쓴다 (추락 뒤 다시 오르는 높이는 안 쓴다)
+            if self.tokens_on and self.charging and self.ledge is None:   # 포타레지에 오르내리기·덤 다이노는 안 쓴다
+                self.bank -= self.body.y - self.top_y
+            self.top_y = self.body.y
+        if self.token_buf and self.t - self.token_float_t > 0.7:   # 받은 토큰을 글자로 띄운다 (잦으면 모아서)
+            side = 1.3 if len(self.texts) % 2 else -1.3
+            self.texts.append(Float(self.body + V(side, 0.9), f"+{self.token_buf:,} 토큰", "token"))
+            self.token_buf, self.token_float_t = 0, self.t
+        for limb in self.limbs.values():
+            if limb.mode == "grip":
+                limb.pos = self.grip_point(limb, limb.hold)
+                if limb.wiggle > 0:   # 고쳐 쥐기: 손이 살짝 들렸다 다시 감긴다
+                    limb.wiggle = max(0.0, limb.wiggle - dt)
+                    limb.pos = limb.pos + V(0, 0.07 * math.sin(math.pi * limb.wiggle / 0.18))
+            elif limb.mode == "follow":
+                limb.pos = limb.follow()
+        self.move_effects(dt)
+        self.move_weather(dt)
+        self.move_milestones(dt)
+        self.move_events(dt)
+        self.cam += (self.body.y + 0.45 - self.cam) * (1 - math.exp(-2.6 * dt))
+        keep = {id(l.hold) for l in self.limbs.values()}
+        if self.ledge and self.ledge.home:
+            keep |= {id(h) for h in self.ledge.home[1].values()}
+        low = self.cam - 14   # 떨어져도 아래 홀드를 다시 잡을 수 있게 넉넉히 남긴다
+        self.holds = [h for h in self.holds if h.p.y > low or id(h) in keep]
+        self.bolts = [b for b in self.bolts if b.p.y > low]
+
+    # ---- 홀드 -------------------------------------------------------------
+
+    def place_hold(self, p, big=False):
+        p.x = max(-WALL_HALF + 0.3, min(WALL_HALF - 0.3, p.x))
+        for h in self.holds:
+            if abs(h.p.y - p.y) < 0.5 and (h.p - p).len() < 0.48:
+                return None
+        hold = Hold(p, self.rng.uniform(0.3, 0.36) if big else self.rng.uniform(0.19, 0.27), self.rng, big)
+        hold.made_t, hold.made_cam = self.t, self.cam
+        self.holds.append(hold)
+        return hold
+
+    def other(self, limb):
+        return next(l for l in self.limbs.values() if l.kind == limb.kind and l is not limb)
+
+    def held_y(self, limb):
+        return limb.hold.p.y if limb.mode == "grip" else limb.pos.y
+
+    def grip_point(self, limb, hold):
+        side = 0
+        if limb.kind == "H":
+            other = self.other(limb)
+            if other.hold is hold and other.mode in ("grip", "move"):
+                side = limb.side   # 두 손이 한 홀드를 모아 잡는다
+        return hold.grip(limb.kind, side)
+
+    def hand_options(self, limb, relax=0, up_only=False):
+        """손이 갈 만한 홀드들 (점수, id, 홀드). relax 면 조건을 풀어 옆으로 고쳐 잡기까지 넣는다."""
+        other = self.other(limb)
+        shoulder = limb.root(self.body, self.tilt) + V(0, 0.25)   # 손을 뻗는 동안 몸도 따라 올라온다
+        my_y, other_y = self.held_y(limb), self.held_y(other)
+        out = []
+        for h in self.holds:
+            if h is limb.hold or (h is other.hold and h.r < 0.3):
+                continue
+            gain = h.p.y - my_y
+            if gain < (0.12 if up_only else 0.12 - 0.17 * relax) or h.p.y > other_y + 1.25 + 0.4 * relax:
+                continue
+            if h in limb.recent:   # 최근에 잡았던 홀드로 돌아가지 않는다
+                continue
+            if limb.side * (h.p.x - other.pos.x) < -0.25 - 0.25 * relax:   # 팔을 크게 엇갈리지 않는다
+                continue
+            if (h.grip("H") - shoulder).len() > limb.reach * 0.97 + 0.15 + 0.2 * relax:
+                continue
+            c = self.route.center(h.p.y)
+            score = -abs(gain - 0.75) * 1.4 - abs(h.p.x - (c + limb.side * 0.6)) * 0.7 + self.rng.uniform(0, 0.6)
+            out.append((score, id(h), h))
+        return out
+
+    def foot_options(self, limb, relax=0):
+        """발이 갈 만한 홀드들. relax 면 높이 띠·몸 쪽·거리 조건을 푼다."""
+        other = self.other(limb)
+        hip = limb.root(self.body, self.tilt)
+        hands_low = min(self.held_y(l) for l in self.limbs.values() if l.kind == "H")
+        my_y = self.held_y(limb)
+        now = (limb.pos - hip).len()
+        want = hands_low - (2.15 if self.rng.random() < 0.15 else 2.65)   # 가끔 발을 높이 올린다
+        out = []
+        for h in self.holds:
+            if h is limb.hold or h is other.hold or h in limb.recent:
+                continue
+            d = (h.grip("F") - hip).len()
+            bends = now > limb.reach * 0.9 and d < now - 0.25 and h.p.y > my_y - 0.3   # 쭉 펴진 다리를 굽힌다 (많이 내려가지 않고)
+            if h.p.y < my_y + 0.15 and not bends:   # 발은 나아질 때만 옮긴다 (올라가거나 펴진 다리를 굽히거나)
+                continue
+            if not hands_low - 3.2 - 0.3 * relax < h.p.y < hands_low - 1.9 + 0.3 * relax:
+                continue
+            if limb.side * (h.p.x - self.body.x) < -0.15 * relax:
+                continue
+            if d > limb.reach * (0.88 + 0.06 * relax):   # 다리를 쭉 펴지 않는다
+                continue
+            score = (-abs(h.p.y - want) * 1.2 + (0.35 if h.chalk > 0 else 0.0)
+                     - abs(limb.side * (h.p.x - self.body.x) - 0.7) * 0.5 + self.rng.uniform(0, 0.5))
+            out.append((score, id(h), h))
+        return out
+
+    def choose_move(self):
+        """다음에 옮길 손발과 홀드. 정해진 순서 없이 그때 자세를 보고 고른다."""
+        hands = sorted((self.limbs["LH"], self.limbs["RH"]), key=self.held_y)
+        feet = sorted((self.limbs["LF"], self.limbs["RF"]), key=self.held_y)
+        if self.stall >= 3:   # 세 번 연속 제자리면: 아래에 펴진 채 남은 발을 끌어올리고, 손은 위로만 (작은 다이노까지)
+            for f in feet:
+                hip = f.root(self.body, self.tilt)
+                if f.pos.y < hip.y and (f.pos - hip).len() > f.reach * 0.9:
+                    options = self.catch_up_options(f, side_tol=0.8)
+                    if options:
+                        self.relaxed += 1
+                        return f, max(options)[2]
+            for relax in (0, 1, 2):
+                for limb in hands:
+                    options = self.hand_options(limb, relax, up_only=True)
+                    if options:
+                        self.relaxed += 1
+                        return limb, max(options)[2]
+            reach = self.reach_options(hands) or self.reach_options(feet)
+            if reach:
+                self.relaxed += 1
+                return reach[1], reach[0]
+        stretch = self.held_y(hands[0]) - self.held_y(feet[1])
+        r = self.rng.random()
+        pinned = [f for f in feet if (f.pos - f.root(self.body, self.tilt)).len() > f.reach * 0.9]
+        if pinned:
+            order = pinned + [l for l in (hands[0], hands[1], feet[0], feet[1]) if l not in pinned]   # 다리가 펴진 발부터 따라 올린다
+        elif stretch > 2.95 or (stretch > 2.55 and r < 0.4):
+            order = [feet[0], feet[1], hands[0], hands[1]]          # 몸이 길게 늘어났으면 발부터
+        elif r < 0.12:
+            order = [hands[1], hands[0], feet[0], feet[1]]          # 위쪽 손을 한 번 더 (멀리 뻗기·고쳐 잡기)
+        elif r < 0.22:
+            order = [self.rng.choice(feet), hands[0], hands[1]]     # 발 고쳐 딛기
+        else:
+            order = [hands[0], hands[1], feet[0], feet[1]]
+        for relax in (0, 1, 2):   # 맞는 데가 없으면 조건을 풀어 고쳐 잡기·고쳐 딛기, 그래도 없으면 멀리 뻗어 몸을 당겨 올리기
+            for limb in (order if relax == 0 else order + [l for l in hands + feet if l not in order]):
+                options = self.hand_options(limb, relax) if limb.kind == "H" else self.foot_options(limb, relax)
+                if options:
+                    self.relaxed += relax > 0
+                    return limb, max(options)[2]
+        for limb in order + [l for l in hands + feet if l not in order]:   # 따라잡기: 닿는 홀드라면 지금보다 위 아무 데나
+            options = self.catch_up_options(limb)
+            if options:
+                self.relaxed += 1
+                return limb, max(options)[2]
+        reach = self.reach_options(hands + feet)
+        if reach:
+            self.relaxed += 1
+            return reach[1], reach[0]
+        self.missing += 1   # 그래도 없으면 가장 처진 손발 쪽 길 위에 하나 만든다
+        limb = min(hands + feet, key=lambda l: self.held_y(l) - (self.body.y + (HAND_UP if l.kind == "H" else -FOOT_DOWN)))
+        y = self.held_y(limb) + 0.6
+        x = (self.body.x + self.route.center(y)) / 2 + limb.side * 0.6
+        hold = self.place_hold(V(x, y))
+        if hold is None:
+            hold = Hold(V(x, y), 0.22, self.rng)
+            self.holds.append(hold)
+        return limb, hold
+
+    def reach_options(self, limbs):
+        """작은 다이노: 위쪽의 가장 가까운 홀드까지 뻗어 몸을 끌어올린다. (홀드, 손발) 또는 None."""
+        best = None
+        for limb in limbs:
+            root = limb.root(self.body, self.tilt)
+            for h in self.holds:
+                if h is limb.hold or h is self.other(limb).hold or h.p.y <= self.held_y(limb) + 0.2:
+                    continue
+                d = (h.p - root).len()
+                if d < (2.6 if limb.kind == "H" else 2.2) and (best is None or d < best[0]):
+                    best = (d, h, limb)
+        return best[1:] if best else None
+
+    def catch_up_options(self, limb, side_tol=0.4):
+        other = self.other(limb)
+        root = limb.root(self.body, self.tilt) + (V(0, 0.25) if limb.kind == "H" else V())
+        ideal = self.body + V(limb.side * 0.7, HAND_UP if limb.kind == "H" else -FOOT_DOWN)
+        limit = limb.reach * (0.97 if limb.kind == "H" else 0.92)
+        return [(-(h.p - ideal).len(), id(h), h) for h in self.holds
+                if h is not limb.hold and h not in limb.recent and (h is not other.hold or (limb.kind == "H" and h.r >= 0.3))
+                and h.p.y > self.held_y(limb) + 0.2 and (h.grip(limb.kind) - root).len() < limit
+                and limb.side * (h.p.x - self.body.x) > -side_tol]
+
+    # ---- 몸 움직임 ---------------------------------------------------------
+
+    def anchors(self, kind):
+        pts = []
+        for limb in self.limbs.values():
+            if limb.kind != kind:
+                continue
+            if limb.mode == "grip":
+                pts.append(limb.pos)
+            elif limb.mode == "move" and limb.goal is not None:
+                pts.append(limb.goal)
+            elif limb.mode in ("move", "follow") and limb.hold is not None and self.mode == "spring":
+                pts.append(limb.hold.p)   # 초크·팔 털기로 잠깐 뗀 손은 돌아갈 홀드 기준 (몸이 남은 손 쪽으로 끌려가지 않는다)
+        return pts
+
+    def stance_target(self):
+        """몸이 갈 자리. 손발을 옮기는 동작 단계 (무게 옮기기·일어서기) 가 정했으면 그 자리, 아니면 평소 자세."""
+        hx = self.hang_target()
+        if self.phase_target is not None:
+            return self.phase_target(), hx[1]
+        return hx
+
+    def hang_target(self):
+        """평소 자세: 팔을 쭉 펴고 뼈로 매달린다 (가장 높이 매달린 팔이 95% 펴지는 높이).
+        무릎을 살짝 굽힌 채 (다리 90%) 다리가 닿는 데까지만 내려가고, 엉덩이는 발보다 0.3 위에 둔다. 잠깐 뗀 손은 돌아갈 홀드 기준."""
+        hands = [l for l in self.limbs.values() if l.kind == "H" and l.hold is not None and l.mode in ("grip", "move", "follow")]
+        feet = [l for l in self.limbs.values() if l.kind == "F" and l.mode == "grip"]
+        if not hands:
+            return V(self.body.x, self.body.y), self.body.x
+        grips = [(l, l.hold.grip("H")) for l in hands]
+        hx = sum(g.x for _, g in grips) / len(grips)
+        fx = sum(f.pos.x for f in feet) / len(feet) if feet else hx
+        wind = math.sin(self.t * 1.3) * 0.16 * self.precip() ** 2   # 거센 바람에 몸이 흔들린다
+        x = hx * 0.5 + fx * 0.5 + wind
+        y = max(g.y - SHOULDER[1] - math.sqrt(max(0.01, (l.reach * 0.95) ** 2 - (g.x - x - l.side * SHOULDER[0]) ** 2))
+                for l, g in grips)
+        for f in feet:
+            dx = f.pos.x - x - f.side * HIP[0]
+            y = min(y, f.pos.y - HIP[1] + math.sqrt(max(0.01, (f.reach * 0.9) ** 2 - dx * dx)))   # 무릎은 살짝 굽혀 둔다
+        if feet:
+            y = max(y, max(f.pos.y for f in feet) - HIP[1] + 0.3)
+        return V(x, y - self.crouch - 0.3 * self.duck), hx
+
+    def reach_height(self, limb, hold, x):
+        """손이 hold 에 편하게 (팔 88%) 닿는 몸 높이."""
+        g = hold.grip("H")
+        dx = g.x - x - limb.side * SHOULDER[0]
+        return g.y - SHOULDER[1] - math.sqrt(max(0.01, (limb.reach * 0.88) ** 2 - dx * dx))
+
+    def project(self, pos):
+        """잡고 있는 손발이 닿는 거리 안으로 몸을 끌어당긴다. 홀드로 가는 손발은 동작 후반부터 조금씩 당긴다
+        (잡는 순간 몸이 한 번에 끌려가지 않게)."""
+        for _ in range(4):
+            for limb in self.limbs.values():
+                if limb.mode == "grip":
+                    target, limit = limb.pos, limb.reach * 0.985
+                elif limb.mode == "move" and limb.target is not None:
+                    target = limb.target
+                    limit = limb.reach * 0.985 + 2.5 * (1 - smooth(max(0.0, limb.progress - 0.4) / 0.6))
+                else:
+                    continue
+                d = target - limb.root(pos, self.tilt)
+                dist = d.len()
+                if dist > limit:
+                    pos = pos + d * ((dist - limit) / dist)
+        return pos
+
+    def move_body(self, dt):
+        if self.mode == "script":
+            return
+        if self.mode == "spring":
+            target, hx = self.stance_target()
+            w, zeta = (9.0, 0.85) if self.phase_target is not None else (6.5, 0.72)   # 동작 단계는 또렷하게
+            if self.phase_target is not None and self.k_now < 0.72:   # 전력 질주: 짧아진 동작을 몸이 따라가게
+                w *= math.sqrt(0.72 / self.k_now)
+            acc = (target - self.body) * (w * w) - self.vel * (2 * zeta * w)
+            lh, rh = self.limbs["LH"], self.limbs["RH"]
+            lean = 0.0
+            if lh.hold is not None and rh.hold is not None:   # 한 손이 높으면 그쪽 어깨를 올려 두 팔로 고르게 매달린다
+                lean = 0.45 * (rh.hold.p.y - lh.hold.p.y)    # (초크 등으로 잠깐 뗀 손도 돌아갈 홀드로 쳐서 몸이 들썩이지 않게)
+            tilt_goal = max(-0.4, min(0.4, -0.22 * (hx - self.body.x) + lean))
+        else:
+            acc = V(0, -GRAVITY)
+            grips = [l.pos for l in self.limbs.values() if l.mode == "grip" and l.kind == "H"]
+            gx = sum(p.x for p in grips) / len(grips) if grips else self.body.x
+            tilt_goal = max(-0.6, min(0.6, -0.7 * (gx - self.body.x)))
+        self.vel = self.vel + acc * dt
+        if self.mode == "hang":
+            self.vel = self.vel * math.exp(-0.9 * dt)
+        if self.rope is not None:   # 로프가 팽팽해지면 늘어나며 잡아 준다 (출렁)
+            anchor, length = self.rope
+            d = self.harness() - anchor
+            dist = d.len() or 1e-6
+            if dist > length:
+                n = d * (1 / dist)
+                along = self.vel.x * n.x + self.vel.y * n.y
+                self.vel = self.vel - n * ((110.0 * (dist - length) + 7.0 * along) * dt)
+                if dist > length + 0.7:   # 로프는 0.7 넘게 늘어나지 않는다
+                    self.body = self.body - n * (dist - length - 0.7)
+                    if along > 0:
+                        self.vel = self.vel - n * along
+        old = self.body
+        free = old + self.vel * dt
+        moved = self.project(free)
+        self.vel = self.vel + (moved - free) * (0.5 / dt)   # 끌려간 만큼의 속도는 반만 남긴다 (튀어 오르지 않게)
+        self.body = moved
+        self.tilt_vel += ((tilt_goal - self.tilt) * 60 - self.tilt_vel * 11) * dt
+        self.tilt += self.tilt_vel * dt
+
+    def move_free_limbs(self, dt):
+        for limb in self.limbs.values():
+            if limb.mode != "free":
+                continue
+            limb.vel = (limb.vel + V(0, -GRAVITY) * dt) * math.exp(-3.0 * dt)
+            old = limb.pos
+            pos = old + limb.vel * dt
+            root = limb.root(self.body, self.tilt)
+            d = pos - root
+            dist = d.len() or 1e-6
+            lo, hi = limb.reach * 0.6, limb.reach * 0.96
+            if dist > hi or dist < lo:
+                pos = root + d * (max(lo, min(hi, dist)) / dist)
+            limb.vel = (pos - old) * (1 / dt)
+            limb.pos = pos
+
+    def move_effects(self, dt):
+        self.squash_vel += ((1.0 - self.squash) * 160 - self.squash_vel * 13) * dt
+        self.squash += self.squash_vel * dt
+        if self.look_at is not None:   # 다음 홀드 쪽을 보고, 위아래로 고개를 든다·숙인다 (옆으로 많이 갈 때만 돌아본다)
+            dx, dy = self.look_at.x - self.body.x, self.look_at.y - self.body.y
+            if abs(dx) > 0.8 and dy > -0.5:
+                self.face = 1 if dx < 0 else -1
+            look = -self.face * max(-0.3, min(0.3, 0.12 * dy))
+        else:
+            look = 0.0
+        self.look_tilt += (look - self.look_tilt) * (1 - math.exp(-8 * dt))
+        step = 7.0 * dt
+        self.face_now = max(self.face_now - step, self.face) if self.face < self.face_now else min(self.face_now + step, self.face)
+        self.hp_shown += max(-60 * dt, min(45 * dt, self.hp - self.hp_shown))
+        for p in self.particles:
+            p.age += dt
+            p.p = p.p + p.v * dt
+            if p.kind == "sweat":
+                p.v = p.v + V(0, -GRAVITY * 0.35) * dt
+            elif p.kind == "confetti":
+                p.v = p.v * math.exp(-1.5 * dt) + V(0, -6.0) * dt
+            elif p.kind == "rock":
+                p.v = p.v + V(0, -GRAVITY * 0.6) * dt
+            else:
+                p.v = p.v * math.exp(-3.0 * dt) + V(0, -0.15) * dt
+        self.particles = [p for p in self.particles if p.age < p.life]
+        for f in self.texts:
+            f.age += dt
+            if f.style == "z":
+                f.p = f.p + V(0.25 * math.cos(f.age * 2.6) * dt - 0.12 * self.face * dt, 0.5 * dt)
+            else:
+                f.p = f.p + V(0, 0.9 * dt)
+        self.texts = [f for f in self.texts if f.age < f.life]
+        if self.hp <= 60 and not self.sleeping:
+            self.sweat_t -= dt
+            if self.sweat_t <= 0:
+                self.sweat_t = 1.6 if self.hp > 30 else 0.8
+                side = self.wrng.choice((-1, 1))
+                self.particles.append(Particle(self.body + V(side * 0.7, 0.75).rot(self.tilt),
+                                               V(side * 0.6, 0.6), 1.1, 0.12, "sweat"))
+        # 눈 깜빡임과 잠꼬대
+        if self.blink_age is not None:
+            self.blink_age += dt
+            if self.blink_age > 0.16:
+                self.blink_age = None
+        elif self.lids < 0.5:
+            self.blink_t -= dt
+            if self.blink_t <= 0:
+                self.blink_t, self.blink_age = self.wrng.uniform(2.2, 5.0), 0.0
+        if self.sleeping:
+            self.z_t -= dt
+            if self.z_t <= 0:
+                self.z_t = 1.3
+                self.texts.append(Float(self.body + V(-0.5 * self.face, 1.0), self.wrng.choice(("z", "Z")), "z"))
+
+    def move_milestones(self, dt):
+        """기록을 넘으면 말풍선과 색종이. 같은 기록은 한 번만."""
+        if self.banner is not None:
+            self.banner[1] += dt
+            if self.banner[1] > 3.5:
+                self.banner = None
+        alt = self.altitude()
+        if alt <= self.peak:
+            return
+        self.peak = alt
+        while self.passed < len(MILESTONES) and alt >= MILESTONES[self.passed][0]:
+            height, name, text = MILESTONES[self.passed]
+            self.passed += 1
+            self.banner = [text, 0.0]
+            self.banners.append(height)
+            for _ in range(26):
+                a = self.wrng.uniform(0.35, math.pi - 0.35)
+                speed = self.wrng.uniform(2.5, 4.5)
+                self.particles.append(Particle(self.body + V(0, 1.2), V(math.cos(a) * speed, math.sin(a) * speed),
+                                               1.6, 0.1, "confetti", self.wrng.choice(CONFETTI)))
+
+    def move_events(self, dt):
+        """추락 이벤트: 비·눈에 발 미끄러짐, 체력이 낮으면 손 미끄러짐, 폭풍우에 낙석."""
+        rng = self.wrng
+        for rock in self.rocks:
+            rock[1] = rock[1] + V(0, -GRAVITY * 0.3) * dt
+            rock[0] = rock[0] + rock[1] * dt
+            rock[2] += rock[3] * dt
+            if not rock[5] and rock[0].y < self.body.y + 1.0:   # 바위 턱에 튕겨 옆으로
+                rock[5] = True
+                side = 1 if rock[0].x > self.body.x else -1
+                rock[1] = V(side * rng.uniform(1.5, 2.5), 1.5)
+                self.puff(rock[0], n=5, speed=1.0, size=0.12, life=0.6)
+        self.rocks = [r for r in self.rocks if r[0].y > self.cam - 10]
+        near = any(0 < r[0].y - self.body.y < 3.5 and not r[5] for r in self.rocks)
+        if near:
+            self.duck_t = 0.5
+        elif self.duck_t > 0:
+            self.duck_t -= dt
+            if self.duck_t <= 0:
+                self.texts.append(Float(self.body + V(0, 1.4), "휴!"))
+        self.duck += ((1.0 if self.duck_t > 0 else 0.0) - self.duck) * (1 - math.exp(-10 * dt))
+        if not self.events or self.sleeping or self.work <= 0 or self.resting or self.rope is not None:
+            return
+        if self.weather > 0.85 and self.precip() > 0:   # 폭풍우: 낙석
+            self.rock_t -= dt
+            if self.rock_t <= 0:
+                self.rock_t = rng.uniform(15, 30)
+                side = rng.choice((-1, 1))
+                x = max(-WALL_HALF, min(WALL_HALF, self.body.x + side * rng.uniform(0.9, 1.4)))
+                self.rocks.append([V(x, self.cam + VIEW_TOP + 1), V(0, -4.0), 0.0, rng.uniform(-6, 6), rng.uniform(0.25, 0.4), False])
+        wet = self.precip() > 0.3
+        if (wet or self.hp <= 20) and not self.requests:
+            self.slip_t -= dt
+            if self.slip_t <= 0:
+                self.slip_t = rng.uniform(25, 45)
+                self.request("slip_hand" if self.hp <= 20 and (not wet or rng.random() < 0.5) else "slip_foot")
+
+    def move_weather(self, dt):
+        target = WEATHER[max(0, min(3, self.work))] if not self.sleeping else 0.0
+        self.weather += (target - self.weather) * (1 - math.exp(-0.6 * dt))
+        amount = self.precip()
+        if amount > 0 and not self.precipitating:   # 비·눈이 새로 시작될 때마다 무작위 (내리는 동안은 그대로)
+            self.weather_kind = self.wrng.choice(("rain", "snow"))
+        self.precipitating = amount > 0
+        rain = self.weather_kind == "rain"
+        want = round((90 if rain else 70) * amount * self.drop_scale)
+        wind = (0.35 if rain else 0.55) * amount ** 1.5
+        rng = self.wrng
+        if self.drops_kind != self.weather_kind:   # 비 ↔ 눈: 화면에 고루 다시 뿌린다
+            self.drops_kind = self.weather_kind
+            self.drops = [self.new_drop(rain, rng.random()) for _ in range(want)]
+        kept = []
+        for d in self.drops:
+            d[1] += d[2] * dt
+            d[0] = (d[0] + (wind + (0 if rain else 0.04 * math.sin(self.t * 2 + d[4]))) * dt) % 1.0
+            if d[1] > 1.05:
+                if len(kept) >= want:
+                    continue
+                d[0], d[1] = rng.random(), rng.uniform(-0.1, 0.0)
+            kept.append(d)
+        while len(kept) < want:
+            kept.append(self.new_drop(rain, rng.uniform(-0.15, 0.0)))
+        self.drops = kept
+        self.wind = wind
+        # 폭풍우에는 가끔 번개
+        self.flash = max(0.0, self.flash - dt * 5)
+        if self.flash2 is not None:
+            self.flash2 -= dt
+            if self.flash2 <= 0:
+                self.flash, self.flash2 = 0.8, None
+        if rain and self.weather > 0.88:
+            self.flash_t -= dt
+            if self.flash_t <= 0:
+                self.flash_t, self.flash, self.flash2 = rng.uniform(5.0, 11.0), 1.0, 0.14
+        snowing = not rain and amount > 0
+        for h in self.holds:
+            h.snow = min(1.0, h.snow + dt * 0.12 * amount) if snowing else max(0.0, h.snow - dt * 0.04)
+
+    def new_drop(self, rain, y):
+        """빗방울·눈송이 [x, y, 떨어지는 빠르기, 크기, 흔들림 위상] (창 높이에 대한 비율)."""
+        rng = self.wrng
+        speed = rng.uniform(1.6, 2.2) if rain else rng.uniform(0.1, 0.22)
+        return [rng.random(), y, speed, rng.uniform(0.6, 1.0), rng.uniform(0, 6.3)]
+
+    def puff(self, at, n=6, speed=1.2, size=0.16, life=0.8):
+        for _ in range(n):
+            a = self.wrng.uniform(0, 2 * math.pi)
+            s = self.wrng.uniform(0.3, 1.0) * speed
+            self.particles.append(Particle(at, V(math.cos(a) * s, math.sin(a) * s * 0.7 + 0.2),
+                                           life * self.wrng.uniform(0.7, 1.2), size * self.wrng.uniform(0.7, 1.3)))
+
+    def blow_puff(self, name):
+        hand = self.limbs[name].pos
+        for _ in range(7):
+            self.particles.append(Particle(hand, V(-self.face * self.wrng.uniform(0.8, 1.8), self.wrng.uniform(-0.3, 0.6)),
+                                           self.wrng.uniform(0.6, 1.0), self.wrng.uniform(0.12, 0.2)))
+        self.squash_vel -= 1.2
+
+    # ---- 몸에 붙은 자리 -----------------------------------------------------
+
+    def harness(self):
+        """하네스 (로프를 묶은 곳)."""
+        return self.body + V(0, -0.62).rot(self.tilt)
+
+    def bag_mouth(self, depth=0.0):
+        """허리 뒤 초크백 입구 (보는 쪽의 반대편)."""
+        return self.body + V(0.46 * self.face, -0.78 - depth).rot(self.tilt)
+
+    def blow_point(self):
+        return self.body + V(-1.05 * self.face, -0.05).rot(self.tilt)
+
+    def tucked(self, name):
+        """침낭 안에 넣은 손발 자리."""
+        side, kind = LIMBS[name]
+        offset = V(side * 0.55, -0.35) if kind == "H" else V(side * 0.35, -0.85)
+
+        def point():
+            return self.body + offset.rot(self.tilt)
+
+        point.tucked = True
+        return point
+
+    # ---- 동작 (제너레이터: 한 프레임마다 dt 를 받는다) ---------------------------
+
+    def brain(self):
+        yield
+        while True:
+            self.charging = True
+            if self.requests:
+                name, args = self.requests.pop(0)
+                if self.sleeping and name not in AWAKE:
+                    continue   # 잠들기 전에 받아 둔 동작은 버린다
+                yield from getattr(self, name)(*args)
+                continue
+            if self.sleeping:
+                yield from self.wait(0.3)
+                continue
+            if not self.has_climb():
+                yield from self.rest()
+                continue
+            bolt = self.bolt_to_clip()
+            if bolt is not None:
+                yield from self.clip(bolt)
+                continue
+            sprint = DYNO_MIX.get(self.pace, 0.0) if self.tokens_on and self.hp > 30 else 0.0
+            if sprint and self.rng.random() < sprint and self.dyno_jug(near=True) is not None:
+                yield from self.dyno(show=False)   # 많이 쌓였으면 다이노를 섞어 크게 오른다
+            else:
+                yield from self.climb_move()
+            if self.hp <= 60 and self.t >= self.shake_t:   # 체력이 줄었으면 오르다가 가끔 팔을 턴다
+                if self.shake_t:
+                    yield from self.shake()
+                self.shake_t = self.t + self.wrng.uniform(*SHAKE_EVERY)
+            self.look_ahead()
+            yield from self.wait(self.pause_time(), until=lambda: not self.has_climb())
+
+    def look_ahead(self):
+        ahead = self.route.center(self.body.y + 2.5) - self.body.x
+        if abs(ahead) > 0.45:
+            self.face = -1 if ahead > 0 else 1   # 가는 쪽을 본다
+
+    def pause_time(self):
+        lo, hi = PACE_PAUSE[max(1, self.pace)]
+        return self.rng.uniform(lo, hi) + (0.35 if self.hp <= 30 else 0.0)
+
+    def wait(self, seconds, stoppable=True, until=None):
+        t = 0.0
+        while t < seconds:
+            if (stoppable and self.requests) or (until is not None and until()):
+                return
+            t += yield
+
+    def tween(self, obj, attr, a, b, dur):
+        t = 0.0
+        while t < dur:
+            t += yield
+            setattr(obj, attr, a + (b - a) * smooth(min(1.0, t / dur)))
+
+    def move_limb(self, name, goal, dur, arc=0.14, support=True, ease=smooth):
+        """손발 하나를 goal (Hold, 점, 또는 점을 돌려주는 함수) 로 옮긴다. 홀드면 잡고, 함수면 그 자리에 붙어 있는다."""
+        limb = self.limbs[name]
+        start = limb.pos
+        hold = goal if isinstance(goal, Hold) else None
+
+        def end():
+            if hold is not None:
+                return self.grip_point(limb, hold)
+            return goal() if callable(goal) else goal
+
+        limb.mode, limb.tucked = "move", False
+        limb.goal = end() if hold is not None and support else None
+        limb.target, limb.progress = (end() if hold is not None else None), 0.0
+        t = 0.0
+        while t < dur:
+            t += yield
+            k = min(1.0, t / dur)
+            bump = math.sin(math.pi * k)
+            limb.pos = start.lerp(end(), ease(k)) + V(limb.side * arc, arc * 0.6) * bump
+            limb.progress = k
+        limb.goal = limb.target = None
+        if hold is not None:
+            self.grab(limb, hold)
+        elif callable(goal):
+            limb.mode, limb.follow = "follow", goal
+        else:
+            limb.mode, limb.follow = "follow", (lambda p=end(): p)
+
+    def grab(self, limb, hold):
+        if hold is not limb.hold and limb.hold is not None:
+            limb.recent.append(limb.hold)
+        limb.mode, limb.hold = "grip", hold
+        limb.pos = self.grip_point(limb, hold)
+        self.grabs.append((self.t, limb.name, hold))
+        if hold.snow > 0.3:   # 눈을 털어 낸다
+            self.puff(limb.pos, n=3, speed=0.6, size=0.1, life=0.5)
+            hold.snow = 0.0
+        if limb.kind == "H":
+            hold.chalk = min(1.0, hold.chalk + 0.3)
+            if self.wrng.random() < 0.35:
+                self.puff(limb.pos, n=2, speed=0.5, size=0.1, life=0.5)
+            shared = self.other(limb).hold is hold
+            if self.events and not hold.big and not shared and self.rope is None and self.wrng.random() < 1 / 80:
+                self.requests.insert(0, ("break_hold", (limb, hold)))   # 사암 홀드가 부서진다
+
+    def move_all(self, goals, dur, body_to=None, tilt_to=None, hop=0.0):
+        """여러 손발 (과 몸) 을 한꺼번에 옮긴다. goals: {이름: Hold 또는 점을 돌려주는 함수}."""
+        starts = {n: self.limbs[n].pos for n in goals}
+        for n in goals:
+            self.limbs[n].mode, self.limbs[n].goal, self.limbs[n].tucked = "move", None, False
+        b0, a0 = self.body, self.tilt
+        if body_to is not None:
+            self.mode = "script"
+        t = 0.0
+        while t < dur:
+            dt = yield
+            t += dt
+            k = smooth(min(1.0, t / dur))
+            if body_to is not None:
+                old = self.body
+                self.body = b0.lerp(body_to(), k) + V(0, hop * math.sin(math.pi * k))
+                self.vel = (self.body - old) * (1 / dt)
+            if tilt_to is not None:
+                self.tilt, self.tilt_vel = a0 + (tilt_to - a0) * k, 0.0
+            for n, goal in goals.items():
+                limb = self.limbs[n]
+                end = self.grip_point(limb, goal) if isinstance(goal, Hold) else goal()
+                limb.pos = starts[n].lerp(end, k)
+        for n, goal in goals.items():
+            limb = self.limbs[n]
+            if isinstance(goal, Hold):
+                self.grab(limb, goal)
+            else:
+                limb.mode, limb.follow = "follow", goal
+                limb.tucked = getattr(goal, "tucked", False)
+
+    def climb_move(self):
+        limb, hold = self.choose_move()
+        self.moves.append(limb.name)
+        self.move_start = self.body.x   # 이 동작을 시작할 때 몸 x (검사용)
+        self.k_now = PACE_DUR[max(1, self.pace)]
+        k = self.k_now * (1.4 if self.hp <= 30 else 1.0)
+        try:
+            if limb.kind == "H":
+                yield from self.reach_move(limb, hold, k)
+            else:
+                yield from self.foot_move(limb, hold, k)
+        finally:
+            self.phase_target = self.look_at = None
+        total = sum(self.held_y(l) for l in self.limbs.values())   # 손발 높이의 합이 최고 기록을 넘어야 나아간 것
+        if total > self.best_top + 0.05:
+            self.best_top, self.stall = total, 0
+        else:
+            self.stall += 1   # 옆으로만 옮기거나 오르내리며 맴돌면 쌓인다
+
+    def settle(self, target, least, most, left=0.0):
+        """몸이 target 에 거의 닿을 때까지 (least~most 초) 기다린다. left 면 처음 거리의 그만큼 남았을 때 끝낸다
+        (일어서는 도중에 손을 뻗기 시작해 동작이 이어진다)."""
+        t, first = 0.0, (target - self.body).len()
+        while t < most and (t < least or (target - self.body).len() > max(0.06, first * left)):
+            t += yield
+
+    def reach_move(self, limb, hold, k):
+        """손 뻗기: 보기 → 반대쪽 발 위로 무게 옮기기 → 다리로 일어서기 → 빠르게 뻗고 부드럽게 잡기 → 고쳐 쥐기.
+        옆으로 멀리 뻗을 때는 가끔 반대쪽 다리를 옆으로 뻗어 균형을 잡는다 (플래깅)."""
+        self.look_at = hold.p
+        reach_x = hold.p.x - self.body.x
+        flag = None
+        if limb.side * reach_x > 0.8 and self.rng.random() < 0.35:
+            flag = self.limbs["LF" if limb.side > 0 else "RF"]   # 뻗는 쪽 반대 다리
+        support = self.limbs["RF" if limb.side > 0 else "LF"] if flag else self.limbs["LF" if limb.side > 0 else "RF"]
+        base = self.hang_target()[0]
+        x0 = self.body.x
+        dx = ((support.pos.x if support.mode == "grip" else x0) - x0) * 0.55
+        if -limb.side * dx < 0.15 and not flag:
+            dx = -limb.side * 0.15   # 적어도 조금은 반대쪽으로
+        shift = V(x0 + dx, base.y)
+        self.flagging = flag is not None
+        self.phase_target = lambda: shift
+        yield from self.settle(shift, 0.16 * k, 0.4 * k)
+        flag_home = None
+        if flag is not None and flag.mode == "grip":
+            flag_home = flag.hold
+            out = lambda: flag.root(self.body, self.tilt) + V(flag.side * 1.25, -0.75)
+            yield from self.move_limb(flag.name, out, 0.22 * k, arc=0.06)
+        stand = V(shift.x, max(base.y, min(self.reach_height(limb, hold, shift.x), base.y + 1.2)))
+        self.phase_target = lambda: stand
+        yield from self.settle(stand, 0.1 * k, (0.25 + 0.4 * max(0.0, stand.y - self.body.y)) * k, left=0.3)
+        dist = (hold.p - limb.pos).len()
+        yield from self.move_limb(limb.name, hold, (0.2 + 0.1 * dist) * k, arc=0.06, support=False, ease=ease_out)
+        limb.wiggle = 0.18
+        if flag_home is not None:
+            yield from self.move_limb(flag.name, flag_home, 0.25 * k, arc=0.08)
+        self.phase_target = self.look_at = None   # 잡고 나면 팔을 펴며 내려앉아 한숨 돌린다
+        yield from self.settle(self.hang_target()[0], 0.1 * k, 0.35 * k)
+
+    def foot_move(self, limb, hold, k):
+        """발 옮기기: 아래를 보고 무게를 다른 발로 넘긴 뒤, 무릎을 들어 홀드 위에서 잠깐 겨눴다가 콕 놓는다."""
+        self.look_at = hold.p
+        other = self.other(limb)
+        base = self.hang_target()[0]
+        shift = V(base.x + ((other.pos.x if other.mode == "grip" else base.x) - base.x) * 0.45, base.y)
+        self.phase_target = lambda: shift
+        yield from self.settle(shift, 0.1 * k, 0.3 * k)
+        above = lambda: self.grip_point(limb, hold) + V(limb.side * 0.05, 0.28)
+        dist = (hold.p - limb.pos).len()
+        yield from self.move_limb(limb.name, above, (0.18 + 0.1 * dist) * k, arc=0.12)
+        yield from self.wait(0.1 * k, stoppable=False)
+        yield from self.move_limb(limb.name, hold, 0.09 * k, arc=0.0)
+
+    def bolt_to_clip(self):
+        """하네스가 막 지나간, 아직 로프를 안 건 볼트. 너무 지나쳤으면 걸지 않고 넘어간다 (런아웃)."""
+        if not self.events:
+            return None
+        h = self.harness()
+        for bolt in self.bolts:
+            if bolt.clipped or bolt.skipped or bolt.p.y > h.y + 0.4:
+                continue
+            if bolt.p.y < h.y - 1.5:
+                bolt.skipped = True   # 너무 지나쳤다 (런아웃)
+                continue
+            return bolt
+        return None
+
+    def clip(self, bolt):
+        """클립: 볼트 쪽 손으로 허리에서 로프를 집어 올려 퀵드로에 걸고 홀드로 돌아간다."""
+        self.actions.append("clip")
+        side = 1 if bolt.p.x > self.body.x else -1
+        limb = self.limbs["RH" if side > 0 else "LH"]
+        if limb.mode != "grip" or (bolt.p - limb.root(self.body, self.tilt)).len() > limb.reach * 0.98:
+            limb = self.limbs["LH" if side > 0 else "RH"]
+            if limb.mode != "grip" or (bolt.p - limb.root(self.body, self.tilt)).len() > limb.reach * 0.98:
+                bolt.skipped = True   # 손이 안 닿으면 건너뛴다
+                return
+        home = limb.hold
+        self.look_at = bolt.p
+        try:
+            yield from self.move_limb(limb.name, self.harness, 0.25, arc=0.05)
+            self.rope_hand = limb.name
+            yield from self.move_limb(limb.name, bolt.rope_point, 0.3, arc=0.08)
+            bolt.clipped = True
+            self.rope_hand = None
+            self.puff(bolt.rope_point(), n=2, speed=0.4, size=0.08, life=0.4)
+            yield from self.move_limb(limb.name, home, 0.28, arc=0.1)
+        finally:
+            self.look_at, self.rope_hand = None, None
+
+    def break_now(self):
+        """시제품용: 지금 잡은 손 홀드를 바로 부순다."""
+        for limb in (self.limbs["LH"], self.limbs["RH"]):
+            if limb.mode == "grip" and self.other(limb).hold is not limb.hold:
+                yield from self.break_hold(limb, limb.hold)
+                return
+
+    def rockfall(self):
+        """시제품용: 낙석을 하나 떨어뜨린다."""
+        side = self.wrng.choice((-1, 1))
+        x = max(-WALL_HALF, min(WALL_HALF, self.body.x + side * 1.1))
+        self.rocks.append([V(x, self.cam + VIEW_TOP + 1), V(0, -4.0), 0.0, self.wrng.uniform(-6, 6), 0.35, False])
+        yield
+
+    def slip_foot(self):
+        """A. 발 미끄러짐 (젖은 바위): 발이 쭉 빠져 몸이 덜컥 처지고, 다시 디딘다."""
+        feet = [f for f in (self.limbs["LF"], self.limbs["RF"]) if f.mode == "grip"]
+        if not feet or self.mode != "spring":
+            return
+        f = self.wrng.choice(feet)
+        home = f.hold
+        self.actions.append("slip_foot")
+        f.mode, f.vel = "free", V(f.side * 1.2, -2.0)
+        self.vel = self.vel + V(0, -1.6)
+        self.squash_vel -= 2.0
+        self.puff(home.grip("F"), n=4, speed=0.8, size=0.1, life=0.5)
+        self.texts.append(Float(self.body + V(0, 1.4), "앗!"))
+        yield from self.wait(0.6, stoppable=False)
+        yield from self.move_limb(f.name, home, 0.3, arc=0.1)
+
+    def slip_hand(self):
+        """B. 손 미끄러짐 (펌핑): 한 손과 같은 쪽 발이 빠져 문짝처럼 휙 돌다가 다시 잡는다."""
+        hands = [h for h in (self.limbs["LH"], self.limbs["RH"]) if h.mode == "grip"]
+        if len(hands) < 2 or self.mode != "spring":
+            return
+        h = self.wrng.choice(hands)
+        f = self.limbs["RF" if h.side > 0 else "LF"]
+        homes = {h.name: h.hold, f.name: f.hold}
+        self.actions.append("slip_hand")
+        h.mode, h.vel = "free", V(h.side * 2.0, -1.0)
+        if f.mode == "grip":
+            f.mode, f.vel = "free", V(f.side * 1.5, -1.0)
+        self.mode = "hang"
+        self.vel = V(-h.side * 1.8, -0.6)
+        self.squash_vel -= 2.5
+        self.texts.append(Float(self.body + V(0, 1.4), "으앗!"))
+        try:
+            yield from self.wait(0.9, stoppable=False)
+            yield from self.move_limb(h.name, homes[h.name], 0.35, arc=0.1)
+            if homes[f.name] is not None and f.mode != "grip":
+                yield from self.move_limb(f.name, homes[f.name], 0.3, arc=0.1)
+        finally:
+            self.mode = "spring"
+
+    def break_hold(self, limb, hold):
+        """C. 홀드 부서짐: 잡은 사암 홀드가 부서져 조각이 떨어지고, 손이 빠졌다가 다른 홀드를 잡는다."""
+        if limb.hold is not hold or limb.mode != "grip" or self.mode != "spring":
+            return
+        self.actions.append("break")
+        for _ in range(7):
+            self.particles.append(Particle(hold.p, V(self.wrng.uniform(-1.2, 1.2), self.wrng.uniform(-0.5, 1.5)),
+                                           1.2, self.wrng.uniform(0.07, 0.13), "rock", (180, 130, 85)))
+        if hold in self.holds:
+            self.holds.remove(hold)
+        limb.mode, limb.vel = "free", V(limb.side * 0.8, -2.0)
+        self.vel = self.vel + V(0, -1.2)
+        self.texts.append(Float(self.body + V(0, 1.4), "으악!"))
+        yield from self.wait(0.5, stoppable=False)
+        options = self.hand_options(limb, 1) or self.hand_options(limb, 2)
+        if options:
+            new = max(options)[2]
+        else:
+            root = limb.root(self.body, self.tilt)
+            new = min((h for h in self.holds if h is not self.other(limb).hold), key=lambda h: (h.p - root).len())
+        yield from self.move_limb(limb.name, new, 0.35, arc=0.1)
+
+    def fall(self):
+        """E. 진짜 추락 (세션 오류): 손발이 다 빠져 떨어지다가 마지막에 건 퀵드로에서 로프가 잡아 준다.
+        출렁 튕기고 흔들린 뒤 `괜찮아요!` 하고 근처 홀드에 다시 붙는다. 높이는 잠깐 줄지만 기록은 그대로."""
+        if not self.events or self.sleeping or self.rope is not None:
+            return
+        clipped = [b for b in self.bolts if b.clipped]
+        if not clipped:
+            return
+        self.actions.append("fall")
+        top = max(clipped, key=lambda b: b.p.y)
+        anchor = top.rope_point()
+        self.rope = (anchor, (self.harness() - anchor).len() + 0.8)
+        self.phase_target = self.look_at = None
+        for l in self.limbs.values():   # 허우적
+            l.mode, l.tucked = "free", False
+            l.vel = V(self.wrng.uniform(-1.5, 1.5), self.wrng.uniform(1.0, 3.0))
+        self.mode = "hang"
+        self.vel = V(self.wrng.uniform(-0.5, 0.5), 0.8)
+        self.lids = 0.0
+        self.texts.append(Float(self.body + V(0, 1.4), "앗!"))
+        try:
+            yield from self.wait(1.8, stoppable=False)
+            self.texts.append(Float(self.body + V(0, 1.4), "괜찮아요!"))
+            self.squash_vel += 1.5
+            yield from self.wait(0.9, stoppable=False)
+            goals, taken = {}, set()
+            for l in self.limbs.values():   # 몸 근처 홀드에 다시 붙는다
+                ideal = self.body + V(l.side * 0.7, HAND_UP - 0.2 if l.kind == "H" else -FOOT_DOWN + 0.3)
+                root = l.root(self.body, self.tilt)
+                near = [h for h in self.holds if id(h) not in taken and (h.p - root).len() < l.reach * 0.95] or \
+                       [h for h in self.holds if id(h) not in taken]
+                hold = min(near, key=lambda h: (h.p - ideal).len())
+                taken.add(id(hold))
+                goals[l.name] = hold
+            body = self.body + V(0, 0.2)
+            yield from self.move_all(goals, 0.8, body_to=lambda: body, tilt_to=0.0)
+        finally:
+            self.rope = None
+            self.mode = "spring"
+            self.vel = V()
+            self.best_top = sum(self.held_y(l) for l in self.limbs.values())
+            self.stall = 0
+
+    def lower_hand(self):
+        return min((self.limbs["LH"], self.limbs["RH"]), key=self.held_y).name
+
+    def rest(self):
+        """오를 게 없으면 (일하는 펫이 없거나, 토큰으로 오를 때 쌓인 높이를 다 썼으면) 더 오르지 않고,
+        팔을 쭉 펴고 엉덩이를 낮춰 매달려 쉰다. 일하는 펫은 있는데 토큰을 기다리는 중이면 쉬는 동작을 짧게 자주 한다."""
+        self.actions.append("rest")
+        self.resting, start = True, self.t
+        ready = lambda: self.climb_ready(self.t - start)
+        try:
+            hands_low = min(self.held_y(l) for l in self.limbs.values() if l.kind == "H")
+            for foot in (self.limbs["LF"], self.limbs["RF"]):   # 높이 올렸거나 멀리 뻗은 발은 편한 자리로
+                if self.held_y(foot) > hands_low - 2.2 or abs(foot.pos.x - self.body.x) > 1.1:
+                    options = [(-abs(h.p.y - (hands_low - 2.65)) - abs(foot.side * (h.p.x - self.body.x) - 0.65), id(h), h)
+                               for h in self.holds if h is not self.other(foot).hold and hands_low - 3.1 < h.p.y < hands_low - 2.2
+                               and h.p.y <= self.held_y(foot) + 0.05
+                               and foot.side * (h.p.x - self.body.x) > 0.2
+                               and (h.grip("F") - foot.root(self.body, self.tilt)).len() < foot.reach * 0.92]
+                    if options:
+                        yield from self.move_limb(foot.name, max(options)[2], 0.4, arc=0.1)
+            yield from self.tween(self, "crouch", self.crouch, 0.5, 0.8)
+            last, first = None, True
+            while not ready() and not self.requests and not self.sleeping:
+                waiting = self.work > 0   # 토큰을 기다리는 중: 초크·털기·두리번을 짧게 자주
+                yield from self.wait(self.rng.uniform(1.5, 2.5) if first else self.rng.uniform(*((1.0, 2.0) if waiting else (2.5, 5.0))),
+                                     until=ready)
+                first = False
+                if ready() or self.requests:
+                    break
+                pick = self.rng.choice([a for a in (("shake", "chalk", "look") if waiting else ("shake", "chalk", "look", "blow"))
+                                        if a != last])
+                last = pick
+                self.actions.append("idle_" + pick)
+                if pick == "shake":
+                    yield from self.shake(both=True)
+                elif pick == "chalk":
+                    yield from self.chalk()
+                elif pick == "look":
+                    yield from self.look_around()
+                else:
+                    yield from self.blow()
+            yield from self.tween(self, "crouch", self.crouch, 0.0, 0.5)
+            if ready() and not self.requests and (not self.tokens_on or self.t - start > 8):
+                yield from self.shake()   # 오래 쉬었으면 한 번 털고 다시 오른다
+        finally:
+            self.resting = False
+
+    def look_around(self):
+        self.face = -self.face
+        yield from self.wait(self.rng.uniform(0.9, 1.6), stoppable=False)
+        if self.rng.random() < 0.6:
+            self.face = -self.face
+            yield from self.wait(0.6, stoppable=False)
+
+    def blow(self):
+        """손에 입김 불기."""
+        name = self.lower_hand()
+        home = self.limbs[name].hold
+        yield from self.move_limb(name, self.blow_point, 0.34, arc=0.08)
+        self.blow_puff(name)
+        yield from self.wait(0.5, stoppable=False)
+        yield from self.move_limb(name, home, 0.34, arc=0.14)
+
+    def chalk(self):
+        """초크 바르기: 아래쪽 손을 초크백에 넣어 세 번 휘젓고, 입김을 불고, 홀드로 돌아간다."""
+        self.actions.append("chalk")
+        name = self.lower_hand()
+        home = self.limbs[name].hold
+        yield from self.move_limb(name, self.bag_mouth, 0.36, arc=0.12)
+        for _ in range(3):
+            yield from self.move_limb(name, lambda: self.bag_mouth(0.17), 0.11, arc=0.0)
+            self.puff(self.bag_mouth(), n=3, speed=0.8, size=0.13, life=0.7)
+            yield from self.move_limb(name, self.bag_mouth, 0.11, arc=0.0)
+        yield from self.move_limb(name, self.blow_point, 0.32, arc=0.08)
+        self.blow_puff(name)
+        yield from self.wait(0.4, stoppable=False)
+        yield from self.move_limb(name, home, 0.34, arc=0.16)
+
+    def shake(self, both=False):
+        """팔 털기: 아래쪽 손을 놓고 몸 밖으로 늘어뜨려 털다가 다시 잡는다. both 면 반대 손도."""
+        self.actions.append("shake")
+        first = self.lower_hand()
+        for name in ((first, "RH" if first == "LH" else "LH") if both else (first,)):
+            limb = self.limbs[name]
+            home = limb.hold
+
+            def hang(wiggle=0.0, limb=limb):
+                root = limb.root(self.body, self.tilt)
+                shake = math.sin(self.t * 2 * math.pi * 4.5) * wiggle
+                return root + V(limb.side * (0.95 + shake), -1.15 + shake * 0.5)
+
+            yield from self.move_limb(name, hang, 0.3, arc=0.1)
+            yield from self.move_limb(name, lambda hang=hang: hang(0.17), 1.0, arc=0.0)
+            yield from self.move_limb(name, home, 0.34, arc=0.16)
+
+    def dyno_jug(self, near=False):
+        """다이노로 잡을 홀드 (손보다 1.5~2.5m 위, 몸 가까이). near 가 아니면 조금 더 넓게 찾는다."""
+        top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
+        options = [h for h in self.holds if top + 1.5 < h.p.y < top + 2.5 and abs(h.p.x - self.body.x) < 1.4]
+        if not options and not near:
+            options = [h for h in self.holds if top + 1.2 < h.p.y < top + 2.8]
+        return max(options, key=lambda h: h.r + self.rng.uniform(0, 0.1)) if options else None
+
+    def dyno(self, show=True):
+        """다이노: 웅크렸다가 튀어 올라 멀리 있는 홀드를 두 손으로 잡고, 매달려 흔들리다 발을 올린다.
+        show 면 오른 높이를 글자로 띄운다 (세션이 일을 끝낼 때)."""
+        self.actions.append("dyno" if show else "dyno_sprint")
+        self.charging = not show    # 일 끝냄 다이노는 덤 (brain 이 다음 동작 전에 되돌린다)
+        hands = [self.limbs["LH"], self.limbs["RH"]]
+        feet = [self.limbs["LF"], self.limbs["RF"]]
+        top = max(self.held_y(l) for l in hands)
+        jug = self.dyno_jug()
+        if jug is None:
+            self.missing += 1
+            jug = self.place_hold(V(self.route.center(top + 2), top + 2), big=True)
+            if jug is None:
+                jug = Hold(V(self.body.x, top + 2), 0.33, self.rng, True)
+                self.holds.append(jug)
+        yield from self.tween(self, "crouch", self.crouch, 0.6, 0.42)
+        # 튀어 오르기: 몸은 점점 느려지며 꼭대기로, 손이 먼저 홀드로 간다
+        self.mode = "script"
+        start = self.body
+        swing = 1 if start.x < jug.p.x else -1
+        apex = jug.p + V(-swing * 0.35, -1.45)
+        hand_from = [l.pos for l in hands]
+        for l in hands:
+            l.mode = "move"
+        self.squash_vel += 2.6
+        dur, t = 0.36, 0.0
+        while t < dur:
+            dt = yield
+            t += dt
+            k = min(1.0, t / dur)
+            old = self.body
+            self.body = start.lerp(apex, 1 - (1 - k) ** 2)
+            self.vel = (self.body - old) * (1 / dt)
+            self.tilt += (0 - self.tilt) * min(1.0, 10 * dt)
+            for l, p in zip(hands, hand_from):
+                l.pos = p.lerp(jug.grip("H", l.side), smooth(min(1.0, k * 1.25)))
+            if k > 0.25:
+                for f in feet:
+                    if f.mode == "grip":
+                        f.mode, f.vel = "free", self.vel * 0.5
+        # 잡기
+        for l in hands:
+            self.grab(l, jug)
+        jug.chalk = 1.0
+        self.crouch = 0.0
+        self.mode = "hang"
+        self.vel = V(swing * 1.6, 0.8)
+        self.squash_vel -= 3.2
+        self.puff(jug.p + V(0, 0.15), n=12, speed=2.0, size=0.2, life=0.9)
+        if show:
+            self.texts.append(Float(jug.p + V(0, 0.6), f"+{max(1, round(jug.p.y - top))}m"))
+        yield from self.wait(1.0, stoppable=False)
+        for f in sorted(feet, key=lambda f: f.side * swing):
+            options = self.foot_options(f)
+            if options:
+                hold = max(options)[2]
+            else:
+                hold = min((h for h in self.holds if h.p.y < jug.p.y - 1.9 and h is not self.other(f).hold),
+                           key=lambda h: (h.grip("F") - f.root(self.body, self.tilt)).len())
+            yield from self.move_limb(f.name, hold, 0.32, arc=0.12)
+        self.mode = "spring"
+        yield from self.wait(0.3, stoppable=False)
+
+    def exhaust(self):
+        """사용량을 다 쓰면 포타레지를 꺼내 걸고 펴서, 그 위 침낭에 들어가 리셋까지 잔다."""
+        if self.sleeping or self.ledge is not None or self.hp > 0:
+            return   # 이미 자고 있거나 펴는 중이거나 (같은 신호가 두 번 왔다), 그사이 체력이 돌아왔다
+        self.actions.append("exhaust")
+        side = 1 if self.body.x < 0 else -1   # 넓은 쪽에 편다
+        ax = max(-WALL_HALF + 1.2, min(WALL_HALF - 1.2, self.body.x + side * 0.9))
+        ledge = self.ledge = Ledge(V(ax, self.body.y + 1.9))
+        yield from self.tween(self, "crouch", self.crouch, 0.2, 0.3)
+        # 1. 아래쪽 손으로 초크백 옆의 꾸러미를 꺼내 앵커에 건다
+        name = self.lower_hand()
+        home = self.limbs[name].hold
+        yield from self.move_limb(name, self.bag_mouth, 0.3, arc=0.1)
+        ledge.carry = name
+        yield from self.move_limb(name, lambda: ledge.anchor + V(0, -0.25), 0.5, arc=0.15)
+        ledge.carry, ledge.hung = None, True
+        yield from self.move_limb(name, home, 0.3, arc=0.1)
+        ledge.home = (self.body, {n: l.hold for n, l in self.limbs.items()})
+        # 2. 펼친다
+        yield from self.tween(ledge, "open", 0.0, 1.0, 0.7)
+        # 3. 손발을 놓고 침대에 올라앉는다
+        seat = ledge.bed + V(0, 0.92)
+        yield from self.move_all({n: self.tucked(n) for n in self.limbs}, 0.9, body_to=lambda: seat, tilt_to=0.12, hop=0.5)
+        self.crouch = 0.0
+        # 4. 침낭을 끌어올리고 잔다
+        yield from self.tween(ledge, "bag", 0.0, 1.0, 0.5)
+        self.sleeping = True
+        self.requests = [r for r in self.requests if r[0] in AWAKE]   # 자기 전에 받아 둔 동작은 버린다
+        self.z_t = 0.6
+        yield from self.tween(self, "lids", self.lids, 1.0, 0.8)
+        if self.hp > 0:   # 펴는 동안 체력이 돌아왔다 (그사이 창이 숨어 깨우는 신호를 못 받았을 수도 있다)
+            yield from self.wake()
+
+    def wake(self):
+        """사용량이 돌아오면 깨어나 기지개를 켜고, 벽으로 돌아가 포타레지를 접어 넣고, 초크를 바르고 다시 오른다."""
+        ledge = self.ledge
+        if not self.sleeping or ledge is None:
+            yield from self.chalk()
+            return
+        self.actions.append("wake")
+        self.sleeping = False
+        yield from self.tween(self, "lids", 1.0, 0.0, 0.35)
+        yield from self.wait(0.3, stoppable=False)
+        self.squash_vel += 1.8
+        yield from self.move_all({"LH": lambda: self.body + V(-0.6, 1.75), "RH": lambda: self.body + V(0.6, 1.75)}, 0.45)
+        yield from self.wait(0.5, stoppable=False)
+        yield from self.move_all({"LH": self.tucked("LH"), "RH": self.tucked("RH")}, 0.35)
+        yield from self.tween(ledge, "bag", 1.0, 0.0, 0.4)
+        body, holds = ledge.home
+        yield from self.move_all(holds, 0.8, body_to=lambda: body, tilt_to=0.0, hop=0.35)
+        self.vel, self.mode = V(), "spring"
+        yield from self.tween(ledge, "open", 1.0, 0.0, 0.5)
+        ledge.hung, ledge.stow = False, 0.0
+        yield from self.tween(ledge, "stow", 0.0, 1.0, 0.45)
+        self.ledge = None
+        yield from self.chalk()
+
+    def refill(self, gain=0):
+        """사용량이 일부 돌아오면 (5시간 창 리셋) 초크백이 다시 차오르고 주먹을 불끈 쥔다 (gain: 늘어난 체력 %)."""
+        if self.sleeping:
+            yield from self.wake()
+            return
+        self.actions.append("refill")
+        self.puff(self.bag_mouth(), n=8, speed=1.0, size=0.14, life=0.9)
+        if gain:
+            self.texts.append(Float(self.body + V(0, 1.5), f"+{gain}%"))
+        name = self.lower_hand()
+        limb = self.limbs[name]
+        home = limb.hold
+        limb.fist = True
+
+        def up():
+            return limb.root(self.body, self.tilt) + V(limb.side * 0.55, 0.8)
+
+        def down():
+            return limb.root(self.body, self.tilt) + V(limb.side * 0.6, 0.35)
+
+        yield from self.move_limb(name, up, 0.3, arc=0.1)
+        for _ in range(2):
+            yield from self.move_limb(name, down, 0.13, arc=0.0)
+            self.squash_vel -= 1.0
+            yield from self.move_limb(name, up, 0.13, arc=0.0)
+        yield from self.wait(0.25, stoppable=False)
+        limb.fist = False
+        yield from self.move_limb(name, home, 0.34, arc=0.14)
+
+
+
+# ---- 저장과 신호 -------------------------------------------------------------
+
+def load_state(path):
+    """climb.json → (기록, 멀쩡한지). 없으면 ({}, True), 깨졌으면 ({}, False)."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, True
+    except (OSError, ValueError):
+        return {}, False
+    return (data, True) if isinstance(data, dict) else ({}, False)
+
+
+def save_state(path, data):
+    """tmp 에 다 쓰고 디스크에 내린 뒤 바꿔 끼운다 (전원이 꺼져도 빈 파일이 남지 않게)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(dict(data, version=1), f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def hp_signals(prev, hp):
+    """체력 (계정 사용량) 이 prev → hp 로 바뀔 때 보낼 신호 [(이름, 인자...)].
+    0 이 되면 잠, 0 에서 오르면 기상, 10 넘게 오르면 초크백이 차오름, 줄면 초크. 처음 읽은 값이 0 이면 바로 잠."""
+    if hp is None:
+        return []
+    if prev is None:
+        return [("exhaust",)] if hp == 0 else []
+    if hp == 0 and prev > 0:
+        return [("exhaust",)]
+    if prev == 0 and hp > 0:
+        return [("wake",)]
+    if hp >= prev + 10:
+        return [("refill", hp - prev)]
+    if hp < prev:
+        return [("chalk",)]
+    return []
+
+
+def session_signals(changes):
+    """세션 상태가 바뀐 것 {sid: (전, 후)} → 보낼 신호. 일을 끝내면 다이노, 오류면 로프 추락."""
+    out = []
+    for _, new in changes.values():
+        if new == "done":
+            out.append(("dyno",))
+        elif new == "error":
+            out.append(("fall",))
+    return out
+
+
+def working_count(states):
+    """일하는 펫 수 (작업 중, 백그라운드 작업 중): 날씨를 정한다."""
+    return sum(1 for state in states.values() if state in WORKING)
