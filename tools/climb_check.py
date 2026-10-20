@@ -301,14 +301,14 @@ def by_work():
 
 def by_tokens():
     print("2. 토큰으로 오르기")
-    for seed in (7, 11, 23):   # 300초 동안 15초마다 1,000 토큰 (분당 4천 = 분당 8m)
+    for seed in (7, 11, 23):   # 300초 동안 15초마다 2m 어치 토큰 (분당 8m)
         sim = climber(seed, tokens=True)
         sim.work = 1
         top0, state = sim.top_y, {"next": 0.0}
 
         def feed(s, t):
             if t >= state["next"] and t < 300:
-                s.deposit(1000)
+                s.deposit(round(2 / M_PER_TOKEN))
                 state["next"] += 15
 
         run(sim, 300, feed=feed)
@@ -322,7 +322,7 @@ def by_tokens():
               f"[시드 {seed}] 넣은 {put:.1f}m, 오른 {climbed:.1f}m (차이 {climbed - put:+.2f}m), 마저 오른 시간 {extra}초")
 
     result = {}
-    for rate in (2000, 10000, 30000):   # 분당 토큰 (10초마다 나눠 넣는다), 240초
+    for rate in (4, 20, 60):   # 분당 들어오는 높이 (m, 10초마다 토큰으로 나눠 넣는다), 240초
         speeds, sprint = [], []
         for seed in (7, 11, 23):
             sim = climber(seed, tokens=True)
@@ -331,7 +331,7 @@ def by_tokens():
 
             def feed(s, t):
                 if t >= state["next"]:
-                    s.deposit(rate // 6)
+                    s.deposit(rate / M_PER_TOKEN / 6)
                     state["next"] += 10
                 paces.append(s.pace if s.has_climb() and not s.resting else 0)
 
@@ -340,17 +340,17 @@ def by_tokens():
             climbing = [p for p in paces if p]
             sprint.append(sum(p == 3 for p in climbing) / max(1, len(climbing)))
         result[rate] = statistics.mean(speeds)
-        print(f"  분당 {rate:,} 토큰 (분당 {rate * M_PER_TOKEN:.0f}m 들어옴): 분당 {', '.join(f'{s:.1f}' for s in speeds)}m 오름, "
+        print(f"  분당 {rate / M_PER_TOKEN:,.0f} 토큰 (분당 {rate}m 들어옴): 분당 {', '.join(f'{s:.1f}' for s in speeds)}m 오름, "
               f"전력 질주 {statistics.mean(sprint):.0%}")
-        if rate == 30000:
-            check(statistics.mean(sprint) > 0.5, "분당 3만에서 전력 질주가 절반 넘게")
-    check(result[2000] < result[10000] < result[30000], "빠르기 순서 2천 < 1만 < 3만")
+        if rate == 60:
+            check(statistics.mean(sprint) > 0.5, "분당 60m 어치에서 전력 질주가 절반 넘게")
+    check(result[4] < result[20] < result[60], "빠르기 순서 분당 4m < 20m < 60m 어치")
 
     for work, name in ((1, "기다리기 (일하는 펫 1)"), (0, "쉬기 (일하는 펫 0)")):
         for seed in (7, 11):
             sim = climber(seed, tokens=True)
             sim.work = 1
-            sim.deposit(3000)
+            sim.deposit(round(6 / M_PER_TOKEN))
             run(sim, 30)
             sim.work = work
             for _ in range(240):

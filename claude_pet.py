@@ -20,9 +20,9 @@ GNOME Wayland 는 앱이 스스로 항상 위에 두는 걸 막으므로 XWaylan
 쉬는 펫은 가끔 옆으로 걸어갔다 오거나 가까운 펫에게 인사하러 가고, 오류 난 이웃은 찾아가 위로한다 (끄면 제자리에서).
 졸기·축하: 오래 쉬면 졸고, 오래 걸린 일이 끝나면 색종이를 뿌리고, 이웃이 일을 끝내면 옆 펫이 축하한다.
 펫 성장: 펫마다 작업한 시간과 끝낸 일로 경험치가 쌓여 레벨이 오른다 (마우스 올림 카드, 이 세션의 펫 메뉴에 표시).
-끝없이 오르기: 줄 오른쪽 끝의 바위 기둥에서 내 아바타가 끝없이 오른다. Claude 가 써낸 출력 토큰 1,000개마다 2m 를
-쌓아 많이 쌓일수록 빠르게 오르고, 일하는 펫 수는 날씨, 계정 5시간·주간 사용량 중 더 적게 남은 쪽이 체력이다.
-일을 끝내면 다이노, 오류면 로프 추락, 사용량이 오르면 초크, 다 쓰면 포타레지에서 리셋까지 잔다 (클라이밍 보기로 끈다).
+끝없이 오르기: 줄 오른쪽 끝의 바위 기둥에서 내 아바타가 끝없이 오른다. Claude 가 쓴 토큰을 API 가격으로 환산해
+$1 어치마다 30m 를 쌓아 많이 쌓일수록 빠르게 오르고, 일하는 펫 수는 날씨, 5시간 사용량은 체력, 주간 사용량은 벽의 끝이다.
+일을 끝내면 다이노, 오류면 로프 추락, 사용량이 오르면 초크, 5시간을 다 쓰면 포타레지에서 잔다 (클라이밍 보기로 끈다).
 
 나중에 이어서 볼게: 다른 세션을 보러 가기 전에 표시해 두면 보라색 말풍선과 책갈피로 기다린다.
 그 펫을 클릭해 돌아가거나, 그 세션에 새 프롬프트를 보내거나, 표시 지우기를 누르면 풀린다.
@@ -107,7 +107,7 @@ LEVEL_CONFETTI = 16
 GROWTH_SAVE_MS = 60_000  # 작업 중에는 성장 기록을 이 간격으로 저장한다 (끝낸 일, 레벨업, 종료 때는 바로)
 GROWTH_COLOR = "#D69E2E"  # 카드의 경험치 막대
 BASE_ID = CARD_ID       # 마우스 올림 카드에서 끝없이 오르기 창을 가리키는 이름
-TOKEN_POLL_MS = 2000    # 이 간격으로 Claude Code 기록 파일에서 새 출력 토큰을 읽는다
+TOKEN_POLL_MS = 2000    # 이 간격으로 Claude Code 기록 파일에서 새로 쓴 토큰을 읽는다
 WALLS_KEEP = 100        # 기록 파일에 남길 끝난 벽 수 (등반 일지용)
 CLIMB_SAVE_MS = 60_000  # 오르기 기록 (높이, 쌓인 높이, 기록 파일을 읽은 자리) 을 이 간격으로 저장한다
 
@@ -1488,7 +1488,7 @@ class PetManager(QObject):
         self.team_prev = None  # 지난번 체력 (팀 HP, 바뀐 만큼 신호를 보낸다. None 이면 다음 값은 기준만)
         self.peaks = {}  # 창마다 지금 리셋 주기에서 본 가장 큰 사용량 (petcore.hold_peaks)
         self.done_seen = None  # 경험치로 센 끝낸 일 {session_id: prompt_ts} (처음 refresh 때 이미 끝나 있던 일은 세지 않는다)
-        self.climber, self.meter = self.load_climb()  # 내 아바타와 출력 토큰 세기 (창이 숨어 있어도 토큰은 쌓는다)
+        self.climber, self.meter = self.load_climb()  # 내 아바타와 쓴 토큰 세기 (창이 숨어 있어도 토큰은 쌓는다)
         self.climber.events = self.climb_events_enabled()
         self.climb_saved = time.monotonic()
         self.climb_passed = self.climber.passed  # 넘은 높이 기록 수 (새 기록을 넘으면 바로 저장한다)
@@ -1639,7 +1639,8 @@ class PetManager(QObject):
             print(f"claude-pet: 오르기 기록 저장 실패: {err}", file=sys.stderr)
 
     def read_tokens(self):
-        """새로 쓰인 출력 토큰을 오를 높이로 쌓는다 (창이 숨어 있어도). 새 높이 기록을 넘었으면 바로, 아니면 가끔 저장한다."""
+        """새로 쓴 토큰 (API 가격으로 출력 환산) 을 오를 높이로 쌓는다 (창이 숨어 있어도). 새 높이 기록을 넘었으면 바로,
+        아니면 가끔 저장한다."""
         try:
             added = self.meter.poll()
         except OSError as err:
@@ -2117,7 +2118,8 @@ class PetManager(QObject):
         return limits
 
     def update_base_card(self):
-        """끝없이 오르기 창에 마우스를 올리면: 지금 높이, 최고 높이, 받은 토큰, 체력, 계정 5시간·주간 사용량과 리셋 시각."""
+        """끝없이 오르기 창에 마우스를 올리면: 지금 높이, 최고 높이, 쓴 양 (출력 환산 토큰과 API 가격), 체력, 계정 5시간·주간
+        사용량과 리셋 시각."""
         now = int(time.time() * 1000)
         limits = self.account_limits()
         team = petcore.team_hp(limits, now)
@@ -2128,7 +2130,7 @@ class PetManager(QObject):
         climber = self.climber
         title = f"끝없이 오르기 · {climbcore.fmt_alt(max(0.0, climber.shown_altitude()))}"
         subtitle = (f"체력 {team[0]}% · 최고 {climbcore.fmt_alt(climber.peak)} · "
-                    f"받은 토큰 {petcore.format_tokens(climber.tokens)}")
+                    f"쓴 양 {petcore.format_tokens(climber.tokens)} 토큰 (${climber.tokens * climbcore.TOKEN_USD:,.2f})")
         self.card.set_content(title, subtitle, rows, note)
         self.card.show_above(self.base, self.screen_area(self.base.geometry().center()))
 

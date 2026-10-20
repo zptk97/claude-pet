@@ -14,12 +14,18 @@ from climbcore import M_PER_TOKEN, Climber, TokenMeter  # noqa: E402
 DT = 1 / 30
 
 
-def usage_line(mid, out, ts=None):
-    """기록 파일에서 응답 한 줄 (출력 토큰 out 개)."""
+def usage_line(mid, out, ts=None, model=None, **usage):
+    """기록 파일에서 응답 한 줄 (출력 토큰 out 개, 그 밖의 토큰은 usage 로)."""
     stamp = ts or time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-    return json.dumps({"type": "assistant", "timestamp": stamp,
-                       "message": {"id": mid, "usage": {"input_tokens": 2, "output_tokens": out,
-                                                        "cache_read_input_tokens": 50000}}}) + "\n"
+    message = {"id": mid, "usage": {"output_tokens": out, **usage}}
+    if model:
+        message["model"] = model
+    return json.dumps({"type": "assistant", "timestamp": stamp, "message": message}) + "\n"
+
+
+def meters(m):
+    """m 미터를 오를 만큼의 토큰 (출력 환산)."""
+    return round(m / M_PER_TOKEN)
 
 
 def run(sim, seconds, feed=None):
@@ -103,6 +109,55 @@ class TokenMeterTest(unittest.TestCase):
             got += again.poll()
         self.assertEqual(got, 400)
 
+    def test_counts_all_tokens_at_api_prices(self):
+        self.main.write_text("")
+        meter = TokenMeter(self.root)
+        # opus: 출력 1,000 + 입력 500 (x0.2) + 캐시 읽기 100,000 (x0.01) + 캐시 쓰기 5분 2,000 (x0.25) + 1시간 1,000 (x0.4)
+        self.append(self.main, usage_line("A", 1000, model="claude-opus-5-5", input_tokens=500, cache_read_input_tokens=100000,
+                                          cache_creation_input_tokens=3000,
+                                          cache_creation={"ephemeral_5m_input_tokens": 2000, "ephemeral_1h_input_tokens": 1000}))
+        self.assertAlmostEqual(meter.poll(), 1000 + 100 + 1000 + 500 + 400)
+        self.append(self.main, usage_line("A", 1500, model="claude-opus-5-5", input_tokens=500, cache_read_input_tokens=100000,
+                                          cache_creation_input_tokens=3000,
+                                          cache_creation={"ephemeral_5m_input_tokens": 2000, "ephemeral_1h_input_tokens": 1000}))
+        self.assertAlmostEqual(meter.poll(), 500)   # 같은 응답이 더 써지면 늘어난 출력만
+        self.append(self.main, usage_line("B", 1000, model="claude-sonnet-5-5", cache_read_input_tokens=20000)
+                    + usage_line("C", 1000, model="claude-haiku-5-5")
+                    + usage_line("D", 0, cache_creation_input_tokens=4000))   # 나눈 값이 없으면 5분, 모르는 모델은 opus
+        self.assertAlmostEqual(meter.poll(), (500 + 200) + 25 + 1000)
+        self.assertAlmostEqual(climbcore.usage_cost("claude-opus-5-5", {"output_tokens": 1000}), 0.02)
+        self.assertAlmostEqual(meter.total * climbcore.TOKEN_USD, (4000 + 1225) * 20 / 1e6)
+
+    def test_prices_by_model_mode_and_attempts(self):
+        tokens = climbcore.usage_tokens
+        self.assertAlmostEqual(tokens("claude-opus-5-5", {"output_tokens": 1000}), 1000)
+        self.assertAlmostEqual(tokens("claude-opus-5", {"output_tokens": 1000, "cache_read_input_tokens": 1000}), 1250 + 25)
+        self.assertAlmostEqual(tokens("claude-opus-6", {"output_tokens": 1000}), 1000)   # 표에 없으면 같은 계열 최신
+        self.assertAlmostEqual(tokens("claude-fable-5-1", {"output_tokens": 100, "cache_read_input_tokens": 1000}), 250 + 12.5)
+        self.assertAlmostEqual(tokens("claude-haiku-4-5", {"output_tokens": 1000}), 250)
+        self.assertAlmostEqual(tokens("claude-haiku-5-5", {"output_tokens": 1000, "input_tokens": 1000}), 25 + 5)
+        self.assertAlmostEqual(tokens("claude-haiku-5-5", {"output_tokens": 1000, "cache_read_input_tokens": 200000}),
+                               125 + 500)   # 프롬프트가 10만 토큰 넘으면 비싼 쪽
+        self.assertAlmostEqual(tokens("claude-opus-5-5", {"output_tokens": 1000, "speed": "fast"}), 2000)   # 빠른 모드는 두 배
+        tries = {"output_tokens": 300, "iterations": [{"output_tokens": 500, "input_tokens": 1000}, {"output_tokens": 300}]}
+        self.assertAlmostEqual(tokens("claude-opus-5-5", tries), 800 + 200)   # 시도가 여럿이면 모두 더한다
+        zeroed = {"output_tokens": 0, "cache_creation_input_tokens": 0, "cache_creation": {"ephemeral_1h_input_tokens": 1900}}
+        self.assertAlmostEqual(tokens("claude-opus-5-5", zeroed), 0)   # 나눈 값은 합계에 맞춘다
+        extra = {"output_tokens": 0, "cache_creation_input_tokens": 3000, "cache_creation": {"ephemeral_1h_input_tokens": 1000}}
+        self.assertAlmostEqual(tokens("claude-opus-5-5", extra), 2000 * 0.25 + 1000 * 0.4)
+
+    def test_old_saved_counts_and_rounding_do_not_add_again(self):
+        self.main.write_text("")
+        meter = TokenMeter(self.root)
+        self.append(self.main, usage_line("H", 333, model="claude-haiku-5-5", cache_read_input_tokens=777))
+        meter.poll()
+        saved = json.loads(json.dumps(meter.state()))
+        saved["seen"]["O"] = 500   # 옛 기록: 출력 토큰 (정수)
+        again = TokenMeter(self.root, saved=saved)
+        self.append(self.main, usage_line("H", 333, model="claude-haiku-5-5", cache_read_input_tokens=777)
+                    + usage_line("O", 500))
+        self.assertEqual(again.poll(), 0)
+
     def test_odd_lines_are_skipped(self):
         self.main.write_text("")
         meter = TokenMeter(self.root)
@@ -147,7 +202,7 @@ class ClimberTest(unittest.TestCase):
 
         def feed(s, t):
             if t >= state["next"] and t < 120:
-                s.deposit(1000)
+                s.deposit(meters(2))
                 state["next"] += 15
 
         run(sim, 120, feed)
@@ -203,7 +258,7 @@ class ClimberTest(unittest.TestCase):
     def test_milestones_once_across_restore(self):
         sim = Climber(3)
         sim.jump(27.0)
-        sim.deposit(4000)   # 8m
+        sim.deposit(meters(8))
         run(sim, 60)
         self.assertEqual(sim.banners, [30])
         saved = json.loads(json.dumps(sim.snapshot()))
@@ -212,9 +267,9 @@ class ClimberTest(unittest.TestCase):
         self.assertGreaterEqual(again.altitude(), 30)
         self.assertEqual(again.passed, 1)
         self.assertAlmostEqual(again.bank, sim.bank, places=2)
-        self.assertEqual(again.tokens, 4000)
+        self.assertEqual(again.tokens, meters(8))
         again.alt0 -= 5     # 내려왔다가 다시 넘어도
-        again.deposit(5000)
+        again.deposit(meters(10))
         run(again, 60)
         self.assertNotIn(30, again.banners)
 
@@ -318,7 +373,7 @@ class ClimberTest(unittest.TestCase):
         sim = Climber(7)
         sim.work = 1
         run(sim, 150)
-        sim.deposit(600)
+        sim.deposit(meters(1.2))
         run(sim, 80)
         self.assertNotIn("nap", sim.actions)
 
@@ -328,7 +383,7 @@ class ClimberTest(unittest.TestCase):
         run(sim, climbcore.NAP_AFTER + 10)
         self.assertTrue(sim.nap)
         moves = len(sim.moves)
-        sim.deposit(600)
+        sim.deposit(meters(1.2))
         run(sim, 10)
         self.assertFalse(sim.sleeping)
         self.assertGreater(len(sim.moves), moves)   # 깨어나 다시 오른다
@@ -343,7 +398,7 @@ class ClimberTest(unittest.TestCase):
         sim.hp = 0
         sim.signal("exhaust")
         self.assertFalse(sim.nap)
-        sim.deposit(5000)
+        sim.deposit(meters(10))
         run(sim, 20)
         self.assertTrue(sim.sleeping)   # 토큰으로는 깨지 않는다
         sim.hp = 100
@@ -367,7 +422,7 @@ class ClimberTest(unittest.TestCase):
             run(sim, 40)      # 쌓인 높이가 없어 기다리며 초크·털기로 같은 홀드를 다시 잡는다
             self.assertTrue(any(a.startswith("idle_") for a in sim.actions))
             self.assertNotIn("break", sim.actions)
-            sim.deposit(1000)
+            sim.deposit(meters(2))
             run(sim, 20)      # 오르며 새 홀드를 잡으면 부서진다
             self.assertIn("break", sim.actions)
         finally:
@@ -506,15 +561,15 @@ class CruxTest(unittest.TestCase):
             if sim.wait_for or sim.crux_log:
                 break
             if sim.bank < 0.3:
-                sim.deposit(500)
+                sim.deposit(meters(1))
             run(sim, 1.0)
         self.assertEqual(sim.crux_log, [])
         self.assertTrue(sim.parked and sim.wait_for > 0)
         self.assertFalse(sim.climb_ready())
-        sim.deposit(500)   # 1m 더 와도 모자라면 계속 기다린다
+        sim.deposit(meters(1))   # 1m 더 와도 모자라면 계속 기다린다
         run(sim, 25.0)
         self.assertEqual(sim.crux_log, [])
-        sim.deposit(3000)
+        sim.deposit(meters(6))
         run(sim, 30.0)
         self.assertEqual(len(sim.crux_log), 1)
         self.assertGreater(sim.bank, -1.0)   # 넣은 것보다 크게 더 오르지 않는다

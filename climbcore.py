@@ -1,8 +1,9 @@
 """끝없이 오르기 계산 (Qt 를 쓰지 않는다. 그리기는 climbview.py).
 
-내 아바타가 흐르는 자연 암벽을 끝없이 오른다. Claude 가 써낸 출력 토큰 1,000개마다 2m 를 오를 높이로 쌓고
-(TokenMeter 가 Claude Code 기록 파일을 읽기만 해서 센다), 쌓인 높이가 많을수록 빠르게 오른다. 다 쓰면
-일하는 펫이 있으면 기다리고 없으면 쉰다. 일하는 펫 수는 날씨, 계정 사용량은 체력이고, 펫 상태에서 온 신호
+내 아바타가 흐르는 자연 암벽을 끝없이 오른다. Claude 가 쓴 토큰 (입력·출력·캐시) 을 API 가격으로 환산해 $1 어치마다
+30m 를 오를 높이로 쌓고 (TokenMeter 가 Claude Code 기록 파일을 읽기만 해서 센다), 쌓인 높이가 많을수록 빠르게 오른다.
+다 쓰면 일하는 펫이 있으면 기다리고 없으면 쉰다. 일하는 펫 수는 날씨, 5시간 사용량은 체력, 주간 사용량은 벽의 끝이고,
+펫 상태에서 온 신호
 (Climber.signal) 로 다이노·로프 추락·초크·잠·기상 같은 동작을 끼워 넣는다. 높이 기록 (아파트 10층 ~ 달) 을
 넘으면 한 번씩 말풍선을 띄운다.
 
@@ -67,7 +68,28 @@ CONFETTI = [(255, 196, 0), (255, 90, 90), (80, 200, 255), (120, 220, 120), (200,
 PACE_DUR = {1: 0.8, 2: 0.6, 3: 0.45}         # 오르는 빠르기별 동작 시간 배율 (3 = 전력 질주, 토큰이 많이 쌓였을 때)
 PACE_PAUSE = {1: (0.05, 0.2), 2: (0.02, 0.08), 3: (0.0, 0.03)}   # 동작 사이 숨 고르기 (초). 보통은 몇 동작마다 둘러보며 쉰다
 PACE_NAME = {1: "보통", 2: "빠름", 3: "전력 질주"}
-M_PER_TOKEN = 2 / 1000                        # 출력 토큰 1,000개 = 2m
+PRICES = {   # API 가격 (달러 / 100만 토큰): 입력, 출력, 캐시 읽기, 캐시 쓰기 5분, 캐시 쓰기 1시간 (claude-api 모델 표, 2026-10)
+    "claude-opus-5-5": (4.0, 20.0, 0.20, 5.0, 8.0),
+    "claude-opus-5": (5.0, 25.0, 0.50, 6.25, 10.0),
+    "claude-opus-4-8": (5.0, 25.0, 0.50, 6.25, 10.0),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.20, 2.5, 4.0),
+    "claude-sonnet-5": (2.0, 10.0, 0.20, 2.5, 4.0),
+    "claude-sonnet-4-6": (3.0, 15.0, 0.30, 3.75, 6.0),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01, 0.125, 0.20),   # 프롬프트가 10만 토큰 넘으면 HAIKU_LONG
+    "claude-haiku-4-5": (1.0, 5.0, 0.10, 1.25, 2.0),
+    "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5, 20.0),
+    "claude-mythos-5-1": (10.0, 50.0, 0.25, 12.5, 20.0),
+    "claude-fable-5": (10.0, 50.0, 1.0, 12.5, 20.0),
+    "claude-mythos-5": (10.0, 50.0, 1.0, 12.5, 20.0),
+}
+PRICE_IDS = sorted(PRICES, key=len, reverse=True)   # 긴 이름부터 맞춰 본다 (claude-opus-5-5 를 claude-opus-5 로 보지 않게)
+PRICE_FAMILY = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5",
+                "fable": "claude-fable-5-1", "mythos": "claude-mythos-5-1"}   # 표에 없는 모델은 같은 계열 최신 가격 (아니면 opus)
+HAIKU_LONG = (0.50, 2.50, 0.05, 0.625, 1.0)
+FAST_PRICE = 2.0              # 빠른 모드 (speed: fast) 는 가격이 두 배
+TOKEN_USD = PRICES["claude-opus-5-5"][1] / 1e6           # 출력 토큰 하나 값: 쓴 금액을 이 값으로 나눠 '토큰 (출력 환산)' 으로 센다
+M_PER_USD = 30.0                              # API 가격 $1 어치 = 30m
+M_PER_TOKEN = M_PER_USD * TOKEN_USD           # 출력 환산 토큰 1,000개 = 0.6m
 PACE_BANK = (8.0, 30.0)                       # 쌓인 높이 (m) 가 이만큼 넘으면 빠름, 전력 질주
 DYNO_MIX = {2: 0.06, 3: 0.18}                 # 빠름·전력 질주에서 손발 동작 대신 다이노를 할 비율
 NAP_AFTER = 180.0                             # 쉬는 자세 (기다림·쉼) 로 이만큼 (초) 있으면 포타레지를 펴고 낮잠을 잔다
@@ -384,12 +406,64 @@ class Ledge:
         self.home = None            # 자기 전 자리 (몸, {손발: 홀드})
 
 
+def usage_parts(usage):
+    """응답 사용량의 (입력, 출력, 캐시 읽기, 캐시 쓰기 5분, 캐시 쓰기 1시간) 토큰. 시도가 여럿 (iterations) 이면 모두 더하고
+    (위 값은 마지막 시도만이다), 정수가 아닌 값은 0. 캐시 쓰기는 5분/1시간으로 나눈 값을 합계에 맞춘다 (나눈 값이 없으면 5분)."""
+    def count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    def one(u):
+        total = count(u.get("cache_creation_input_tokens"))
+        split = u.get("cache_creation")
+        if isinstance(split, dict):
+            w1h, w5m = count(split.get("ephemeral_1h_input_tokens")), count(split.get("ephemeral_5m_input_tokens"))
+            if "cache_creation_input_tokens" in u:
+                w1h = min(w1h, total)
+                w5m = total - w1h
+        else:
+            w5m, w1h = total, 0
+        return (count(u.get("input_tokens")), count(u.get("output_tokens")), count(u.get("cache_read_input_tokens")), w5m, w1h)
+
+    tries = usage.get("iterations")
+    tries = [u for u in tries if isinstance(u, dict)] if isinstance(tries, list) else []
+    if len(tries) > 1:
+        return tuple(map(sum, zip(*(one(u) for u in tries))))
+    return one(usage)
+
+
+def model_prices(model, prompt):
+    """모델 이름과 프롬프트 길이 (입력 + 캐시) 의 가격 (PRICES 한 줄)."""
+    name = model if isinstance(model, str) else ""
+    key = next((k for k in PRICE_IDS if name.startswith(k)), None)
+    if key is None:
+        key = next((v for family, v in PRICE_FAMILY.items() if family in name), "claude-opus-5-5")
+    if key == "claude-haiku-5-5" and prompt > 100_000:
+        return HAIKU_LONG
+    return PRICES[key]
+
+
+def usage_tokens(model, usage):
+    """응답 하나를 출력 환산 토큰으로: 입력·출력 (생각 포함)·캐시 읽기·캐시 쓰기 (5분/1시간) 토큰에 모델별 가격 (PRICES) 을
+    opus 5.5 출력 가격으로 나눈 비율을 곱해 더한다 (opus 5.5 출력 토큰은 그대로). 빠른 모드는 두 배.
+    TOKEN_USD 를 곱하면 API 가격 (달러)."""
+    tokens = usage_parts(usage)
+    price = model_prices(model, tokens[0] + sum(tokens[2:]))
+    base = PRICES["claude-opus-5-5"][1] / (FAST_PRICE if usage.get("speed") == "fast" else 1.0)
+    return sum(t * p / base for t, p in zip(tokens, price))
+
+
+def usage_cost(model, usage):
+    """응답 하나의 API 가격 (달러)."""
+    return usage_tokens(model, usage) * TOKEN_USD
+
+
 class TokenMeter:
-    """Claude Code 기록 파일에서 출력 토큰 (생각 포함) 을 센다. 읽기만 한다.
+    """Claude Code 기록 파일에서 쓴 토큰을 API 가격으로 환산해 센다 (출력 토큰 값으로 나눈 '출력 환산 토큰').
+    읽기만 한다.
 
     ~/.claude/projects/<프로젝트>/<세션>.jsonl 과 서브에이전트 기록 <세션>/subagents/*.jsonl 을 본다.
     응답 하나가 여러 줄에 같은 값으로 남고, 서브에이전트 기록에는 응답 도중의 덜 센 값도 남아서
-    응답 id 마다 가장 큰 값을 기억하고 늘어난 만큼만 더한다.
+    응답 id 마다 가장 큰 값을 기억하고 늘어난 만큼만 더한다 (입력·캐시는 응답마다 같고 출력이 늘어난다).
 
     처음 쓰면 (saved 가 없으면) 지금 있는 기록은 세지 않고 그 뒤에 쓰인 줄만 센다. state() 를 저장해 두었다가
     saved 로 주면 파일마다 읽던 자리부터 이어 읽어서, 펫이 꺼져 있던 동안 쓰인 토큰도 빠짐없이 한 번만 센다
@@ -405,7 +479,7 @@ class TokenMeter:
         self.root = Path(root) if root else Path.home() / ".claude" / "projects"
         self.offsets = {}           # 파일 → 읽은 바이트 수
         self.rest = {}              # 파일 → 아직 줄바꿈이 오지 않은 끝부분
-        self.seen = collections.OrderedDict()   # 응답 id → 지금까지 본 출력 토큰
+        self.seen = collections.OrderedDict()   # 응답 id → 지금까지 본 출력 환산 토큰
         self.total = 0
         saved = saved if isinstance(saved, dict) else {}
         offsets, seen = saved.get("offsets"), saved.get("seen")
@@ -414,7 +488,9 @@ class TokenMeter:
             self.start = since
             self.offsets = {Path(p): o for p, o in offsets.items() if isinstance(p, str) and isinstance(o, int) and o >= 0}
             if isinstance(seen, dict):
-                self.seen.update((k, v) for k, v in seen.items() if isinstance(k, str) and isinstance(v, int))
+                self.seen.update((k, v) for k, v in seen.items()   # 옛 기록의 출력 토큰도 출력만 환산한 값과 같다
+                                 if isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)
+                                 and math.isfinite(v))
         else:
             self.start = time.time()
             for path in self.files():
@@ -430,11 +506,11 @@ class TokenMeter:
     def state(self):
         """저장할 것: 파일마다 읽은 자리 (다 쓰이지 않은 끝줄은 다시 읽게 뺀다), 마지막으로 읽은 때, 최근 응답 id."""
         offsets = {str(p): o - len(self.rest.get(p, b"")) for p, o in self.offsets.items()}
-        seen = dict(list(self.seen.items())[-self.SEEN_SAVE:])
+        seen = {k: round(v, 3) for k, v in list(self.seen.items())[-self.SEEN_SAVE:]}
         return {"ts": self.polled, "offsets": offsets, "seen": seen}
 
     def poll(self):
-        """새로 쓰인 줄을 읽고 늘어난 출력 토큰 수를 돌려준다."""
+        """새로 쓰인 줄을 읽고 늘어난 출력 환산 토큰 수를 돌려준다."""
         added = 0
         now = time.time()
         present = set()
@@ -482,10 +558,12 @@ class TokenMeter:
         message = entry.get("message") if isinstance(entry, dict) else None
         if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
             return 0
-        out = message["usage"].get("output_tokens")
+        usage = message["usage"]
+        out = usage.get("output_tokens")
         key = message.get("id") or entry.get("requestId")
         if not isinstance(out, int) or isinstance(out, bool) or not isinstance(key, str) or not key:
             return 0
+        tokens = usage_tokens(message.get("model"), usage)
         stamp = entry.get("timestamp")
         if isinstance(stamp, str):   # 다른 파일에서 옮겨 적힌 옛 줄은 세지 않는다
             try:
@@ -494,13 +572,13 @@ class TokenMeter:
             except ValueError:
                 pass
         old = self.seen.get(key, 0)
-        if out <= old:
+        if tokens <= old + 1e-3:   # 저장할 때 반올림한 값 (소수 셋째 자리) 때문에 다시 더하지 않게
             return 0
-        self.seen[key] = out
+        self.seen[key] = tokens
         self.seen.move_to_end(key)
         while len(self.seen) > self.SEEN_KEEP:
             self.seen.popitem(last=False)
-        return out - old
+        return tokens - old
 
 
 class Climber:
@@ -553,7 +631,7 @@ class Climber:
         self.signal_t = {}          # 신호별 마지막으로 받은 때 (COOLDOWN)
         self.shake_t = 0.0          # 다음 팔 털기 (체력 60% 이하)
         self.bank = 0.0             # 쌓인 오를 높이 (m). 몸이 가장 높이 올라간 자리를 넘을 때마다 줄어든다
-        self.tokens = 0             # 받은 토큰 합 (검사용)
+        self.tokens = 0             # 받은 토큰 합 (출력 환산, TOKEN_USD 를 곱하면 API 가격 달러)
         self.token_buf, self.token_float_t = 0, -1.0   # 아직 글자로 띄우지 않은 토큰
         self.deposit_t = 0.0        # 마지막으로 토큰을 받은 때
         self.resting = False
@@ -759,7 +837,7 @@ class Climber:
         return 0 if self.work <= 0 else 1 if self.work <= 2 else 2
 
     def deposit(self, tokens):
-        """출력 토큰을 받아 오를 높이로 쌓는다."""
+        """쓴 토큰 (출력 환산) 을 받아 오를 높이로 쌓는다."""
         self.tokens += tokens
         self.bank += tokens * M_PER_TOKEN
         if self.wall_pending:
@@ -833,9 +911,9 @@ class Climber:
     def snapshot(self):
         """저장할 기록: 높이 (이번 길에서 가장 높이 올라간 자리), 최고 높이, 쌓인 높이, 받은 토큰 합."""
         if self.wall_pending or self.grounded:   # 벽이 끝났다 (떨어지는 장면 전에 꺼져도 다음에는 새 벽 땅에서)
-            return {"height": 0.0, "peak": 0.0, "bank": 0.0, "tokens": self.tokens, "grounded": True}
+            return {"height": 0.0, "peak": 0.0, "bank": 0.0, "tokens": round(self.tokens, 1), "grounded": True}
         return {"height": round(self.alt0 + self.top_y, 2), "peak": round(self.peak, 2),
-                "bank": round(self.bank, 3), "tokens": self.tokens}
+                "bank": round(self.bank, 3), "tokens": round(self.tokens, 1)}
 
     def restore(self, saved):
         """snapshot() 으로 저장한 기록으로 되돌린다. 깨진 값은 처음 값으로 둔다."""
@@ -846,7 +924,8 @@ class Climber:
         self.jump(height, max(height, number("peak")))
         self.bank = number("bank")
         tokens = saved.get("tokens") if isinstance(saved, dict) else None
-        self.tokens = tokens if isinstance(tokens, int) and tokens >= 0 else 0
+        ok = isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and math.isfinite(tokens) and tokens >= 0
+        self.tokens = tokens if ok else 0
         if isinstance(saved, dict) and saved.get("grounded") is True:   # 벽이 끝나 땅에서 기다리던 중
             self.new_wall(grounded=True, banner=False)
 
@@ -886,9 +965,9 @@ class Climber:
             if self.tokens_on and self.charging and self.ledge is None:   # 포타레지에 오르내리기·덤 다이노는 안 쓴다
                 self.bank -= self.body.y - self.top_y
             self.top_y = self.body.y
-        if self.token_buf and self.t - self.token_float_t > 0.7 and not self.falling:   # 받은 토큰을 글자로 띄운다 (잦으면 모아서)
+        if self.token_buf >= 0.5 and self.t - self.token_float_t > 0.7 and not self.falling:   # 받은 토큰을 글자로 띄운다 (잦으면 모아서)
             side = 1.3 if len(self.texts) % 2 else -1.3
-            self.texts.append(Float(self.body + V(side, 0.9), f"+{self.token_buf:,} 토큰", "token"))
+            self.texts.append(Float(self.body + V(side, 0.9), f"+{int(self.token_buf + 0.5):,} 토큰", "token"))
             self.token_buf, self.token_float_t = 0, self.t
         for limb in self.limbs.values():
             if limb.mode == "grip":
