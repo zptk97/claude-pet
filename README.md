@@ -99,6 +99,9 @@ $5·$8, Sonnet 5.5 는 $2·$10·$0.20·$2.5·$4, 빠른 모드는 두 배. 모�
 클릭은 바위 기둥과 왼쪽 위 높이 상자에서만 받고, 양옆 배경을 누르면 아래 창으로 간다.
 펫이 없거나 사용량을 모르면(상태줄 중계를 안 쓰면) 창은 숨는다. 펫 메뉴나 창 오른쪽 클릭에서 **클라이밍 보기**를 끄면 사라진다.
 기록(높이, 최고 높이, 쌓인 높이, 쓴 양, 기록 파일마다 읽은 자리, 이번 주 벽을 끝냈는지, 끝난 벽 높이)은 `~/.local/share/claude-pet/climb.json` 에 남는다.
+등반 일지용으로 5시간 창과 주마다 (리셋 시각으로 가른다) 가장 큰 사용량·처음 본 때·마지막으로 오른 때·다 쓴 때, 한국 시각 1시간마다
+쓴 토큰 (출력 환산) 을 같은 폴더의 `journal.json` 에 12주치 남긴다. 사용량 % 는 이 기록을 넣은 뒤부터 쌓이고, 토큰은 처음 한 번
+Claude Code 기록 파일에 남아 있는 지난 것까지 되살린다 (기록이 크면 몇 초, 따로 돌아서 화면은 멈추지 않는다).
 길(홀드)은 켤 때마다 새로 깐다. 바위와 배경 그림(`assets/climb/`)은 이 저장소용으로 그림 생성 AI 로 만들었다.
 
 아바타는 `avatar/body.png`(팔다리 없는 투명 배경 몸통 그림) 와 `avatar/avatar.json`(몸통 공·눈 자리) 이다
@@ -112,6 +115,7 @@ claude_pet.py      펫 창 (PyQt5)
 petcore.py         Qt 없는 로직: 상태 계산, 말풍선 문구, 펫 배정, 사용량 카드, 접기
 climbcore.py       끝없이 오르기 계산 (Qt 없음): 아바타 움직임, 날씨, 추락 이벤트, 높이 기록, 토큰 세기
 climbview.py       끝없이 오르기 창 (그리기)
+journalcore.py     등반 일지 기록 (Qt 없음): 5시간 창·주 사용량, 시간별 토큰, 지난 토큰 되살리기
 hooks/
   claude-pet-hook.sh        Claude Code hook → 세션별 상태 파일, 새 세션에서 펫 자동 실행
   claude-pet-statusline.sh  상태줄 중계 → 컨텍스트·사용량 파일 (원래 상태줄 출력은 그대로)
@@ -128,7 +132,7 @@ install.sh         설치·점검
 ```
 
 실행 중에 쓰는 파일: `$XDG_RUNTIME_DIR/claude-pet/` (세션 상태, 사용량, 로그), 설정은 `~/.config/claude-pet/config.json`,
-펫 성장 기록은 `~/.local/share/claude-pet/growth.json`, 끝없이 오르기 기록은 같은 폴더의 `climb.json`.
+펫 성장 기록은 `~/.local/share/claude-pet/growth.json`, 끝없이 오르기 기록은 같은 폴더의 `climb.json`, 등반 일지 기록은 `journal.json`.
 
 ## 설치
 

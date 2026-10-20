@@ -457,6 +457,31 @@ def usage_cost(model, usage):
     return usage_tokens(model, usage) * TOKEN_USD
 
 
+def line_usage(line):
+    """Claude Code 기록 파일의 한 줄 (bytes) → (응답 id, 출력 환산 토큰, 적힌 때 epoch 초 또는 None). 응답 줄이 아니면 None."""
+    if b'"output_tokens"' not in line:
+        return None
+    try:
+        entry = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    message = entry.get("message") if isinstance(entry, dict) else None
+    if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
+        return None
+    usage = message["usage"]
+    out = usage.get("output_tokens")
+    key = message.get("id") or entry.get("requestId")
+    if not isinstance(out, int) or isinstance(out, bool) or not isinstance(key, str) or not key:
+        return None
+    stamp, when = entry.get("timestamp"), None
+    if isinstance(stamp, str):
+        try:
+            when = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return key, usage_tokens(message.get("model"), usage), when
+
+
 class TokenMeter:
     """Claude Code 기록 파일에서 쓴 토큰을 API 가격으로 환산해 센다 (출력 토큰 값으로 나눈 '출력 환산 토큰').
     읽기만 한다.
@@ -481,6 +506,7 @@ class TokenMeter:
         self.rest = {}              # 파일 → 아직 줄바꿈이 오지 않은 끝부분
         self.seen = collections.OrderedDict()   # 응답 id → 지금까지 본 출력 환산 토큰
         self.total = 0
+        self.spent = collections.Counter()   # 시간 칸 시작 epoch 초 → 그 시간에 적힌 응답의 출력 환산 토큰 (take_spent)
         saved = saved if isinstance(saved, dict) else {}
         offsets, seen = saved.get("offsets"), saved.get("seen")
         since = saved.get("ts")
@@ -502,6 +528,11 @@ class TokenMeter:
 
     def files(self):
         return list(self.root.glob("*/*.jsonl")) + list(self.root.glob("*/*/subagents/*.jsonl"))
+
+    def take_spent(self):
+        """지난번 뒤로 센 토큰을 응답이 적힌 시간 칸마다 {시간 칸 시작 epoch 초: 출력 환산 토큰} 으로 넘기고 비운다 (등반 일지)."""
+        spent, self.spent = self.spent, collections.Counter()
+        return spent
 
     def state(self):
         """저장할 것: 파일마다 읽은 자리 (다 쓰이지 않은 끝줄은 다시 읽게 뺀다), 마지막으로 읽은 때, 최근 응답 id."""
@@ -549,28 +580,12 @@ class TokenMeter:
         return added
 
     def read_line(self, line):
-        if b'"output_tokens"' not in line:
+        got = line_usage(line)
+        if got is None:
             return 0
-        try:
-            entry = json.loads(line)
-        except (ValueError, RecursionError):
+        key, tokens, when = got
+        if when is not None and when < self.start - 60:   # 다른 파일에서 옮겨 적힌 옛 줄은 세지 않는다
             return 0
-        message = entry.get("message") if isinstance(entry, dict) else None
-        if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
-            return 0
-        usage = message["usage"]
-        out = usage.get("output_tokens")
-        key = message.get("id") or entry.get("requestId")
-        if not isinstance(out, int) or isinstance(out, bool) or not isinstance(key, str) or not key:
-            return 0
-        tokens = usage_tokens(message.get("model"), usage)
-        stamp = entry.get("timestamp")
-        if isinstance(stamp, str):   # 다른 파일에서 옮겨 적힌 옛 줄은 세지 않는다
-            try:
-                if datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() < self.start - 60:
-                    return 0
-            except ValueError:
-                pass
         old = self.seen.get(key, 0)
         if tokens <= old + 1e-3:   # 저장할 때 반올림한 값 (소수 셋째 자리) 때문에 다시 더하지 않게
             return 0
@@ -578,6 +593,8 @@ class TokenMeter:
         self.seen.move_to_end(key)
         while len(self.seen) > self.SEEN_KEEP:
             self.seen.popitem(last=False)
+        when = time.time() if when is None else when
+        self.spent[int(when // 3600) * 3600] += tokens - old
         return tokens - old
 
 

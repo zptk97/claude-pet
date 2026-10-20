@@ -40,6 +40,7 @@ import random
 import shutil
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -56,6 +57,7 @@ from PyQt5.QtWidgets import (QAction, QActionGroup, QApplication, QCheckBox, QMe
                              QProxyStyle, QStyle, QWidget, QWidgetAction)
 
 import climbcore  # noqa: E402
+import journalcore  # noqa: E402
 import petcore  # noqa: E402
 from climbview import CARD_ID, ClimbWindow  # noqa: E402
 
@@ -1494,6 +1496,10 @@ class PetManager(QObject):
         self.climb_passed = self.climber.passed  # 넘은 높이 기록 수 (새 기록을 넘으면 바로 저장한다)
         self.climb_snapshot = self.climber.snapshot()  # 마지막으로 저장한 기록 (바뀐 게 없으면 저장하지 않는다)
         self.climb_dirty = False  # 마지막 저장 뒤 새 토큰을 받았다 (기록 파일 위치가 바뀌었다)
+        self.journal = self.load_journal()  # 등반 일지: 계정 사용량·시간별 토큰 기록 (오르기 기록과 같이 저장한다)
+        self.journal_dirty = False
+        self.backfill = None  # 지난 토큰을 되살리는 스레드 ([스레드, 결과]), 일지에 pending 이 있을 때
+        self.start_backfill()
         QApplication.instance().aboutToQuit.connect(self.save_growth)
         QApplication.instance().aboutToQuit.connect(self.save_climb)
         QApplication.instance().aboutToQuit.connect(self.gister.shutdown)
@@ -1637,10 +1643,72 @@ class PetManager(QObject):
                                                      "week": self.week, "walls": self.walls})
         except OSError as err:
             print(f"claude-pet: 오르기 기록 저장 실패: {err}", file=sys.stderr)
+        if self.journal_dirty:
+            self.save_journal()
+
+    @staticmethod
+    def journal_file():
+        return petcore.growth_file().with_name("journal.json")
+
+    def load_journal(self):
+        """등반 일지 (journalcore). 깨졌으면 시각을 붙인 이름으로 남겨 두고 새로 쓴다. 처음 (또는 깨져 새로) 이면 토큰
+        계수기가 이미 읽은 자리를 pending 으로 적어 두고 그 앞의 토큰을 되살린다 (start_backfill). 계수기 자리와 시간별
+        토큰이 서로 맞아야 겹치거나 빠지지 않아서, 일지는 오르기 기록과 같이 저장한다 (save_climb)."""
+        path = self.journal_file()
+        data, intact = climbcore.load_state(path)
+        if not intact:
+            backup = path.with_name(f"{path.name}.broken-{time.strftime('%Y%m%d-%H%M%S')}")
+            try:
+                shutil.copy2(path, backup)
+                print(f"claude-pet: 등반 일지가 깨져서 {backup} 로 남기고 새로 씀", file=sys.stderr)
+            except OSError as err:
+                print(f"claude-pet: 깨진 등반 일지를 남기지 못함: {err}", file=sys.stderr)
+        journal = journalcore.restore(data, time.time())
+        if "backfilled" not in journal and "pending" not in journal:
+            journal["pending"] = self.meter.state()["offsets"]
+        return journal
+
+    def save_journal(self):
+        journalcore.trim(self.journal, time.time())
+        try:
+            climbcore.save_state(self.journal_file(), journalcore.state(self.journal))
+            self.journal_dirty = False   # 못 썼으면 다음 저장 때 (오르기 기록과 같이) 다시
+        except OSError as err:
+            print(f"claude-pet: 등반 일지 저장 실패: {err}", file=sys.stderr)
+
+    def start_backfill(self):
+        """일지에 pending (되살릴 자리) 이 있으면 그 앞의 토큰을 시간 칸으로 세는 스레드를 띄운다 (기록이 크면 몇 초).
+        끝나면 tend_backfill 이 일지에 더한다. 그 전에 끄면 다음에 켤 때 같은 자리로 다시 센다."""
+        pending = self.journal.get("pending")
+        if pending is None:
+            return
+        job = [None, None]
+
+        def run():
+            try:
+                job[1] = journalcore.backfill(pending)
+            except Exception as err:   # 스레드 안의 오류는 남기고 다음에 켤 때 다시
+                print(f"claude-pet: 지난 토큰을 되살리지 못함: {err!r}", file=sys.stderr)
+
+        job[0] = threading.Thread(target=run, name="journal-backfill", daemon=True)
+        self.backfill = job
+        job[0].start()
+
+    def tend_backfill(self):
+        if self.backfill is None or self.backfill[0].is_alive():
+            return
+        spent, self.backfill = self.backfill[1], None
+        if spent is None:
+            return
+        journalcore.add_hours(self.journal, spent)
+        self.journal.pop("pending", None)
+        self.journal["backfilled"] = time.time()
+        self.journal_dirty = True
+        self.save_climb()   # 계수기 자리와 함께 바로 남긴다
 
     def read_tokens(self):
-        """새로 쓴 토큰 (API 가격으로 출력 환산) 을 오를 높이로 쌓는다 (창이 숨어 있어도). 새 높이 기록을 넘었으면 바로,
-        아니면 가끔 저장한다."""
+        """새로 쓴 토큰 (API 가격으로 출력 환산) 을 오를 높이로 쌓고 (창이 숨어 있어도), 등반 일지의 시간 칸에도 더한다.
+        새 높이 기록을 넘었으면 바로, 아니면 가끔 저장한다."""
         try:
             added = self.meter.poll()
         except OSError as err:
@@ -1649,10 +1717,13 @@ class PetManager(QObject):
         if added:
             self.climber.deposit(added)
             self.climb_dirty = True
+        if journalcore.add_hours(self.journal, self.meter.take_spent()):
+            self.journal_dirty = True
+        self.tend_backfill()
         if self.climber.passed != self.climb_passed:
             self.save_climb()
         elif time.monotonic() - self.climb_saved >= CLIMB_SAVE_MS / 1000:   # 바뀐 게 있을 때만 (기록 파일 위치가 많아 크다)
-            if self.climb_dirty or self.climber.snapshot() != self.climb_snapshot:
+            if self.climb_dirty or self.journal_dirty or self.climber.snapshot() != self.climb_snapshot:
                 self.save_climb()
             else:
                 self.climb_saved = time.monotonic()
@@ -1821,6 +1892,8 @@ class PetManager(QObject):
         백그라운드) 로 날씨를 정한다. 줄을 다시 세워야 하면 True. 클라이밍 보기를 껐거나, 펫이 없거나, 사용량을 모르면
         (상태줄 중계를 안 쓰면) 창을 숨긴다 (아바타도 멈추고, 토큰은 read_tokens 가 계속 쌓는다)."""
         limits = self.account_limits()
+        if journalcore.record_limits(self.journal, limits, now / 1000):
+            self.journal_dirty = True
         week = self.check_week(limits, now)
         team = None
         if self.climb_enabled() and self.order:
