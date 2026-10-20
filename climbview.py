@@ -21,8 +21,8 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGra
                          QPixmap, QPolygonF, QRadialGradient, QRegion, QTransform)
 from PyQt5.QtWidgets import QWidget
 
-from climbcore import (ARM, BANDS, KST, LEG, MOON, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF, edge_x,
-                       fmt_alt, height_pct, night_level, smooth, two_bone)
+from climbcore import (ARM, BANDS, KST, LEG, M_PER_TOKEN, MOON, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF,
+                       edge_x, fmt_alt, height_pct, night_level, smooth, two_bone)
 
 APP_DIR = Path(__file__).resolve().parent
 ASSET_DIR = APP_DIR / "assets" / "climb"
@@ -634,7 +634,7 @@ class Look:
         return f"리셋 ({'월화수목금토일'[at.weekday()]} {at:%H:%M}) 까지 달에서 쉬어요"
 
     def prepare_hud(self, sim):
-        """왼쪽 위 상자 그림 (self.hud, self.hud_rect): 높이와 다음 기록, 쌓인 오를 거리 (바위) 와 빠르기 (막대),
+        """왼쪽 위 상자 그림 (self.hud, self.hud_rect): 높이와 다음 기록, 아직 오르지 않은 양과 빠르기 (막대),
         체력 (막대). 글자나 막대가 바뀔 때만 다시 그린다. 다시 그릴 곳 (ClimbWindow.dirty) 이 커진 상자를 알도록
         그리기 전에 부른다."""
         alt = max(0.0, sim.shown_altitude())
@@ -652,7 +652,12 @@ class Look:
         if sim.tokens_on:
             state = sim.state_label()
             fill = max(0.0, min(1.0, sim.bank / (PACE_BANK[1] * 1.5)))   # 전력 질주 기준의 1.5배가 가득
-            rows.append((f"오를 거리 {max(0.0, sim.bank):,.1f}m · {state}", small, QColor(170, 235, 255),
+            left = max(0.0, sim.bank)
+            if sim.week_pct is not None:   # 높이 숫자는 주간 % 눈금이라 바위 m 대신 토큰으로 (100 단위 올림)
+                left = f"남은 토큰 {math.ceil(left / M_PER_TOKEN / 100 - 1e-9) * 100:,}"
+            else:
+                left = f"오를 거리 {left:,.1f}m"
+            rows.append((f"{left} · {state}", small, QColor(170, 235, 255),
                          (fill, {1: (110, 200, 120), 2: (240, 200, 70), 3: (255, 120, 60)}[sim.pace])))
         hp = max(0, min(100, round(sim.hp_shown)))
         rows.append((f"체력 {hp}%", small, QColor(230, 215, 190),
