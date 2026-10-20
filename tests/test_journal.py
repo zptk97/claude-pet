@@ -159,10 +159,10 @@ class WeekScaleTest(unittest.TestCase):
 
     def test_week_pct(self):
         j = journalcore.new(0)
-        self.assertEqual(journalcore.week_scale(j, None, RW - H), (None, None))
-        self.assertEqual(journalcore.week_scale(j, limits(RW - H, 5, week=38), RW - H), (38, None))
-        self.assertEqual(journalcore.week_scale(j, limits(RW + 60, 5, week=38), RW + 60), (0.0, None))   # 리셋이 지났다
-        self.assertEqual(journalcore.week_scale(j, limits(RW - H, 5, week=38, week_reset=None), RW - H), (38, None))
+        self.assertEqual(journalcore.week_scale(j, None, RW - H), (None, None, None))
+        self.assertEqual(journalcore.week_scale(j, limits(RW - H, 5, week=38), RW - H), (38, None, RW))
+        self.assertEqual(journalcore.week_scale(j, limits(RW + 60, 5, week=38), RW + 60), (0.0, None, None))   # 리셋이 지났다
+        self.assertEqual(journalcore.week_scale(j, limits(RW - H, 5, week=38, week_reset=None), RW - H), (38, None, None))
 
 
 class BackfillTest(unittest.TestCase):

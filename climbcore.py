@@ -3,7 +3,7 @@
 내 아바타가 흐르는 자연 암벽을 끝없이 오른다. Claude 가 쓴 토큰 (입력·출력·캐시) 을 API 가격으로 환산해 $1 어치마다
 30m 를 오를 높이로 쌓고 (TokenMeter 가 Claude Code 기록 파일을 읽기만 해서 센다), 쌓인 높이가 많을수록 빠르게 오른다.
 다 쓰면 일하는 펫이 있으면 기다리고 없으면 쉰다. 일하는 펫 수는 날씨, 5시간 사용량은 체력, 주간 사용량은 높이
-(가속 눈금 week_height: 50% = 100km, 100% = 달) 와 벽의 끝이고, 펫 상태에서 온 신호
+(가속 눈금 week_height: 50% = 100km, 100% = 기둥 위 끝 달에 올라선다) 와 벽의 끝이고, 펫 상태에서 온 신호
 (Climber.signal) 로 다이노·로프 추락·초크·잠·기상 같은 동작을 끼워 넣는다. 높이 기록 (아파트 10층 ~ 달) 을
 넘으면 한 번씩 말풍선을 띄운다.
 
@@ -100,7 +100,7 @@ DYNO_MIX = {2: 0.06, 3: 0.18}                 # 빠름·전력 질주에서 손�
 NAP_AFTER = 180.0                             # 쉬는 자세 (기다림·쉼) 로 이만큼 (초) 있으면 포타레지를 펴고 낮잠을 잔다
 LEFTOVER_WAIT = 20.0                          # 1m 가 안 되게 남은 오를 높이는 토큰이 이만큼 (초) 안 들어오면 마저 오른다
 GROUND = -2.4                 # 땅 높이 (m). 새 벽 첫 자세가 0m 이고 그 발 아래
-GROUND_OK = ("get_up",)       # 바닥에 앉아 있는 동안 받는 동작
+GROUND_OK = ("get_up", "moon_leave")   # 바닥 (달) 에 앉아 있는 동안 받는 동작
 FALL_SPEED = 8.0              # 벽의 끝: 떨어지는 빠르기 (m/s, 처음부터 끝까지 같다. 높이 숫자는 따로 가속 눈금을 따라)
 FALL_PCT = 12.0               # 벽의 끝에서 높이 숫자가 가속 눈금을 따라 내려가는 빠르기 (%/s)
 FALL_RAMP = 4.0               # 땅 가까이 이만큼 (%) 에서 느려져 마지막 12m 의 떨어지는 빠르기와 이어진다
@@ -114,7 +114,7 @@ LAST_ROOM = 0.3                               # 남은 오를 높이가 이보�
 COOLDOWN = {"dyno": 8.0, "chalk": 15.0}      # 잦은 신호는 이 간격 (초) 안이면 버린다 (일 끝냄 → 다이노, 사용량 → 초크)
 SHAKE_EVERY = (40.0, 80.0)                    # 체력 60% 이하면 오르다가 이 간격으로 팔을 턴다
 WORKING = ("running", "background")          # 일하는 펫으로 치는 상태 (날씨)
-AWAKE = ("wake", "refill", "wall_end")        # 자는 동안에도 받는 동작
+AWAKE = ("wake", "refill", "wall_end", "moon_top", "moon_leave")   # 자는 동안에도 받는 동작
 FREE_FOOT = 0.75                              # 손을 뻗을 때 한 발을 떼어 (삼지점) 플래그·벽 딛기로 균형을 잡을 비율
 FREE_HOLD = 0.3                               # 뗀 발은 손을 잡고 적어도 이만큼 (초) 더 균형을 잡은 뒤 홀드로 옮긴다
 FOOT_SPAN = 3.6                               # 편한 자세에서 아래쪽 손과 발 사이 높이 (팔 펴고 다리로 민다, 무릎 약 100°)
@@ -713,6 +713,11 @@ class Climber:
         self.wall_pending = False   # 벽이 끝나 새 벽을 기다린다 (떨어지는 장면을 아직 안 보였다)
         self.carry = 0.0            # 벽이 끝난 뒤 떨어지는 동안 받은 오를 높이 (새 벽으로 넘긴다)
         self.grounded = False       # 벽이 끝나 땅에 앉아 있다 (주간 사용량이 돌아오면 일어나 새 벽을 오른다)
+        self.moon = None            # 달 표면 높이 (몸 좌표 y): 주간 사용량 100% 로 기둥 위 끝 달에 올라섰다 (앉으면 grounded 도)
+        self.moon_t = -1e9          # 달 표면이 나타난 때 (하늘의 달이 사라진다)
+        self.moon_flag = None       # 달에 꽂은 깃발 자리
+        self.moon_pending = False   # 달에 오르는 장면을 기다린다 (그 전에 꺼져도 다음에는 달 위에서)
+        self.week_reset = None      # 계정 주간 리셋 epoch 초 (달에서 기다릴 때 보인다)
         self.start_pose = None      # 새 벽의 첫 자세 (몸 자리, {손발: 홀드}) — 일어나 붙을 곳
         self.lay_wall(random.Random(seed + 3))
         self.brain_task = self.brain()
@@ -745,6 +750,7 @@ class Climber:
         last = self.peak
         self.holds, self.bolts, self.rocks, self.particles, self.texts, self.requests = [], [], [], [], [], []
         self.cam, self.falling, self.rope_cut, self.wall_pending = 0.45, False, None, False
+        self.moon, self.moon_flag, self.moon_pending = None, None, False
         self.mode, self.vel, self.tilt, self.tilt_vel, self.crouch = "spring", V(), 0.0, 0.0, 0.0
         self.phase_target = self.look_at = self.lamp = self.rope = self.rope_hand = self.ledge = None
         self.sleeping = self.nap = self.resting = self.parked = False
@@ -759,7 +765,7 @@ class Climber:
             self.sit(keep[1] if keep else self.body.x)
             self.cam = self.body.y + (keep[0] if keep else 1.0)
         if banner:
-            self.banner = [f"새 벽! 지난 벽 {fmt_alt(last)}", 0.0]
+            self.banner = ["새 벽! 지난주는 달까지 완등" if last >= MOON else f"새 벽! 지난 벽 {fmt_alt(last)}", 0.0]
         if self.hp <= 0 and not grounded:
             self.requests.append(("exhaust", ()))   # 5시간 사용량도 다 썼으면 새 벽에서 다시 잔다
         if restart:
@@ -769,8 +775,10 @@ class Climber:
     def end_wall(self, animate=True, locked=True):
         """주간 사용량을 다 썼거나 주간 리셋: 지금 벽을 끝낸다. animate 면 다음 동작으로 빌레이 줄이 끊어져 땅까지
         떨어진다 (wall_end). 아니면 (창이 숨어 있다) 바로 새 벽: locked (주간을 다 써서 못 쓴다) 면 땅에 앉아서, 아니면
-        벽에 붙어서. 이미 땅에 앉아 있으면 조용히 벽만 새로."""
-        if self.grounded:
+        벽에 붙어서. 이미 땅에 앉아 있으면 조용히 벽만 새로. 달 위에 있으면 달에서 내려온다 (leave_moon)."""
+        if self.moon is not None:
+            self.leave_moon(animate)
+        elif self.grounded:
             self.new_wall(grounded=True, banner=False)
         elif animate:
             self.wall_pending = True
@@ -782,19 +790,26 @@ class Climber:
         """땅의 y (높이 GROUND)."""
         return GROUND - self.alt0
 
+    def seat_y(self):
+        """앉는 바닥의 y: 달 위면 달 표면, 아니면 땅."""
+        return self.moon if self.moon is not None else self.ground_y()
+
     def sit(self, x):
-        """땅에 주저앉는다: 몸통이 땅에 닿고 다리는 양옆으로 뻗고 손은 옆 땅을 짚는다."""
-        self.body = V(max(-WALL_HALF + 0.6, min(WALL_HALF - 0.6, x)), self.ground_y() + 1.0)
+        """땅 (달) 에 주저앉는다: 몸통이 바닥에 닿고 다리는 양옆으로 뻗고 손은 옆 바닥을 짚는다."""
+        self.body = V(max(-WALL_HALF + 0.6, min(WALL_HALF - 0.6, x)), self.seat_y() + 1.0)
         self.mode, self.vel, self.tilt, self.tilt_vel = "script", V(), 0.0, 0.0
-        for name, (dx, dy) in {"LF": (-1.0, 0.1), "RF": (1.0, 0.1), "LH": (-1.25, 0.25), "RH": (1.25, 0.25)}.items():
+        for name, goal in self.sit_goals().items():
             limb = self.limbs[name]
-            limb.mode, limb.tucked = "follow", False
-            limb.follow = lambda dx=dx, dy=dy: V(self.body.x + dx, self.ground_y() + dy)
+            limb.mode, limb.tucked, limb.follow = "follow", False, goal
             limb.pos = limb.follow()
+
+    def sit_goals(self):
+        return {name: (lambda dx=dx, dy=dy: V(self.body.x + dx, self.seat_y() + dy))
+                for name, (dx, dy) in {"LF": (-1.0, 0.1), "RF": (1.0, 0.1), "LH": (-1.25, 0.25), "RH": (1.25, 0.25)}.items()}
 
     def rise(self, animate=True):
         """주간 사용량이 돌아왔다: 땅에서 일어나 새 벽에 붙는다 (animate 면 걸어가 첫 홀드를 잡는 get_up, 아니면 바로)."""
-        if not self.grounded or any(r[0] == "get_up" for r in self.requests):
+        if not self.grounded or self.moon is not None or any(r[0] == "get_up" for r in self.requests):
             return
         if animate:
             self.requests.append(("get_up", ()))
@@ -804,6 +819,137 @@ class Climber:
             for name, hold in holds.items():
                 self.grab(self.limbs[name], hold)
             self.cam = self.body.y + 0.45
+
+    def reach_moon(self, animate=True):
+        """주간 사용량을 다 썼다 (100%): 기둥 위 끝 달에 오른다. animate 면 다음 동작으로 올라서는 장면 (moon_top),
+        아니면 (창이 숨어 있다) 바로 달 위에 앉는다."""
+        if self.moon is not None or self.moon_pending or self.falling or self.wall_pending:
+            return   # 벽의 끝으로 떨어지는 중에는 오르지 않는다 (같은 주에 둘이 겹칠 일은 없다)
+        if self.grounded:   # 땅에서 기다리던 중이면 벽에 붙인 뒤에
+            self.rise(animate=False)
+        if animate:
+            self.moon_pending = True
+            self.requests.insert(0, ("moon_top", ()))
+        else:
+            self.place_on_moon()
+
+    def place_on_moon(self):
+        """장면 없이 달 위에 앉힌다 (창이 숨어 있었거나 다시 켰을 때, 올라서는 도중에 숨었을 때). 깃발은 꽂혀 있다.
+        brain 밖에서만 부른다 (하던 동작을 버리고 brain 을 새로 띄운다)."""
+        hands = [self.held_y(self.limbs[n]) for n in ("LH", "RH")]
+        self.moon, self.moon_t, self.moon_pending = min(max(hands) + 0.8, self.body.y + 1.75), self.t - 10.0, False
+        self.clear_above_moon()
+        self.ledge, self.sleeping, self.nap, self.rope, self.rope_hand = None, False, False, None, None
+        self.phase_target = self.look_at = None
+        self.requests, self.resting, self.parked, self.wait_for, self.crouch = [], False, False, 0.0, 0.0
+        self.idle_since, self.lids, self.vel, self.falling = None, 0.0, V(), False
+        self.brain_task = self.brain()   # 하던 동작 (다이노·낮잠 펴기 등) 을 버리고 달 위에서 처음부터
+        next(self.brain_task)
+        x = max(-WALL_HALF + 0.8, min(WALL_HALF - 0.8, self.body.x))
+        self.moon_flag = self.flag_spot(x)
+        self.grounded = True
+        self.sit(x)
+        self.clear_above_moon(gripped=False)
+        self.cam = self.body.y + 0.45
+        self.pct_shown, self.peak, self.passed = 100.0, float(MOON), len(MILESTONES)
+
+    def clear_above_moon(self, gripped=True):
+        """달 표면 위의 홀드·볼트를 치운다 (gripped 면 잡고 있는 홀드는 둔다)."""
+        keep = {id(l.hold) for l in self.limbs.values() if l.mode == "grip"} if gripped else set()
+        self.holds = [h for h in self.holds if h.p.y < self.moon - 0.35 or id(h) in keep]
+        self.bolts = [b for b in self.bolts if b.p.y < self.moon - 0.5]
+
+    def flag_spot(self, x):
+        side = 1 if x < 0 else -1   # 넓은 쪽에 꽂는다
+        return V(x + side * 1.0, self.moon)
+
+    def leave_moon(self, animate=True):
+        """달에서 주간 리셋: animate 면 다음 동작으로 뛰어내려 지구까지 떨어지는 장면 (moon_leave), 아니면 바로 새 벽에
+        붙는다."""
+        if self.moon is None:
+            return
+        if animate:
+            self.wall_pending = True
+            self.requests.insert(0, ("moon_leave", ()))
+        else:
+            self.new_wall(grounded=False)
+
+    def moon_top(self):
+        """주간 사용량 100%: 바위 기둥 위 끝이 달 표면이다. 손 위로 달 표면이 나타나고, 끝에 두 손을 걸어 몸을 끌어
+        올려 올라선 뒤 깃발을 꽂고 '이번 주 완등!' 하며 만세, 리셋까지 달 위에 앉아 쉰다 (ground_wait).
+        포타레지에서 자고 있었으면 깨어 포타레지를 접고 오른다."""
+        if self.moon is not None:
+            return
+        if self.sleeping and self.ledge is not None:
+            yield from self.wake()
+        self.actions.append("moon_top")
+        top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
+        lip = self.moon = min(top + 0.8, self.body.y + 1.75)   # 매달린 몸에서 손이 닿는 높이
+        self.moon_t, self.moon_pending = self.t, False
+        self.clear_above_moon()
+        self.phase_target, self.rope, self.rope_hand = None, None, None
+        self.lids, self.look_at = 0.0, V(self.body.x, lip + 0.6)
+        yield from self.wait(0.7, stoppable=False)
+        x0 = max(-WALL_HALF + 0.8, min(WALL_HALF - 0.8, self.body.x))
+
+        def at(dx, dy, base=None):
+            return lambda: V(self.body.x + dx, (lip if base is None else self.body.y) + dy)
+        yield from self.move_limb("LH", at(-0.55, 0.05), 0.35)   # 두 손을 달 표면 끝에 건다
+        yield from self.move_limb("RH", at(0.55, 0.05), 0.35)
+        yield from self.move_all({"LF": at(-0.45, -1.35, "body"), "RF": at(0.45, -1.35, "body")}, 0.8,
+                                 body_to=lambda: V(x0, lip - 0.15), tilt_to=0.0)   # 몸을 끌어 올린다
+        yield from self.move_all({"RF": at(0.45, 0.05)}, 0.6, body_to=lambda: V(x0, lip + 0.9))   # 눌러 올라서며 한 발을 올린다
+        yield from self.move_all({"LF": at(-0.35, 0.05), "RF": at(0.35, 0.05), "LH": at(-0.75, -0.55, "body"),
+                                  "RH": at(0.75, -0.55, "body")}, 0.7, body_to=lambda: V(x0, lip + 2.15))   # 일어선다
+        spot = self.flag_spot(x0)
+        hand = "RH" if spot.x > x0 else "LH"
+        self.face = -1 if spot.x > x0 else 1
+        self.look_at = spot + V(0, 0.5)
+        yield from self.move_limb(hand, lambda: V(spot.x, lip + 1.5), 0.4, arc=0.1)   # 깃대를 들어
+        yield from self.move_limb(hand, lambda: V(spot.x, lip + 0.8), 0.14, arc=0.0)   # 푹 꽂는다
+        self.moon_flag = spot
+        self.puff(spot, n=10, speed=0.9, size=0.15, life=0.9)
+        self.texts.append(Float(spot + V(0, 2.3), "푹!"))
+        yield from self.wait(0.4, stoppable=False)
+        self.look_at = None
+        self.banner = [f"이번 주 완등! 달 {fmt_alt(MOON)}", 0.0]
+        self.confetti(40)
+        yield from self.move_all({"LH": lambda: self.body + V(-0.6, 1.75), "RH": lambda: self.body + V(0.6, 1.75)}, 0.4)   # 만세
+        self.squash_vel -= 1.5
+        yield from self.wait(1.6, stoppable=False)
+        yield from self.move_all(self.sit_goals(), 0.6, body_to=lambda: V(x0, lip + 1.0), tilt_to=0.0)   # 앉는다
+        self.grounded = True
+        self.sit(x0)
+        self.clear_above_moon(gripped=False)
+
+    def moon_leave(self):
+        """달에서 주간 리셋: 일어나 '다시 지구로!' 하고 뛰어내린다. 높이 숫자와 배경이 가속 눈금을 따라 내려가고
+        (fall_home), 땅에 닿으면 새 벽 아래에 앉는다 (주간 사용량이 돌아왔으니 곧 일어나 오른다)."""
+        if self.moon is None:
+            return
+        self.actions.append("moon_leave")
+        lip, x0 = self.moon, self.body.x
+        self.lids, self.look_at = 0.0, None
+        self.sleeping, self.nap, self.ledge = False, False, None
+
+        def at(dx, dy):
+            return lambda: V(self.body.x + dx, self.body.y + dy)
+        yield from self.move_all({"LF": lambda: V(self.body.x - 0.35, lip + 0.05), "RF": lambda: V(self.body.x + 0.35, lip + 0.05),
+                                  "LH": at(-0.75, -0.55), "RH": at(0.75, -0.55)}, 0.7, body_to=lambda: V(x0, lip + 2.15),
+                                 tilt_to=0.0)   # 일어선다
+        self.texts.append(Float(self.body + V(0, 1.6), "다시 지구로!"))
+        yield from self.move_all({"RH": at(0.7, 1.6)}, 0.3)   # 손을 흔들고
+        yield from self.move_all({"RH": at(0.9, 1.3)}, 0.2)
+        yield from self.move_all({"RH": at(0.7, 1.6)}, 0.2)
+        yield from self.move_all({"LH": at(-0.75, -0.55), "RH": at(0.75, -0.55)}, 0.3, body_to=lambda: V(x0, lip + 1.7))   # 웅크렸다
+        yield from self.move_all({"LH": at(-0.6, 1.6), "RH": at(0.6, 1.6)}, 0.3, body_to=lambda: V(x0, lip + 2.8))   # 뛰어오른다
+        self.grounded = False
+        for limb in self.limbs.values():   # 허우적
+            limb.mode, limb.tucked = "free", False
+            limb.vel = V(self.wrng.uniform(-2.0, 2.0), self.wrng.uniform(1.5, 3.5))
+        self.mode, self.falling = "script", True
+        self.alt0 = MOON - self.body.y
+        yield from self.fall_home(float(MOON), "다녀왔어요!")
 
     def get_up(self):
         """땅에서 영차 일어나 벽 앞으로 걸어가 첫 홀드를 잡고 올라선다."""
@@ -832,7 +978,7 @@ class Climber:
             self.requests.append(("exhaust", ()))
 
     def ground_wait(self):
-        """땅에서 기다린다: 가끔 벽을 올려다보며 한숨 (5시간 사용량도 다 썼으면 꾸벅꾸벅 존다)."""
+        """땅 (달) 에서 기다린다: 가끔 벽을 올려다보며 (달에서는 지구를 내려다보며) 한숨 (5시간 사용량도 다 썼으면 꾸벅꾸벅 존다)."""
         if self.hp <= 0:
             if self.lids < 0.85:
                 yield from self.tween(self, "lids", self.lids, 0.9, 0.8)
@@ -844,11 +990,12 @@ class Climber:
         yield from self.wait(self.wrng.uniform(4.0, 8.0), until=lambda: bool(self.requests) or self.hp <= 0)
         if self.requests or self.hp <= 0:
             return
-        self.look_at = self.body + V(-0.6 * self.face, 4.0)   # 벽을 올려다본다
+        moon = self.moon is not None
+        self.look_at = self.body + (V(2.0, -3.0) if moon else V(-0.6 * self.face, 4.0))   # 달에서는 아래 지구를 내려다보고, 땅에서는 벽을 올려다본다
         yield from self.wait(1.4, until=lambda: bool(self.requests))
         self.look_at = None
         if self.wrng.random() < 0.5:
-            self.texts.append(Float(self.body + V(0, 1.4), "휴…"))
+            self.texts.append(Float(self.body + V(0, 1.4), "지구다…" if moon else "휴…"))
 
     # ---- 바깥에서 부르는 것 ---------------------------------------------------
 
@@ -922,7 +1069,7 @@ class Climber:
     def state_label(self):
         """높이 상자에 보이는 지금 상태: 잠, 쉬는 자세면 기다림 (일하는 펫 있음)·쉼, 오르는 중이면 빠르기."""
         if self.grounded:
-            return "바닥"
+            return "달" if self.moon is not None else "바닥"
         if self.sleeping:
             return "낮잠" if self.nap else "잠"
         if self.resting:
@@ -932,6 +1079,8 @@ class Climber:
     def shown_altitude(self):
         """높이 상자에 보이는 높이: 가속 눈금이면 그 높이, 아니면 이번 길에서 가장 높이 올라간 자리 (일어섰다 앉을 때마다
         숫자가 오르내리지 않게). 1.5m 넘게 떨어졌으면 (추락) 지금 높이."""
+        if self.moon is not None and not self.falling:
+            return float(MOON)
         if self.scaled():
             return week_height(self.pct_shown)
         return self.alt0 + self.top_y if self.body.y >= self.top_y - 1.5 else self.altitude()
@@ -940,19 +1089,21 @@ class Climber:
         """높이가 주간 사용량의 가속 눈금인지: 주간 % 를 알고 벽에 붙어 있을 때 (떨어질 때·땅에서는 실제 높이)."""
         return self.week_pct is not None and not self.falling and not self.grounded
 
-    def set_week(self, pct, per=None):
+    def set_week(self, pct, per=None, reset=None):
         """계정 주간 사용량 (%, None 이면 그대로) 과 1% 에 드는 토큰 (None 이면 그대로). 처음 받거나 % 가 오르면 그
         % 에 그때까지의 토큰이 들어 있으니 토큰은 처음부터 센다 (꺼져 있던 동안 쌓인 토큰이 % 를 밀어 올리지 않게).
         처음 받으면 저장해 둔 높이가 더 높아도 이 % 에 맞추고, % 가 줄면 (새 주) 벽의 끝 장면을 기다리는 게 아니면
-        새 주 높이로 맞춘다 (벽이 끝나지 않은 채 주가 바뀌었어도 지난주 높이에 머물지 않게)."""
+        새 주 높이로 맞춘다 (벽이 끝나지 않은 채 주가 바뀌었어도 지난주 높이에 머물지 않게. 달 위면 내려올 때 새로)."""
         if per:
             self.week_per = per
+        if reset:
+            self.week_reset = reset
         if pct is None:
             return
         old, self.week_pct = self.week_pct, max(0.0, min(100.0, pct))
         if old is None or self.week_pct != old:
             self.week_tokens = 0.0
-        if old is None or (self.week_pct < old and not self.wall_pending and not self.falling):
+        if self.moon is None and (old is None or (self.week_pct < old and not self.wall_pending and not self.falling)):
             self.rebase(min(self.pct_shown, self.week_target()))
 
     def rebase(self, pct):
@@ -974,6 +1125,8 @@ class Climber:
 
     def altitude(self):
         """지금 높이 (m): 가속 눈금이면 보이는 주간 % 의 높이, 아니면 오른 바위 높이."""
+        if self.moon is not None and not self.falling:
+            return float(MOON)
         return week_height(self.pct_shown) if self.scaled() else self.alt0 + self.body.y
 
     def jump(self, target, peak=None):
@@ -989,6 +1142,9 @@ class Climber:
 
     def snapshot(self):
         """저장할 기록: 높이 (이번 길에서 가장 높이 올라간 자리), 최고 높이, 쌓인 높이, 받은 토큰 합."""
+        if (self.moon is not None or self.moon_pending) and not self.wall_pending:   # 달 위 (오르는 장면 전에 꺼져도)
+            return {"height": float(MOON), "peak": float(MOON), "bank": 0.0, "tokens": round(self.tokens, 1),
+                    "grounded": True, "moon": True}
         if self.wall_pending or self.grounded:   # 벽이 끝났다 (떨어지는 장면 전에 꺼져도 다음에는 새 벽 땅에서)
             return {"height": 0.0, "peak": 0.0, "bank": 0.0, "tokens": round(self.tokens, 1), "grounded": True}
         height = week_height(self.pct_shown) if self.scaled() else self.alt0 + self.top_y
@@ -1008,7 +1164,9 @@ class Climber:
         tokens = saved.get("tokens") if isinstance(saved, dict) else None
         ok = isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and math.isfinite(tokens) and tokens >= 0
         self.tokens = tokens if ok else 0
-        if isinstance(saved, dict) and saved.get("grounded") is True:   # 벽이 끝나 땅에서 기다리던 중
+        if isinstance(saved, dict) and saved.get("moon") is True:   # 달 위에서 리셋을 기다리던 중
+            self.place_on_moon()
+        elif isinstance(saved, dict) and saved.get("grounded") is True:   # 벽이 끝나 땅에서 기다리던 중
             self.new_wall(grounded=True, banner=False)
 
     def next_milestone(self):
@@ -1037,7 +1195,8 @@ class Climber:
         self.t += dt
         self.flagging = any(f.mode == "follow" and getattr(f, "free_style", None) in ("flag", "backflag") and not f.tucked
                             for f in (self.limbs["LF"], self.limbs["RF"]))
-        self.route.fill(self, self.cam + FILL_AHEAD)
+        if self.moon is None:   # 달 표면 위로는 홀드가 없다
+            self.route.fill(self, self.cam + FILL_AHEAD)
         self.brain_task.send(dt)
         steps = max(1, math.ceil(dt * (30 if self.resting else 60)))   # 쉬는 동안은 몸 계산을 덜 잘게
         for _ in range(steps):
@@ -1521,11 +1680,14 @@ class Climber:
                 continue
             self.banner = [text, 0.0]
             self.banners.append(height)
-            for _ in range(26):
-                a = self.wrng.uniform(0.35, math.pi - 0.35)
-                speed = self.wrng.uniform(2.5, 4.5)
-                self.particles.append(Particle(self.body + V(0, 1.2), V(math.cos(a) * speed, math.sin(a) * speed),
-                                               1.6, 0.1, "confetti", self.wrng.choice(CONFETTI)))
+            self.confetti(26)
+
+    def confetti(self, n):
+        for _ in range(n):
+            a = self.wrng.uniform(0.35, math.pi - 0.35)
+            speed = self.wrng.uniform(2.5, 4.5)
+            self.particles.append(Particle(self.body + V(0, 1.2), V(math.cos(a) * speed, math.sin(a) * speed),
+                                           1.6, 0.1, "confetti", self.wrng.choice(CONFETTI)))
 
     def move_events(self, dt):
         """추락 이벤트: 비·눈에 발 미끄러짐, 체력이 낮으면 손 미끄러짐, 폭풍우에 낙석."""
@@ -2416,6 +2578,11 @@ class Climber:
         self.mode, self.falling = "script", True
         self.alt0 = height - self.body.y   # 떨어지는 동안 높이는 실제 높이 (가속 눈금 높이에서 이어서)
         self.texts.append(Float(self.body + V(0, 1.4), "으아아!"))
+        yield from self.fall_home(height, "아야…")
+
+    def fall_home(self, height, after):
+        """height (m) 에서 땅까지 떨어진다 (wall_end·moon_leave): 몸은 같은 빠르기, 높이 숫자와 배경은 가속 눈금을 따라.
+        쿵 하고 새 벽의 땅에 주저앉아 after 를 말한다."""
         land = GROUND + 1.0   # 몸통이 땅에 닿는 높이
         final = min(height, 12.0)   # 마지막 이만큼은 떨어지는 빠르기대로 (땅이 아래에서 올라와 닿는다)
         pct, pct_end = height_pct(height), height_pct(final)   # 그 위는 높이 숫자만 가속 눈금을 따라
@@ -2456,7 +2623,7 @@ class Climber:
         self.texts.append(Float(self.body + V(0, 1.6), "쿵!"))
         self.squash_vel -= 4.0
         yield from self.wait(1.0, stoppable=False)
-        self.texts.append(Float(self.body + V(0.6, 1.3), "아야…"))
+        self.texts.append(Float(self.body + V(0.6, 1.3), after))
 
     def crux_ready(self):
         """크럭스 끝 홀드로 뛸 때면 그 홀드: 손보다 1~3.6m 위에 있고, 손이 더 오를 데가 없고 (제자리로 맴돌기 시작했으면

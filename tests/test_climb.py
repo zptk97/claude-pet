@@ -929,6 +929,133 @@ class ScaleTest(unittest.TestCase):
         self.assertTrue(sim.grounded)
 
 
+class MoonTest(unittest.TestCase):
+    """주간 사용량 100%: 기둥 위 끝 달에 올라서 깃발을 꽂고 리셋까지 쉬다가, 리셋이면 뛰어내려 지구로 떨어진다."""
+
+    def at_moon(self, seed=5, sleep=False):
+        sim = Climber(seed)
+        sim.tokens_on, sim.work = False, 1
+        sim.set_week(99, 1000.0, 1_792_623_600)
+        sim.pct_shown = 99.0
+        run(sim, 20.0)
+        if sleep:
+            sim.hp = 0
+            sim.signal("exhaust")
+            run(sim, 15.0)
+            self.assertTrue(sim.sleeping)
+        sim.set_week(100)
+        sim.reach_moon()
+        self.assertTrue(sim.snapshot()["moon"])   # 올라서는 장면 전에 꺼져도 다음에는 달 위
+        run(sim, 14.0)
+        return sim
+
+    def check_on_moon(self, sim):
+        self.assertTrue(sim.grounded)
+        self.assertIsNotNone(sim.moon)
+        self.assertAlmostEqual(sim.body.y, sim.moon + 1.0, delta=0.05)   # 달 표면에 앉아 있다
+        self.assertIsNotNone(sim.moon_flag)
+        self.assertEqual(sim.altitude(), climbcore.MOON)
+        self.assertEqual(sim.shown_altitude(), climbcore.MOON)
+        self.assertFalse(any(h.p.y > sim.moon for h in sim.holds))   # 표면 위로는 홀드가 없다
+        self.assertEqual(sim.state_label(), "달")
+
+    def test_tops_out_plants_flag_and_waits(self):
+        sim = self.at_moon()
+        self.assertIn("moon_top", sim.actions)
+        self.check_on_moon(sim)
+        self.assertIn(climbcore.MOON, sim.banners)   # 달에 도착했어요!
+        self.assertEqual(sim.missing, 0)
+        for name in ("chalk", "dyno", "fall", "exhaust"):   # 다른 동작은 받지 않는다
+            sim.request(name)
+        self.assertEqual(sim.requests, [])
+        holds = len(sim.holds)
+        run(sim, 30.0)   # 리셋까지 달 위에서 (위로 홀드를 더 깔지 않는다)
+        self.check_on_moon(sim)
+        self.assertEqual(len(sim.holds), holds)
+        sim.hp = 0
+        run(sim, 8.0)
+        self.assertGreater(sim.lids, 0.8)   # 5시간 사용량도 다 썼으면 존다
+        saved = sim.snapshot()
+        self.assertEqual((saved["moon"], saved["height"]), (True, climbcore.MOON))
+        again = Climber(8)
+        again.tokens_on, again.work = False, 1
+        again.restore(saved)
+        self.check_on_moon(again)
+        again.set_week(100)   # 다시 켜도 달 위 (내려오지 않는다)
+        run(again, 5.0)
+        self.check_on_moon(again)
+
+    def test_from_the_portaledge_and_hidden(self):
+        sim = self.at_moon(seed=7, sleep=True)   # 자다가 100%: 깨어 포타레지를 접고 오른다
+        self.assertIn("wake", sim.actions)
+        self.check_on_moon(sim)
+        self.assertIsNone(sim.ledge)
+        hidden = Climber(3)
+        hidden.tokens_on, hidden.work = False, 1
+        run(hidden, 20.0)
+        hidden.reach_moon(animate=False)   # 창이 숨어 있으면 바로 달 위
+        self.check_on_moon(hidden)
+        hidden.leave_moon(animate=False)   # 숨어 있는 동안 리셋: 바로 새 벽에 붙는다
+        self.assertFalse(hidden.grounded)
+        self.assertIsNone(hidden.moon)
+        self.assertIn("달까지", hidden.banner[0])
+
+    def test_hidden_mid_action_restart_and_reach(self):
+        for setup in ("dyno", "rest"):   # 하던 동작 (다이노, 오래 쉬다 낮잠) 은 버리고 달 위에서 처음부터
+            sim = Climber(11)
+            sim.tokens_on, sim.work = False, (0 if setup == "rest" else 1)
+            run(sim, 15.0)
+            if setup == "dyno":
+                sim.request("dyno")
+                run(sim, 0.3)
+            sim.reach_moon(animate=False)
+            run(sim, 200.0)
+            self.check_on_moon(sim)
+            self.assertFalse(sim.sleeping, setup)
+            self.assertIsNone(sim.ledge, setup)
+            self.assertTrue(all(l.mode == "follow" for l in sim.limbs.values()), setup)
+        again = Climber(8)
+        again.tokens_on, again.work = False, 1
+        again.restore(sim.snapshot())
+        again.set_week(99.7, 1000.0)   # 다시 켜면: 달 위면 처음 받은 % 에 맞추지 않는다 (도착 말풍선이 다시 뜨지 않게)
+        run(again, 5.0)
+        self.check_on_moon(again)
+        self.assertEqual(again.banners, [])
+        reach = Climber(13)   # 표면은 매달린 몸에서 손이 닿는 높이에
+        reach.tokens_on, reach.work = False, 1
+        run(reach, 20.0)
+        reach.reach_moon()
+        while reach.moon is None:
+            reach.update(DT)
+        self.assertLess(reach.moon - reach.body.y, 1.9)   # 팔이 닿는 거리 (어깨 0.26 + 팔 1.68) 안
+
+    def test_leaves_the_moon_falls_home_and_climbs_again(self):
+        sim = self.at_moon(seed=9)
+        sim.leave_moon()
+        self.assertTrue(sim.snapshot()["grounded"])   # 내려오는 장면 전에 꺼지면 다음에는 땅에서
+        self.assertNotIn("moon", sim.snapshot())
+        sim.set_week(0)   # 새 주 (떠나는 장면을 기다리는 동안은 높이를 그대로)
+        alts, t = [], 0.0
+        while (sim.wall_pending or sim.falling) and t < 30:
+            sim.update(DT)
+            t += DT
+            if sim.falling:
+                alts.append(sim.altitude())
+        self.assertIn("moon_leave", sim.actions)
+        self.assertAlmostEqual(alts[0], climbcore.MOON, delta=climbcore.MOON * 0.05)
+        self.assertTrue(all(b <= a + 0.05 for a, b in zip(alts, alts[1:])))
+        self.assertLess(alts[-1], 0.0)
+        self.assertLess(t, 16.0)
+        self.assertTrue(sim.grounded)
+        self.assertIsNone(sim.moon)
+        self.assertIn("달까지", sim.banner[0])   # 새 벽! 지난주는 달까지 완등
+        sim.rise()
+        run(sim, 40.0)
+        self.assertFalse(sim.grounded)
+        self.assertEqual(sim.missing, 0)
+        self.assertLess(sim.altitude(), climbcore.week_height(1.0))   # 새 주 0% 부터
+
+
 class StateFileTest(unittest.TestCase):
 
     def test_save_and_load(self):

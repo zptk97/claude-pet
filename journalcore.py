@@ -169,10 +169,10 @@ def tokens_per_pct(journal):
 
 
 def week_scale(journal, limits, now_s):
-    """끝없이 오르기 높이 (가속 눈금) 에 줄 (주간 사용량 %, 1% 에 드는 토큰). % 는 리셋 시각이 지났으면 0 (새 주),
-    모르면 None. 1% 에 드는 토큰은 tokens_per_pct (모르면 None)."""
+    """끝없이 오르기 높이 (가속 눈금) 에 줄 (주간 사용량 %, 1% 에 드는 토큰, 주간 리셋 epoch 초). % 는 리셋 시각이
+    지났으면 0 (새 주), 모르면 None. 1% 에 드는 토큰은 tokens_per_pct (모르면 None), 리셋은 지났거나 모르면 None."""
     pct = _number(limits.get("seven_day_pct")) if limits else None
     reset = _number(limits.get("seven_day_reset")) if limits else None
-    if pct is not None and reset is not None and reset <= now_s:
-        pct = 0.0
-    return pct, tokens_per_pct(journal)
+    if reset is not None and reset <= now_s:
+        pct, reset = (0.0 if pct is not None else None), None
+    return pct, tokens_per_pct(journal), reset

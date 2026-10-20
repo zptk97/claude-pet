@@ -22,7 +22,7 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGra
 from PyQt5.QtWidgets import QWidget
 
 from climbcore import (ARM, BANDS, KST, LEG, MOON, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF, edge_x,
-                       fmt_alt, night_level, smooth, two_bone)
+                       fmt_alt, height_pct, night_level, smooth, two_bone)
 
 APP_DIR = Path(__file__).resolve().parent
 ASSET_DIR = APP_DIR / "assets" / "climb"
@@ -34,6 +34,9 @@ NIGHT_EVERY = 5.0                 # 시계를 보고 밤 정도를 다시 정하
 NIGHT_TINT = (8, 12, 30)          # 밤에 덮는 색 (하늘·바위·아바타)
 LAMP = (-0.40, -0.70)             # 헤드램프 자리 (몸통 공 중심에서, 반지름 단위, 그림 좌표: 왼쪽 위가 -)
 LAMP_POOL = 1.3                   # 헤드램프가 벽을 비추는 웅덩이 반지름 (m)
+MOON_SLAB = 1.6                   # 기둥 위 끝 달 표면 띠의 두께 (m)
+SPACE_MOON = (0.823, 0.147, 0.045)   # 우주 배경 그림 속 달: 가운데 (그림 폭·높이 비율), 반지름 (그림 폭 비율)
+SPACE_SKY = (15, 18, 24)          # 그 달 둘레의 하늘색 (달 위에 있을 때 그림 속 달을 덮는다)
 
 
 def clock_night():
@@ -202,8 +205,9 @@ class Look:
         bolts = tuple((id(b), b.clipped) for b in sim.bolts if bottom_y < b.p.y < top_y) if sim.events else ()
         ledge = (sim.ledge.anchor.x, sim.ledge.anchor.y) if sim.ledge is not None else None
         snow = round(sim.precip() * 60) if sim.weather_kind == "snow" else 0
+        moon = (round(sim.moon * self.R) if sim.moon is not None else None, sim.moon_flag is not None)
         return (round(cam * self.R), round(k * 4000), round(sim.gloom() * 60), snow, holds, bolts, ledge,
-                round(sim.t * 30) if moving else 0, round(self.night_amount(sim) * 60))
+                round(sim.t * 30) if moving else 0, round(self.night_amount(sim) * 60), moon)
 
     def paint(self, painter, sim):
         cam = self.view_cam(sim)
@@ -280,7 +284,8 @@ class Look:
                 painter.setBrush(QColor(255, 255, 255, round(210 * (1 - k) ** 1.5)))
                 s = p.size * R * (0.6 + k * 1.2)
                 painter.drawEllipse(pt, s, s)
-        if sim.events and sim.rope_cut is None and not sim.grounded:   # 땅에 앉아 있는 동안은 로프를 풀어 둔다
+        roped = sim.moon is None or (sim.body.y < sim.moon + 0.5 and not sim.falling)   # 달 위에 올라서면 로프를 푼다
+        if sim.events and sim.rope_cut is None and not sim.grounded and roped:   # 땅에 앉아 있는 동안은 로프를 풀어 둔다
             self.paint_rope(painter, sim, cam)
         for rock in sim.rocks:
             self.paint_rock(painter, rock, cam)
@@ -364,6 +369,11 @@ class Look:
             outline.append(self.to_screen(V(edge_x(y, 1), y), cam))
         clip = QPainterPath()
         clip.addPolygon(outline)
+        surface = self.to_screen(V(0, sim.moon), cam).y() if sim.moon is not None else None
+        if surface is not None:   # 기둥은 달 표면에서 끝난다
+            below = QPainterPath()
+            below.addRect(QRectF(0, surface, W, H - surface + 1))
+            clip = clip.intersected(below)
         self.clip = clip
         lp.setClipPath(clip)
         th = self.rock.height()
@@ -394,9 +404,14 @@ class Look:
         if ground < H:   # 벽 맨 아래 땅 (새 벽을 시작할 때와 벽 끝에서 떨어져 닿을 때 보인다)
             lp.setClipping(False)
             self.paint_ground(lp, ground)
-            clip = QPainterPath(clip)
-            clip.addRect(QRectF(0, ground - R * 0.15, W, H))
+            land = QPainterPath()
+            land.addRect(QRectF(0, ground - R * 0.15, W, H))
+            clip = clip.united(land)   # addRect 로 더하면 기둥과 겹친 곳이 구멍이 된다
             self.clip = clip   # 밤에 헤드램프가 땅도 비춘다
+        if surface is not None and -MOON_SLAB * R < surface < H + 2.0 * R:   # 기둥 위 끝 달 표면과 깃발 (위로 2m)
+            lp.setClipping(False)
+            clip = clip.united(self.paint_moon_top(lp, sim, surface, cam))   # 밤에 같이 어두워지고 헤드램프가 비춘다
+            self.clip = clip
         night = self.night_amount(sim)
         if night > 0.01:   # 밤: 헤드램프가 비출 밝은 바위를 남겨 두고, 바위도 어둡게 (하늘보다 덜, 홀드가 보이게)
             lp.end()
@@ -467,6 +482,24 @@ class Look:
         draw(BANDS[i][1], k, 1.0)
         if i + 1 < len(BANDS) and k > 0.95:   # 구간 끝 5% 에서 다음 구간으로
             draw(BANDS[i + 1][1], 0.0, (k - 0.95) / 0.05)
+        disk = None   # 덧그린 하늘의 달 (그 앞에는 별을 그리지 않는다)
+        if BANDS[i][1] == "space" and self.backs.get("space") is not None:   # 그림 속 달 (밤에는 같이 어두워진다)
+            pix = self.backs["space"]
+            cx = (W - pix.width()) / 2 + SPACE_MOON[0] * pix.width()
+            cy = -(pix.height() - H) * (1 - k) + SPACE_MOON[1] * pix.height()
+            art = SPACE_MOON[2] * pix.width()
+            if sim.moon is not None:   # 달 위에서는 하늘의 달을 지운다
+                g = QRadialGradient(QPointF(cx, cy), art * 1.7)
+                g.setColorAt(0.0, QColor(*SPACE_SKY))
+                g.setColorAt(0.65, QColor(*SPACE_SKY))
+                g.setColorAt(1.0, QColor(*SPACE_SKY, 0))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(g))
+                p.drawEllipse(QPointF(cx, cy), art * 1.7, art * 1.7)
+            sky = self.sky_moon(sim, alt, art)
+            if sky is not None:
+                self.paint_sky_moon(p, cx, cy, *sky)
+                disk = (cx, cy, sky[0])
         night = self.night_amount(sim)
         if night > 0.01:   # 밤: 하늘과 풍경을 어둡게
             p.fillRect(QRectF(0, 0, W, H), QColor(*NIGHT_TINT, round(205 * night)))
@@ -477,6 +510,8 @@ class Look:
             for x, y, size, phase in self.stars:
                 if not level and y > 0.4:
                     continue   # 밤에만 보이는 별은 하늘 위쪽에만 (건물·산에 겹치지 않게)
+                if disk is not None and (x * W - disk[0]) ** 2 + (y * H - disk[1]) ** 2 < disk[2] ** 2:
+                    continue
                 a = stars * (0.5 + 0.5 * math.sin((sim.t * 2.2 if level else 0.0) + phase))
                 p.setBrush(QColor(255, 255, 240, round(220 * a)))
                 r = max(0.8, self.R * 0.035 * size)
@@ -489,6 +524,86 @@ class Look:
         if name == "space" and 150000 < alt < 2000000:   # 지나가는 국제우주정거장
             self.paint_iss(p, ((sim.t / 30.0) % 1.4 - 0.2) * W, H * 0.22)
         p.setOpacity(1.0)
+
+    def sky_moon(self, sim, alt, art):
+        """배경 그림 속 달 (반지름 art) 자리에 덧그릴 달 (반지름 px, 진하기) 또는 None: 주간 100% 로 갈수록 커지고
+        (그림이 내려오며 위에서 나타난다), 기둥 위 끝 달 표면이 나타나면 1.5초 동안 사라진다. 벽의 끝으로 떨어질 때는
+        높이를 따라 작아진다."""
+        fade = 1.0 if sim.moon is None else 1.0 - (sim.t - sim.moon_t) / 1.5
+        if fade <= 0:
+            return None
+        u = max(0.0, min(1.0, (height_pct(alt) - 50) / 50))
+        return max(art * 1.05, self.W * 0.4 * u ** 4), fade
+
+    def paint_sky_moon(self, p, cx, cy, r, fade):
+        disk = QPainterPath()
+        disk.addEllipse(QPointF(cx, cy), r, r)
+        p.save()
+        p.setOpacity(fade)
+        p.setPen(Qt.NoPen)
+        g = QRadialGradient(QPointF(cx - r * 0.3, cy - r * 0.3), r * 1.4)
+        g.setColorAt(0.0, QColor(236, 234, 222))
+        g.setColorAt(1.0, QColor(168, 166, 158))
+        p.setBrush(QBrush(g))
+        p.drawPath(disk)
+        p.setClipPath(disk)
+        p.setBrush(QColor(150, 148, 142, 150))   # 바다 (어두운 들판)
+        for dx, dy, w, h in ((-0.3, -0.2, 0.42, 0.3), (0.15, -0.35, 0.3, 0.22), (0.25, 0.1, 0.38, 0.3), (-0.2, 0.35, 0.3, 0.2)):
+            p.drawEllipse(QPointF(cx + dx * r, cy + dy * r), w * r, h * r)
+        if r > self.R * 0.6:   # 커지면 크레이터
+            for dx, dy, cr in ((-0.55, 0.15, 0.08), (0.45, -0.1, 0.06), (0.05, 0.6, 0.1), (-0.1, -0.6, 0.05), (0.6, 0.45, 0.07)):
+                p.setBrush(QColor(130, 128, 122, 170))
+                p.drawEllipse(QPointF(cx + dx * r, cy + dy * r), cr * r, cr * r)
+        p.restore()
+
+    def paint_moon_top(self, p, sim, top, cam):
+        """기둥 위 끝 달 표면 (창 y top): 창 폭 가득 회색 띠, 아래 끝은 울퉁불퉁, 앞면에 크레이터. 깃발을 꽂았으면 깃발.
+        그린 곳 (QPainterPath) 을 돌려준다."""
+        R, W = self.R, self.W
+        slab = MOON_SLAB * R
+        path = QPainterPath(QPointF(0, top))
+        path.lineTo(W, top)
+        steps = 14
+        for i in range(steps + 1):   # 아래 끝 (오른쪽에서 왼쪽으로)
+            x = W * (1 - i / steps)
+            path.lineTo(x, top + slab * (0.7 + 0.18 * math.sin(i * 1.9) + 0.1 * math.sin(i * 4.3)))
+        path.closeSubpath()
+        g = QLinearGradient(0, top, 0, top + slab)
+        g.setColorAt(0.0, QColor(196, 196, 202))
+        g.setColorAt(1.0, QColor(112, 112, 122))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(g))
+        p.drawPath(path)
+        p.save()
+        p.setClipPath(path)
+        for k in range(9):   # 크레이터
+            cx, cy = (k * 0.137 + 0.05) % 1.0 * W, top + slab * (0.18 + (k * 0.29) % 0.42)
+            cr = R * (0.1 + (k * 0.37) % 0.2)
+            p.setBrush(QColor(140, 140, 150))
+            p.drawEllipse(QPointF(cx, cy), cr * 1.3, cr * 0.7)
+            p.setBrush(QColor(222, 222, 228, 160))
+            p.drawEllipse(QPointF(cx - cr * 0.15, cy - cr * 0.3), cr * 1.0, cr * 0.25)
+        p.restore()
+        p.setPen(QPen(QColor(232, 232, 238), max(1.0, R * 0.06)))
+        p.drawLine(QPointF(0, top), QPointF(W, top))
+        flag = sim.moon_flag
+        if flag is not None:   # 깃대 위 가로대에 걸린 깃발 (달에는 바람이 없다)
+            base = self.to_screen(flag, cam)
+            side = 1 if flag.x >= 0 else -1
+            pole_top = base.y() - R * 2.0
+            p.setPen(QPen(QColor(205, 205, 210), max(1.0, R * 0.06)))
+            p.drawLine(base, QPointF(base.x(), pole_top))
+            p.drawLine(QPointF(base.x(), pole_top), QPointF(base.x() + side * R * 0.9, pole_top))
+            p.setPen(QPen(QColor(150, 70, 45), max(1.0, R * 0.03)))
+            p.setBrush(QColor(217, 119, 87))
+            cloth = QRectF(min(base.x(), base.x() + side * R * 0.9), pole_top, R * 0.9, R * 0.55)
+            p.drawRect(cloth)
+            for part in (cloth, QRectF(base.x() - R * 0.03, pole_top, R * 0.06, base.y() - pole_top),
+                         QRectF(min(base.x(), base.x() + side * R * 0.9), pole_top - R * 0.03, R * 0.9, R * 0.06)):
+                piece = QPainterPath()   # 천·깃대·가로대만 (그 뒤 하늘은 배경에서 이미 어두워졌다)
+                piece.addRect(part.adjusted(-1, -1, 1, 1))
+                path = path.united(piece)
+        return path
 
     def paint_plane(self, p, x, y):
         s = self.R * 0.22
@@ -511,15 +626,26 @@ class Look:
         p.drawRect(QRectF(x - 2.2 * s, y - 0.12 * s, 4.4 * s, 0.24 * s))
         p.drawRect(QRectF(x - 0.6 * s, y - 0.4 * s, 1.2 * s, 0.8 * s))
 
-    def paint_altitude(self, p, sim):
-        """왼쪽 위 상자: 높이와 다음 기록, 쌓인 오를 거리 (바위) 와 빠르기 (막대), 체력 (막대). 기록을 넘을 때 말풍선."""
+    @staticmethod
+    def moon_note(sim):
+        if not sim.week_reset:
+            return "주간 리셋까지 달에서 쉬어요"
+        at = datetime.fromtimestamp(sim.week_reset, KST)
+        return f"리셋 ({'월화수목금토일'[at.weekday()]} {at:%H:%M}) 까지 달에서 쉬어요"
+
+    def prepare_hud(self, sim):
+        """왼쪽 위 상자 그림 (self.hud, self.hud_rect): 높이와 다음 기록, 쌓인 오를 거리 (바위) 와 빠르기 (막대),
+        체력 (막대). 글자나 막대가 바뀔 때만 다시 그린다. 다시 그릴 곳 (ClimbWindow.dirty) 이 커진 상자를 알도록
+        그리기 전에 부른다."""
         alt = max(0.0, sim.shown_altitude())
         nxt = sim.next_milestone()
         small = QFont(self.small)
         small.setBold(False)
         small.setPixelSize(max(9, round(self.small.pixelSize() * 0.8)))
         rows = [(fmt_alt(alt), self.small, QColor(255, 240, 210), None)]   # (글자, 글꼴, 색, (채움, 막대 색) 또는 None)
-        if sim.grounded:
+        if sim.moon is not None and not sim.falling:
+            rows.append((self.moon_note(sim), small, QColor(230, 215, 190), None))
+        elif sim.grounded:
             rows.append(("주간 사용량이 돌아오면 다시 올라요", small, QColor(230, 215, 190), None))
         elif nxt and not sim.falling:
             rows.append((f"다음: {nxt[1]}까지 {fmt_alt(nxt[0] - alt)}", small, QColor(230, 215, 190), None))
@@ -537,6 +663,10 @@ class Look:
             self.hud_key = key
             self.hud = self.draw_hud(rows)
             self.hud_rect = QRect(6, 6, self.hud.width(), self.hud.height())
+
+    def paint_altitude(self, p, sim):
+        """왼쪽 위 상자 (prepare_hud) 와 기록을 넘을 때 말풍선."""
+        self.prepare_hud(sim)
         p.drawPixmap(6, 6, self.hud)
         self.banner_rect = QRect()
         if sim.banner is not None:
@@ -1013,6 +1143,8 @@ class ClimbWindow(QWidget):
         self.timer.stop()
         if self.sim.wall_pending:   # 벽이 끝났는데 떨어지는 장면을 못 보였으면 바로 새 벽으로
             self.sim.new_wall()
+        elif self.sim.moon_pending or (self.sim.moon is not None and not self.sim.grounded and not self.sim.falling):
+            self.sim.place_on_moon()   # 달에 오르는 장면을 못 보였거나 오르는 도중이면 바로 달 위에
         self.sim.requests.clear()
         self.hide()
 
@@ -1032,7 +1164,9 @@ class ClimbWindow(QWidget):
         actor = look.actor_region(sim)
         region = actor.united(self.actor) if self.actor is not None else QRegion(0, 0, look.W, look.H)
         self.actor = actor
-        return region.united(look.hud_rect)
+        old = QRect(look.hud_rect)
+        look.prepare_hud(sim)   # 상자가 커지면 커진 자리까지
+        return region.united(old).united(look.hud_rect)
 
     def tick(self):
         now = time.monotonic()

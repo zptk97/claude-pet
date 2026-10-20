@@ -1934,8 +1934,9 @@ class PetManager(QObject):
         return resized or not was_on
 
     def check_week(self, limits, now):
-        """주간 사용량을 다 썼거나 주간 리셋이 오면 지금 벽을 끝낸다: 창이 보이면 빌레이 줄이 끊어져 땅까지 떨어지고,
-        숨어 있으면 바로 새 벽 (다 쓴 주면 땅에 앉아서). 땅에 앉아 있다가 주간 사용량이 돌아오면 일어나 새 벽에 붙는다.
+        """주간 사용량을 다 썼으면 기둥 위 끝 달에 올라서고 (창이 숨어 있으면 바로 달 위에), 주간 리셋이 오면 지금 벽을
+        끝낸다: 창이 보이면 빌레이 줄이 끊어져 땅까지 떨어지고, 숨어 있으면 바로 새 벽. 땅에 앉아 있다가 주간 사용량이
+        돌아오면 일어나 새 벽에 붙고, 달 위에 있었으면 뛰어내려 지구로 떨어진다.
         한 주기에 한 번 (petcore.week_end, 기록 파일에 남긴다). 끝난 벽은 walls 에 쌓는다.
         끝났으면 그 까닭 ("full"/"reset"), 아니면 None."""
         state, reason = petcore.week_end(self.week, limits, now / 1000)
@@ -1944,15 +1945,25 @@ class PetManager(QObject):
         locked = petcore.week_locked(limits, now)
         visible = self.base_on and self.base is not None and self.base.isVisible()
         if reason is not None and not climber.wall_pending:   # 떨어지는 장면을 기다리는 중이면 한 번으로
-            self.walls.append({"end": round(now / 1000), "height": round(max(climber.peak, climber.shown_altitude()), 1),
-                               "reason": reason})
+            height = climbcore.MOON if reason == "full" else round(max(climber.peak, climber.shown_altitude()), 1)
+            self.walls.append({"end": round(now / 1000), "height": height, "reason": reason})
             del self.walls[:-WALLS_KEEP]
-            climber.end_wall(animate=visible, locked=locked)
+            if reason == "full":   # 주간 사용량을 다 썼다: 기둥 위 끝 달에 올라 리셋까지 쉰다
+                climber.reach_moon(animate=visible)
+            elif locked:   # 꺼져 있던 동안 리셋되고 새 주도 이미 다 썼다: 새 벽 끝 달 위에
+                climber.end_wall(animate=False, locked=False)
+                climber.reach_moon(animate=False)
+            else:
+                climber.end_wall(animate=visible, locked=locked)
             if reason == "full" and self.climb_enabled():
                 for window in list(self.windows.values()):
                     window.announce(*petcore.WEEK_OVER, style="error")
-        if climber.grounded and limits and not locked and not climber.wall_pending:   # 주간 사용량이 돌아왔다: 일어나 새 벽으로 (모르면 기다린다)
-            climber.rise(animate=visible)
+        known = limits and limits["seven_day_pct"] is not None and limits["seven_day_reset"] is not None
+        if climber.grounded and known and not locked and not climber.wall_pending:   # 주간 사용량이 돌아왔다: 일어나 새 벽으로 (주간 값을 모르면 기다린다)
+            if climber.moon is not None:   # 달에서는 뛰어내려 지구로
+                climber.leave_moon(animate=visible)
+            else:
+                climber.rise(animate=visible)
         if changed:
             self.save_climb()
         return reason
