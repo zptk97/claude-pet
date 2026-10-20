@@ -24,6 +24,8 @@ KEEP_S = 12 * 7 * 86400   # 이보다 오래된 창·주·시간 칸은 지운�
 PERIODS = (("five_hour", "windows", petcore.RESET_SLACK_S), ("seven_day", "weeks", petcore.WEEK_SLACK_S))
 FULL = petcore.WEEK_FULL  # 이만큼 (%) 넘으면 다 쓴 것
 HOUR_KEY = re.compile(r"\d{4}-\d\d-\d\dT\d\d")
+RATE_MIN_PCT = 3          # 주간을 이만큼 (%) 넘게 쓴 주로 1% 에 드는 토큰을 잰다 (적으면 들쭉날쭉하다)
+WEEK_S = 7 * 86400
 
 
 def new(now_s):
@@ -148,3 +150,29 @@ def backfill(offsets):
     for tokens, ts in best.values():
         spent[int(ts // 3600) * 3600] += tokens
     return spent
+
+
+def week_tokens(journal, reset):
+    """리셋 시각이 reset 인 주 (그 7일 전부터) 에 쓴 토큰 (출력 환산)."""
+    start, end = hour_key(reset - WEEK_S), hour_key(reset)
+    return sum(v for k, v in journal["hours"].items() if start <= k < end)
+
+
+def tokens_per_pct(journal):
+    """주간 1% 에 드는 토큰: 가장 최근 주 (이번 주, 아니면 지난주...) 중 RATE_MIN_PCT 넘게 쓴 주의 토큰 ÷ %. 없으면 None."""
+    for entry in reversed(journal["weeks"]):
+        if entry["peak"] >= RATE_MIN_PCT:
+            tokens = week_tokens(journal, entry["reset"])
+            if tokens > 0:
+                return tokens / entry["peak"]
+    return None
+
+
+def week_scale(journal, limits, now_s):
+    """끝없이 오르기 높이 (가속 눈금) 에 줄 (주간 사용량 %, 1% 에 드는 토큰). % 는 리셋 시각이 지났으면 0 (새 주),
+    모르면 None. 1% 에 드는 토큰은 tokens_per_pct (모르면 None)."""
+    pct = _number(limits.get("seven_day_pct")) if limits else None
+    reset = _number(limits.get("seven_day_reset")) if limits else None
+    if pct is not None and reset is not None and reset <= now_s:
+        pct = 0.0
+    return pct, tokens_per_pct(journal)

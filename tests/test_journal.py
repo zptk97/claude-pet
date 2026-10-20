@@ -141,6 +141,30 @@ class SaveTest(unittest.TestCase):
         self.assertEqual(fresh, journalcore.new(7))
 
 
+class WeekScaleTest(unittest.TestCase):
+    """끝없이 오르기 높이에 줄 주간 % 와 1% 에 드는 토큰."""
+
+    def test_tokens_per_pct_from_the_latest_used_week(self):
+        j = journalcore.new(0)
+        self.assertIsNone(journalcore.tokens_per_pct(j))
+        last, this = RW - 7 * 86400, RW
+        j["weeks"] = [{"reset": last, "peak": 40, "first": None, "last": None, "full": None},
+                      {"reset": this, "peak": 2, "first": None, "last": None, "full": None}]
+        j["hours"] = {journalcore.hour_key(last - 3 * 86400): 30_000_000, journalcore.hour_key(last - 8 * 86400): 999,
+                      journalcore.hour_key(this - H): 1_000_000}
+        self.assertEqual(journalcore.tokens_per_pct(j), 30_000_000 / 40)   # 이번 주는 2% 라 지난주로
+        j["weeks"][1]["peak"] = 4
+        self.assertEqual(journalcore.tokens_per_pct(j), 1_000_000 / 4)
+        self.assertEqual(journalcore.week_tokens(j, last), 30_000_000)   # 그 전 주 토큰은 안 센다
+
+    def test_week_pct(self):
+        j = journalcore.new(0)
+        self.assertEqual(journalcore.week_scale(j, None, RW - H), (None, None))
+        self.assertEqual(journalcore.week_scale(j, limits(RW - H, 5, week=38), RW - H), (38, None))
+        self.assertEqual(journalcore.week_scale(j, limits(RW + 60, 5, week=38), RW + 60), (0.0, None))   # 리셋이 지났다
+        self.assertEqual(journalcore.week_scale(j, limits(RW - H, 5, week=38, week_reset=None), RW - H), (38, None))
+
+
 class BackfillTest(unittest.TestCase):
     """지난 토큰 되살리기: 계수기가 읽은 자리 앞까지만, 응답마다 한 번. 뒤는 계수기가 세서 합이 맞는다."""
 

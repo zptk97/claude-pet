@@ -2,8 +2,8 @@
 
 내 아바타가 흐르는 자연 암벽을 끝없이 오른다. Claude 가 쓴 토큰 (입력·출력·캐시) 을 API 가격으로 환산해 $1 어치마다
 30m 를 오를 높이로 쌓고 (TokenMeter 가 Claude Code 기록 파일을 읽기만 해서 센다), 쌓인 높이가 많을수록 빠르게 오른다.
-다 쓰면 일하는 펫이 있으면 기다리고 없으면 쉰다. 일하는 펫 수는 날씨, 5시간 사용량은 체력, 주간 사용량은 벽의 끝이고,
-펫 상태에서 온 신호
+다 쓰면 일하는 펫이 있으면 기다리고 없으면 쉰다. 일하는 펫 수는 날씨, 5시간 사용량은 체력, 주간 사용량은 높이
+(가속 눈금 week_height: 50% = 100km, 100% = 달) 와 벽의 끝이고, 펫 상태에서 온 신호
 (Climber.signal) 로 다이노·로프 추락·초크·잠·기상 같은 동작을 끼워 넣는다. 높이 기록 (아파트 10층 ~ 달) 을
 넘으면 한 번씩 말풍선을 띄운다.
 
@@ -61,6 +61,11 @@ MILESTONES = [  # (높이 m, 짧은 이름, 넘을 때 말풍선)
     (25000, "오존층", "오존층을 지나요! (약 25km)"),
     (100000, "카르만 선", "우주에 닿았어요! 카르만 선 100km"),
     (400000, "국제우주정거장", "국제우주정거장 높이예요! (약 400km)"),
+    (2000000, "저궤도 끝", "저궤도를 벗어났어요! (약 2,000km)"),
+    (12742000, "지구 지름", "지구 지름(12,742km)만큼 올라왔어요!"),
+    (20200000, "GPS 위성", "GPS 위성 높이예요! (약 2만 km)"),
+    (35786000, "정지궤도", "정지궤도에 닿았어요! (약 3만 6천 km)"),
+    (192200000, "달까지 절반", "달까지 절반 왔어요! (약 19만 km)"),
     (384400000, "달", "달에 도착했어요! (384,400km)"),
 ]
 CONFETTI = [(255, 196, 0), (255, 90, 90), (80, 200, 255), (120, 220, 120), (200, 120, 255)]
@@ -96,7 +101,15 @@ NAP_AFTER = 180.0                             # 쉬는 자세 (기다림·쉼) �
 LEFTOVER_WAIT = 20.0                          # 1m 가 안 되게 남은 오를 높이는 토큰이 이만큼 (초) 안 들어오면 마저 오른다
 GROUND = -2.4                 # 땅 높이 (m). 새 벽 첫 자세가 0m 이고 그 발 아래
 GROUND_OK = ("get_up",)       # 바닥에 앉아 있는 동안 받는 동작
-FALL_SPEED = 8.0              # 벽의 끝: 떨어지는 빠르기 (m/s, 처음부터 끝까지 같다. 높이 숫자는 따로 0m 까지 일정하게)
+FALL_SPEED = 8.0              # 벽의 끝: 떨어지는 빠르기 (m/s, 처음부터 끝까지 같다. 높이 숫자는 따로 가속 눈금을 따라)
+FALL_PCT = 12.0               # 벽의 끝에서 높이 숫자가 가속 눈금을 따라 내려가는 빠르기 (%/s)
+FALL_RAMP = 4.0               # 땅 가까이 이만큼 (%) 에서 느려져 마지막 12m 의 떨어지는 빠르기와 이어진다
+MOON = 384_400_000            # 달까지 (m) = 주간 사용량 100%
+SCALE_K = math.log(3843) / 50                 # 가속 눈금: 높이 = SCALE_A x (e^(SCALE_K x %) - 1). 50% = 100km, 100% = 달
+SCALE_A = MOON / math.expm1(100 * SCALE_K)    # 약 26m
+WEEK_RATE = 13.4 / TOKEN_USD                  # 주간 1% 에 드는 토큰 (출력 환산) 을 모를 때 (2026-10 기록에서 1% 에 약 $13.4)
+PCT_STEP = 0.98                               # 주간 % 사이를 토큰으로 채울 때 다음 % 의 이만큼 앞까지
+PCT_EASE = (1.5, 0.3)                         # 보이는 주간 % 가 따라붙는 빠르기: 남은 만큼의 비율 (1/s), 가장 느릴 때 (%/s)
 LAST_ROOM = 0.3                               # 남은 오를 높이가 이보다 적은데 가까운 홀드가 없으면 멈추고 다음 토큰과 합쳐 오른다
 COOLDOWN = {"dyno": 8.0, "chalk": 15.0}      # 잦은 신호는 이 간격 (초) 안이면 버린다 (일 끝냄 → 다이노, 사용량 → 초크)
 SHAKE_EVERY = (40.0, 80.0)                    # 체력 60% 이하면 오르다가 이 간격으로 팔을 턴다
@@ -152,6 +165,17 @@ def ease_out(k):
 def fmt_alt(m):
     """높이 글자: 10km 아래는 m, 위는 km."""
     return f"{m:,.0f}m" if m < 10000 else f"{m / 1000:,.1f}km".replace(".0km", "km")
+
+
+def week_height(pct):
+    """주간 사용량 (%) → 가속 눈금 높이 (m): 10% 110m, 35% 에베레스트, 50% 100km, 80% 1.4만 km, 100% 달.
+    같은 1% 라도 위로 갈수록 더 많이 올라서 도시~우주 경치가 한 주에 고르게 퍼진다."""
+    return SCALE_A * math.expm1(SCALE_K * max(0.0, min(100.0, pct)))
+
+
+def height_pct(m):
+    """week_height 의 거꾸로: 높이 (m) → 주간 사용량 (%)."""
+    return math.log1p(max(0.0, m) / SCALE_A) / SCALE_K
 
 
 def smooth(k):
@@ -630,7 +654,11 @@ class Climber:
         self.holds, self.particles, self.texts = [], [], []
         self.requests = []
         self.sweat_t = 0.0
-        self.alt0 = 0.0             # 높이 (m) = alt0 + 몸 높이
+        self.alt0 = 0.0             # 오른 바위 높이 (m) = alt0 + 몸 높이 (땅 자리, 주간 % 를 모를 때의 높이)
+        self.week_pct = None        # 계정 주간 사용량 (%, set_week). 알면 높이가 가속 눈금 (scaled)
+        self.week_per = WEEK_RATE   # 주간 1% 에 드는 토큰 (출력 환산)
+        self.week_tokens = 0.0      # 계정 주간 % 를 마지막으로 받은 뒤 (오르거나 처음) 받은 토큰 (% 사이를 채운다)
+        self.pct_shown = 0.0        # 보이는 주간 % (가속 눈금 높이는 이것으로)
         self.peak = 0.0             # 가장 높이 올라간 높이 (기록은 이걸로 센다)
         self.passed = 0             # 넘은 기록 수 (MILESTONES 앞에서부터)
         self.banner = None          # [말풍선, 나이]
@@ -856,6 +884,7 @@ class Climber:
     def deposit(self, tokens):
         """쓴 토큰 (출력 환산) 을 받아 오를 높이로 쌓는다."""
         self.tokens += tokens
+        self.week_tokens += tokens
         self.bank += tokens * M_PER_TOKEN
         if self.wall_pending:
             self.carry += tokens * M_PER_TOKEN
@@ -901,9 +930,40 @@ class Climber:
         return PACE_NAME[max(1, self.pace)]
 
     def shown_altitude(self):
-        """높이 상자에 보이는 높이: 이번 길에서 가장 높이 올라간 자리 (일어섰다 앉을 때마다 숫자가 오르내리지 않게).
-        1.5m 넘게 떨어졌으면 (추락) 지금 높이."""
+        """높이 상자에 보이는 높이: 가속 눈금이면 그 높이, 아니면 이번 길에서 가장 높이 올라간 자리 (일어섰다 앉을 때마다
+        숫자가 오르내리지 않게). 1.5m 넘게 떨어졌으면 (추락) 지금 높이."""
+        if self.scaled():
+            return week_height(self.pct_shown)
         return self.alt0 + self.top_y if self.body.y >= self.top_y - 1.5 else self.altitude()
+
+    def scaled(self):
+        """높이가 주간 사용량의 가속 눈금인지: 주간 % 를 알고 벽에 붙어 있을 때 (떨어질 때·땅에서는 실제 높이)."""
+        return self.week_pct is not None and not self.falling and not self.grounded
+
+    def set_week(self, pct, per=None):
+        """계정 주간 사용량 (%, None 이면 그대로) 과 1% 에 드는 토큰 (None 이면 그대로). 처음 받거나 % 가 오르면 그
+        % 에 그때까지의 토큰이 들어 있으니 토큰은 처음부터 센다 (꺼져 있던 동안 쌓인 토큰이 % 를 밀어 올리지 않게).
+        처음 받으면 저장해 둔 높이가 더 높아도 이 % 에 맞추고, % 가 줄면 (새 주) 벽의 끝 장면을 기다리는 게 아니면
+        새 주 높이로 맞춘다 (벽이 끝나지 않은 채 주가 바뀌었어도 지난주 높이에 머물지 않게)."""
+        if per:
+            self.week_per = per
+        if pct is None:
+            return
+        old, self.week_pct = self.week_pct, max(0.0, min(100.0, pct))
+        if old is None or self.week_pct != old:
+            self.week_tokens = 0.0
+        if old is None or (self.week_pct < old and not self.wall_pending and not self.falling):
+            self.rebase(min(self.pct_shown, self.week_target()))
+
+    def rebase(self, pct):
+        """보이는 주간 % 를 pct 로 낮추고 최고 높이와 넘은 기록도 거기에 맞춘다 (말풍선 없이)."""
+        self.pct_shown = pct
+        self.peak = min(self.peak, week_height(pct))
+        self.passed = sum(1 for m in MILESTONES if m[0] <= self.peak)
+
+    def week_target(self):
+        """보일 주간 %: 계정 값에 그 뒤 받은 토큰만큼 (다음 % 는 넘지 않게)."""
+        return min(100.0, self.week_pct + min(PCT_STEP, self.week_tokens / self.week_per))
 
     def reroll_weather(self, other=False):
         """비·눈을 다시 뽑는다 (other 면 지금과 다른 쪽으로)."""
@@ -913,12 +973,14 @@ class Climber:
             self.weather_kind = self.wrng.choice(("rain", "snow"))
 
     def altitude(self):
-        return self.alt0 + self.body.y
+        """지금 높이 (m): 가속 눈금이면 보이는 주간 % 의 높이, 아니면 오른 바위 높이."""
+        return week_height(self.pct_shown) if self.scaled() else self.alt0 + self.body.y
 
     def jump(self, target, peak=None):
         """높이를 target (m) 으로 옮긴다 (다시 켤 때, 검사). peak 까지의 기록은 말풍선 없이 넘은 걸로 친다."""
         self.alt0 = target - self.body.y
         self.top_y = self.body.y
+        self.pct_shown = height_pct(target)
         self.peak = max(target, peak or 0.0)
         self.passed = sum(1 for m in MILESTONES if m[0] <= self.peak)
         self.banner = None
@@ -929,7 +991,8 @@ class Climber:
         """저장할 기록: 높이 (이번 길에서 가장 높이 올라간 자리), 최고 높이, 쌓인 높이, 받은 토큰 합."""
         if self.wall_pending or self.grounded:   # 벽이 끝났다 (떨어지는 장면 전에 꺼져도 다음에는 새 벽 땅에서)
             return {"height": 0.0, "peak": 0.0, "bank": 0.0, "tokens": round(self.tokens, 1), "grounded": True}
-        return {"height": round(self.alt0 + self.top_y, 2), "peak": round(self.peak, 2),
+        height = week_height(self.pct_shown) if self.scaled() else self.alt0 + self.top_y
+        return {"height": round(height, 2), "rock": round(self.alt0 + self.top_y, 2), "peak": round(self.peak, 2),
                 "bank": round(self.bank, 3), "tokens": round(self.tokens, 1)}
 
     def restore(self, saved):
@@ -939,6 +1002,8 @@ class Climber:
             return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else 0.0
         height = max(0.0, number("height"))
         self.jump(height, max(height, number("peak")))
+        if isinstance(saved, dict) and "rock" in saved:   # 땅 자리는 오른 바위 높이로 (가속 눈금 높이와 다르다)
+            self.alt0 = max(0.0, number("rock")) - self.body.y
         self.bank = number("bank")
         tokens = saved.get("tokens") if isinstance(saved, dict) else None
         ok = isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and math.isfinite(tokens) and tokens >= 0
@@ -982,6 +1047,11 @@ class Climber:
             if self.tokens_on and self.charging and self.ledge is None:   # 포타레지에 오르내리기·덤 다이노는 안 쓴다
                 self.bank -= self.body.y - self.top_y
             self.top_y = self.body.y
+        if self.scaled():   # 보이는 주간 % 가 따라붙는다 (한 주 안에서는 내려가지 않는다)
+            target = self.week_target()
+            if target > self.pct_shown:
+                step = max((target - self.pct_shown) * (1 - math.exp(-PCT_EASE[0] * dt)), PCT_EASE[1] * dt)
+                self.pct_shown = min(target, self.pct_shown + step)
         if self.token_buf >= 0.5 and self.t - self.token_float_t > 0.7 and not self.falling:   # 받은 토큰을 글자로 띄운다 (잦으면 모아서)
             side = 1.3 if len(self.texts) % 2 else -1.3
             self.texts.append(Float(self.body + V(side, 0.9), f"+{int(self.token_buf + 0.5):,} 토큰", "token"))
@@ -1443,9 +1513,12 @@ class Climber:
         if alt <= self.peak:
             return
         self.peak = alt
+        quiet = self.scaled() and self.week_target() - self.pct_shown > 1.0   # 멀리서 따라붙는 중이면 조용히 넘는다
         while self.passed < len(MILESTONES) and alt >= MILESTONES[self.passed][0]:
             height, name, text = MILESTONES[self.passed]
             self.passed += 1
+            if quiet:
+                continue
             self.banner = [text, 0.0]
             self.banners.append(height)
             for _ in range(26):
@@ -2321,10 +2394,11 @@ class Climber:
 
     def wall_end(self):
         """벽의 끝: 빌레이 줄이 툭 끊어지고 (추락 이벤트를 켰으면 끊어진 줄이 보인다) 허우적대며 같은 빠르기로 떨어진다.
-        카메라가 따라 내려가며 벽이 흘러가고, 높이 숫자와 배경은 4~7초 (높을수록 조금 길게) 동안 0m 까지
-        내려가고, 마지막 12m 는 떨어지는 빠르기대로라 땅이 아래에서 올라와 닿는다. 쿵 하고 새 벽의 땅에 주저앉는다.
-        포타레지에서 자고 있었으면 깨어 떨어진다."""
+        카메라가 따라 내려가며 벽이 흘러가고, 높이 숫자와 배경은 가속 눈금을 따라 고르게 (FALL_PCT, 오를 때 % 로
+        지나간 비율대로 경치가 지나간다) 내려가다 땅 가까이 느려지고, 마지막 12m 는 떨어지는 빠르기대로라 땅이
+        아래에서 올라와 닿는다. 쿵 하고 새 벽의 땅에 주저앉는다. 포타레지에서 자고 있었으면 깨어 떨어진다."""
         self.actions.append("wall_end")
+        height = max(0.0, self.altitude())   # 떨어지기 전 (가속 눈금) 높이
         if self.ledge is not None:   # 침낭에서 빠져 떨어진다 (빈 포타레지는 남는다)
             self.ledge.bag, self.ledge.carry = 0.0, None
         self.sleeping, self.nap, self.lids = False, False, 0.0
@@ -2340,26 +2414,33 @@ class Climber:
             limb.mode, limb.tucked = "free", False
             limb.vel = V(self.wrng.uniform(-2.0, 2.0), self.wrng.uniform(1.5, 3.5))
         self.mode, self.falling = "script", True
+        self.alt0 = height - self.body.y   # 떨어지는 동안 높이는 실제 높이 (가속 눈금 높이에서 이어서)
         self.texts.append(Float(self.body + V(0, 1.4), "으아아!"))
-        height = max(0.0, self.altitude())
         land = GROUND + 1.0   # 몸통이 땅에 닿는 높이
         final = min(height, 12.0)   # 마지막 이만큼은 떨어지는 빠르기대로 (땅이 아래에서 올라와 닿는다)
-        head = 2.5 + 0.6 * math.log10(height / 10 + 1) if height > final + 0.5 else 0.0   # 그 위는 높이 숫자만 빠르게
-        dur = max(0.6, head + (final - land) / FALL_SPEED)
+        pct, pct_end = height_pct(height), height_pct(final)   # 그 위는 높이 숫자만 가속 눈금을 따라
+        slow = FALL_SPEED / (SCALE_K * (SCALE_A + final))   # final 에서 FALL_SPEED 가 되는 % 빠르기
+        head = None if pct > pct_end + 1e-6 else 0.0   # 높이 숫자가 final 에 닿은 때
+        dur = None if head is None else max(0.6, (final - land) / FALL_SPEED)
         decor = random.Random(int(self.t * 1000))   # 지나가는 벽의 홀드 (그림만)
         fill, t = self.body.y - 6.0, 0.0
-        while t < dur:
+        while dur is None or t < dur:
             dt = yield
-            t = min(dur, t + dt)
+            t = t + dt if dur is None else min(dur, t + dt)
+            if head is None:
+                pct -= (slow + (FALL_PCT - slow) * min(1.0, (pct - pct_end) / FALL_RAMP)) * dt
+                if pct <= pct_end:
+                    head = t
+                    dur = max(0.6, head + (final - land) / FALL_SPEED)
             old = self.body
             self.body = self.body + V(math.sin(t * 2.0) * 0.4 * dt, -FALL_SPEED * dt)
             self.vel = (self.body - old) * (1 / dt)
             self.tilt += 1.2 * dt   # 천천히 돈다
             for i, limb in enumerate(self.limbs.values()):   # 팔다리를 허우적댄다
                 limb.vel = limb.vel + V(math.sin(t * 11 + i * 1.7), math.cos(t * 9 + i * 2.3)) * (40.0 * dt)
-            alt = height + (final - height) * t / head if t < head else final - (t - head) * FALL_SPEED
+            alt = week_height(pct) if head is None else final - (t - head) * FALL_SPEED
             self.alt0 = max(land, alt) - self.body.y   # 높이 숫자와 배경이 내려가고 마지막에 땅이 올라온다
-            near = smooth(max(0.0, min(1.0, (t - head) / max(0.01, dur - head))))   # 마지막: 카메라가 느려지며 땅 쪽에 선다
+            near = 0.0 if head is None else smooth(max(0.0, min(1.0, (t - head) / max(0.01, dur - head))))   # 마지막: 카메라가 느려지며 땅 쪽에 선다
             aim = self.body.y + 1.0 + (self.ground_y() + 1.45 - self.body.y - 1.0) * near
             self.cam += (aim - self.cam) * (1 - math.exp(-8.0 * dt))
             while fill > self.body.y - 8.0:   # 아래로 지나갈 벽에 홀드를 깔고, 지나간 위쪽은 버린다

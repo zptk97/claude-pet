@@ -21,7 +21,7 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGra
                          QPixmap, QPolygonF, QRadialGradient, QRegion, QTransform)
 from PyQt5.QtWidgets import QWidget
 
-from climbcore import (ARM, BANDS, KST, LEG, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF, edge_x,
+from climbcore import (ARM, BANDS, KST, LEG, MOON, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF, edge_x,
                        fmt_alt, night_level, smooth, two_bone)
 
 APP_DIR = Path(__file__).resolve().parent
@@ -441,8 +441,8 @@ class Look:
     def band_at(self, alt):
         """높이 alt 의 배경 구간 번호와 구간 안에서 간 정도 (0~1, 로그 눈금)."""
         i = max(k for k, (start, _) in enumerate(BANDS) if alt >= start) if alt >= 0 else 0
-        if i == len(BANDS) - 1:
-            start, end = BANDS[i][0], BANDS[i][0] * 40
+        if i == len(BANDS) - 1:   # 우주는 달까지 (주간 사용량 50~100%)
+            start, end = BANDS[i][0], MOON
         else:
             start, end = BANDS[i][0], BANDS[i + 1][0]
         a = max(0.0, alt)
@@ -512,7 +512,7 @@ class Look:
         p.drawRect(QRectF(x - 0.6 * s, y - 0.4 * s, 1.2 * s, 0.8 * s))
 
     def paint_altitude(self, p, sim):
-        """왼쪽 위 상자: 높이와 다음 기록, 쌓인 오를 높이와 빠르기 (막대), 체력 (막대). 기록을 넘을 때 말풍선."""
+        """왼쪽 위 상자: 높이와 다음 기록, 쌓인 오를 거리 (바위) 와 빠르기 (막대), 체력 (막대). 기록을 넘을 때 말풍선."""
         alt = max(0.0, sim.shown_altitude())
         nxt = sim.next_milestone()
         small = QFont(self.small)
@@ -526,7 +526,7 @@ class Look:
         if sim.tokens_on:
             state = sim.state_label()
             fill = max(0.0, min(1.0, sim.bank / (PACE_BANK[1] * 1.5)))   # 전력 질주 기준의 1.5배가 가득
-            rows.append((f"오를 높이 {max(0.0, sim.bank):,.1f}m · {state}", small, QColor(170, 235, 255),
+            rows.append((f"오를 거리 {max(0.0, sim.bank):,.1f}m · {state}", small, QColor(170, 235, 255),
                          (fill, {1: (110, 200, 120), 2: (240, 200, 70), 3: (255, 120, 60)}[sim.pace])))
         hp = max(0, min(100, round(sim.hp_shown)))
         rows.append((f"체력 {hp}%", small, QColor(230, 215, 190),

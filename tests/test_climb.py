@@ -764,6 +764,171 @@ class WallTest(unittest.TestCase):
         self.check_new_wall(sim)
 
 
+class ScaleTest(unittest.TestCase):
+    """높이 = 주간 사용량의 가속 눈금: % 사이는 토큰으로 채우고, 한 주 안에서는 내려가지 않고, 떨어질 때도 눈금을 따른다."""
+
+    def climber(self, pct=None, per=1000.0, seed=4):
+        sim = Climber(seed)
+        sim.tokens_on, sim.work = False, 1
+        if pct is not None:
+            sim.set_week(pct, per)
+        return sim
+
+    def test_scale_values(self):
+        H = climbcore.week_height
+        self.assertEqual(H(0), 0.0)
+        self.assertAlmostEqual(H(10), 110, delta=2)
+        self.assertAlmostEqual(H(35.3), 8849, delta=8849 * 0.02)   # 에베레스트
+        self.assertAlmostEqual(H(50), 100_000, delta=10)
+        self.assertAlmostEqual(H(80), 14_155_000, delta=10_000)
+        self.assertEqual(H(100), climbcore.MOON)
+        self.assertEqual(H(120), climbcore.MOON)
+        for pct in (0.5, 37.2, 99.9):
+            self.assertAlmostEqual(climbcore.height_pct(H(pct)), pct)
+        pcts = [climbcore.height_pct(m[0]) for m in climbcore.MILESTONES]
+        self.assertEqual(pcts, sorted(pcts))
+        self.assertAlmostEqual(pcts[-1], 100.0)
+
+    def test_follows_the_week_and_tokens_fill_between(self):
+        sim = self.climber(38)
+        run(sim, 4.0)
+        H = climbcore.week_height
+        self.assertAlmostEqual(sim.altitude(), H(38), delta=H(38) * 0.01)
+        self.assertEqual(sim.shown_altitude(), sim.altitude())
+        sim.deposit(500)   # 1% 에 1,000 토큰: 반 % 더
+        run(sim, 4.0)
+        self.assertAlmostEqual(sim.altitude(), H(38.5), delta=H(38.5) * 0.01)
+        sim.deposit(2000)   # 다음 % 는 넘지 않는다
+        run(sim, 4.0)
+        self.assertGreater(sim.altitude(), H(38.9))
+        self.assertLess(sim.altitude(), H(39))
+        sim.set_week(39)   # 계정 % 가 오르면 그 % 에 토큰이 들어 있으니 처음부터
+        self.assertEqual(sim.week_tokens, 0.0)
+        run(sim, 2.0)
+        self.assertAlmostEqual(sim.altitude(), H(39), delta=H(39) * 0.01)
+        sim.set_week(41)
+        run(sim, 4.0)
+        self.assertAlmostEqual(sim.altitude(), H(41), delta=H(41) * 0.01)
+        sim.pct_shown = 45.0   # 보이는 % 가 더 높으면 (한 주 안에서) 내려가지 않는다
+        sim.set_week(42)
+        run(sim, 2.0)
+        self.assertEqual(sim.pct_shown, 45.0)
+
+    def test_scale_moves_milestones_and_scenery_not_the_ground(self):
+        sim = self.climber(34)
+        run(sim, 5.0)
+        ground, passed = sim.ground_y(), sim.passed
+        self.assertEqual(climbcore.MILESTONES[passed][1], "에베레스트")
+        sim.set_week(36)
+        run(sim, 5.0)
+        self.assertIn(8849, sim.banners)
+        self.assertGreater(sim.passed, passed)
+        self.assertEqual(sim.ground_y(), ground)   # 땅은 벽 아래 그대로 (높이 숫자를 따라오지 않는다)
+        before = sim.altitude()
+        sim.request("fall")   # 로프 추락: 몸은 떨어져도 높이 숫자는 그대로
+        run(sim, 3.0)
+        self.assertIn("fall", sim.actions)
+        self.assertGreaterEqual(sim.altitude(), before)
+        self.assertEqual(sim.missing, 0)
+
+    def test_first_reading_restore_and_new_week(self):
+        H = climbcore.week_height
+        old = self.climber()
+        old.restore({"height": 5061.0, "peak": 5061.0})   # 예전 (바위 높이) 기록
+        self.assertAlmostEqual(old.altitude(), 5061.0, delta=0.01)   # 주간 % 를 받기 전에는 그대로
+        old.set_week(38, 1000.0)
+        self.assertAlmostEqual(old.altitude(), 5061.0, delta=1.0)   # 거기서부터 따라붙는다
+        run(old, 5.0)
+        self.assertAlmostEqual(old.altitude(), H(38), delta=H(38) * 0.02)
+        high = self.climber()
+        high.restore({"height": 40_000.0, "peak": 40_000.0})
+        high.set_week(38)   # 처음 받은 % 가 낮으면 거기에 맞춘다
+        self.assertAlmostEqual(high.altitude(), H(38), delta=1.0)
+        saved = high.snapshot()
+        self.assertAlmostEqual(saved["height"], H(38), delta=1.0)
+        again = self.climber()
+        again.restore(saved)
+        again.set_week(38)
+        self.assertAlmostEqual(again.altitude(), H(38), delta=1.0)
+        again.deposit(300)
+        again.end_wall(animate=False, locked=False)   # 주간 리셋: 새 벽 0m 부터
+        again.set_week(0)
+        self.assertEqual(again.week_tokens, 0.0)
+        run(again, 2.0)
+        self.assertLess(again.altitude(), 1.0)
+        unknown = self.climber()
+        unknown.set_week(None)   # 주간 % 를 모르면 오른 바위 높이
+        run(unknown, 20.0)
+        self.assertFalse(unknown.scaled())
+        self.assertAlmostEqual(unknown.altitude(), unknown.alt0 + unknown.body.y)
+
+    def test_backlog_upgrade_and_catch_up(self):
+        H = climbcore.week_height
+        sim = self.climber()
+        sim.deposit(5000)   # 꺼져 있던 동안 쓴 토큰 (계정 % 에 이미 들어 있다)
+        sim.set_week(38, 1000.0)
+        run(sim, 30.0)
+        self.assertLess(sim.altitude(), H(38) * 1.001)
+        self.assertLessEqual(len(sim.banners), 2)   # 0m 에서 멀리 따라붙는 동안은 기록을 조용히 넘는다
+        old = self.climber()
+        old.restore({"height": 8000.0, "peak": 8000.0})   # 예전 기록이 계정 % 보다 높다
+        old.set_week(20, 1000.0)
+        self.assertAlmostEqual(old.altitude(), H(20), delta=1.0)
+        self.assertLessEqual(old.peak, H(20) + 1.0)   # 최고 높이와 넘은 기록도 맞춘다
+        self.assertEqual(old.passed, sum(1 for m in climbcore.MILESTONES if m[0] <= old.peak))
+        for pct in range(21, 37):   # 계정 % 는 1% 씩 오른다
+            old.set_week(pct)
+            run(old, 1.5)
+        self.assertIn(1947, old.banners)   # 다시 넘는 기록은 말풍선이 뜬다
+        self.assertIn(8849, old.banners)
+
+    def test_new_week_without_wall_end_and_ground_after_restore(self):
+        H = climbcore.week_height
+        sim = self.climber(70)
+        run(sim, 5.0)
+        sim.set_week(1)   # 벽이 끝나지 않은 채 주가 바뀌었다 (지난주 높이에 머물지 않는다)
+        run(sim, 1.0)
+        self.assertLess(sim.altitude(), H(1.5))
+        self.assertLess(sim.peak, H(1.5))
+        pending = self.climber(70)
+        run(pending, 5.0)
+        pending.end_wall()   # 떨어지는 장면을 기다리는 동안은 지난주 높이에서 떨어진다
+        pending.set_week(0)
+        self.assertAlmostEqual(pending.altitude(), H(70), delta=H(70) * 0.01)
+        low = self.climber(0.3, per=1e9)
+        run(low, 120.0)   # 주간 0.3% 에서 바위를 한참 올랐다
+        rock = low.body.y - low.ground_y()
+        self.assertGreater(rock, 10.0)
+        again = self.climber()
+        again.restore(low.snapshot())
+        again.set_week(0.3, 1e9)
+        self.assertAlmostEqual(again.body.y - again.ground_y(), rock, delta=1.5)   # 땅은 다시 켜도 벽 아래에
+
+    def test_fall_follows_the_scale(self):
+        H = climbcore.week_height
+        sim = self.climber(60, seed=9)
+        sim.pct_shown = 60.0
+        run(sim, 2.0)
+        sim.end_wall()
+        alts, t = [], 0.0
+        while (sim.wall_pending or sim.falling) and t < 30:
+            sim.update(DT)
+            t += DT
+            if sim.falling:
+                alts.append(sim.altitude())
+        self.assertAlmostEqual(alts[0], H(60), delta=H(60) * 0.02)   # 가속 눈금 높이에서 이어서
+        self.assertTrue(all(b <= a + 0.05 for a, b in zip(alts, alts[1:])))
+        bands = {"strato": (12_000, 100_000), "mountains": (2000, 9500), "hills": (300, 2000)}
+        for name, (low, high) in bands.items():   # 오를 때 % 로 지나간 비율대로 지나간다
+            spent = sum(DT for a in alts if low <= a < high)
+            width = climbcore.height_pct(high) - climbcore.height_pct(low)
+            self.assertAlmostEqual(spent, width / climbcore.FALL_PCT, delta=0.15, msg=name)
+        tail = [(a - b) / DT for a, b in zip(alts, alts[1:]) if -1.3 < b and a < 11]
+        self.assertTrue(tail and all(abs(v - climbcore.FALL_SPEED) < 0.5 for v in tail), tail)   # 땅이 올라오는 동안은 떨어지는 빠르기
+        self.assertLess(len(alts) * DT, 9.0)
+        self.assertTrue(sim.grounded)
+
+
 class StateFileTest(unittest.TestCase):
 
     def test_save_and_load(self):

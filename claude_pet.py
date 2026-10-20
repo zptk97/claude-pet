@@ -1888,13 +1888,15 @@ class PetManager(QObject):
 
     def update_team(self, now):
         """계정 5시간 사용량으로 체력을 구해 아바타에게 주고, 바뀐 만큼 신호를 보낸다 (줄면 초크, 0 이면 포타레지에서 잠,
-        0 에서 오르면 기상, 10 넘게 오르면 초크백이 차오름). 주간 사용량은 벽의 끝 (check_week). 일하는 펫 수 (작업 중·
+        0 에서 오르면 기상, 10 넘게 오르면 초크백이 차오름). 주간 사용량은 높이 (가속 눈금) 와 벽의 끝 (check_week).
+        사용량은 등반 일지에도 남긴다. 일하는 펫 수 (작업 중·
         백그라운드) 로 날씨를 정한다. 줄을 다시 세워야 하면 True. 클라이밍 보기를 껐거나, 펫이 없거나, 사용량을 모르면
         (상태줄 중계를 안 쓰면) 창을 숨긴다 (아바타도 멈추고, 토큰은 read_tokens 가 계속 쌓는다)."""
         limits = self.account_limits()
         if journalcore.record_limits(self.journal, limits, now / 1000):
             self.journal_dirty = True
         week = self.check_week(limits, now)
+        self.climber.set_week(*journalcore.week_scale(self.journal, limits, now / 1000))   # 높이는 주간 % 의 가속 눈금
         team = None
         if self.climb_enabled() and self.order:
             team = petcore.team_hp(limits, now)
@@ -1949,7 +1951,7 @@ class PetManager(QObject):
             if reason == "full" and self.climb_enabled():
                 for window in list(self.windows.values()):
                     window.announce(*petcore.WEEK_OVER, style="error")
-        if climber.grounded and not locked and not climber.wall_pending:   # 주간 사용량이 돌아왔다: 일어나 새 벽으로
+        if climber.grounded and limits and not locked and not climber.wall_pending:   # 주간 사용량이 돌아왔다: 일어나 새 벽으로 (모르면 기다린다)
             climber.rise(animate=visible)
         if changed:
             self.save_climb()
