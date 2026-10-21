@@ -660,11 +660,21 @@ class CruxTest(unittest.TestCase):
         self.assertEqual(sum(1 for h in chips if start < h.p.y < jug.p.y), 1)
         gap_bolts = [b for b in sim.bolts if start - 1.0 < b.p.y < jug.p.y]
         self.assertEqual(gap_bolts, [])   # 구간 안에는 볼트가 없고
-        base = [b for b in sim.bolts if start - 4.5 < b.p.y <= start - 3.0]
-        self.assertTrue(base and all(b.p.x * jug.p.x < 0 for b in base))   # 뛰기 전에 걸 볼트는 시작 쪽에
+        base = [b for b in sim.bolts if start - 2.0 < b.p.y <= start - 1.0]
+        self.assertTrue(base and all(b.p.x * jug.p.x < 0 for b in base))   # 뛰기 전에 걸 볼트는 시작 쪽 손 높이에
+        worst = 0.0   # 그 아래 볼트와 멀지 않다 (크럭스 앞에서 기다리다 떨어져도 멀리 안 간다)
+        for seed in range(1, 41):
+            far = Climber(seed)
+            far.route.next_crux = 15.0
+            far.route.fill(far, 200.0)
+            for crux in far.route.jugs:
+                ys = sorted(b.p.y for b in far.bolts if b.p.y < crux.crux_from)
+                worst = max(worst, ys[-1] - ys[-2])
+        self.assertLess(worst, 4.8)
 
     def test_waits_for_tokens_before_the_crux(self):
         sim = Climber(3)
+        sim.events = False   # 놓쳐 떨어지면 다시 오르는 데 오래 걸린다 (놓침은 따로 본다)
         sim.route.next_crux = 15.0
         for _ in range(600):   # 1m 씩 조금씩 넣으면 크럭스 아래 끝에서 끝 홀드까지 모자라 기다린다
             if sim.wait_for or sim.crux_log:
@@ -695,7 +705,8 @@ class CruxTest(unittest.TestCase):
         self.assertGreater(sim.top_y, jug.p.y + 3.0)
 
     def test_no_limb_jumps_during_crux(self):
-        """놓치고 다시 뛰는 동안 몸과 그려지는 발끝이 한 프레임에 크게 튀지 않는다 (60fps)."""
+        """뛰고, 놓쳐 로프에 걸려 떨어지고, 다시 붙고, 다시 뛰는 동안 몸과 그려지는 발끝이 한 프레임에 크게 튀지 않는다
+        (60fps. 다시 붙은 뒤 크럭스 아래까지 다시 오르는 보통 오르기는 뺀다)."""
         saved = climbcore.CRUX_MISS
         climbcore.CRUX_MISS = 1.0
         try:
@@ -703,10 +714,16 @@ class CruxTest(unittest.TestCase):
                 sim = Climber(seed)
                 sim.tokens_on, sim.work = False, 3
                 sim.route.next_crux = 15.0
-                last, worst = None, {"body": 0.0, "feet": 0.0}
+                last, worst, roped, back = None, {"body": 0.0, "feet": 0.0}, False, False
                 for _ in range(60 * 240):
                     sim.update(1 / 60)
-                    inside = sim.actions and sim.actions[-1] in ("crux", "crux_miss", "crux_dyno")
+                    if sim.rope is not None:
+                        roped = True
+                    elif roped and sim.mode == "spring":   # 로프 추락이 끝나 다시 붙었다
+                        roped, back = False, True
+                    if back and sim.actions[-1] == "crux":   # 크럭스 아래까지 다시 올라와 다시 뛴다
+                        back = False
+                    inside = sim.actions and sim.actions[-1] in ("crux", "crux_miss", "crux_dyno") and not back
                     tips = [climbcore.two_bone(f.root(sim.body, sim.tilt), f.pos, *climbcore.LEG, f.side, "F", f.drop)[1]
                             for f in (sim.limbs["LF"], sim.limbs["RF"])]
                     now = (sim.body, tips)
@@ -714,13 +731,102 @@ class CruxTest(unittest.TestCase):
                         worst["body"] = max(worst["body"], (now[0] - last[0]).len())
                         worst["feet"] = max([worst["feet"]] + [(a - b).len() for a, b in zip(now[1], last[1])])
                     last = now
-                    if sim.crux_log and sim.actions[-1] not in ("crux", "crux_miss", "crux_dyno"):
+                    if sim.crux_log:
                         break
                 self.assertEqual(sim.crux_log[0][0], 2, seed)
                 self.assertLess(worst["body"], 0.6, seed)   # 다이노는 빠르지만 이어진다 (전력 질주 다이노도 0.48m)
                 self.assertLess(worst["feet"], 0.7, seed)
         finally:
             climbcore.CRUX_MISS = saved
+
+    def test_miss_falls_on_the_rope_and_climbs_back(self):
+        """놓치면 뛰기 전에 건 퀵드로에 로프가 걸려 크럭스 아래로 떨어졌다가, 다시 붙어 올라와 두 번째에 넘는다.
+        건 퀵드로가 없으면 예전처럼 잡던 홀드로 미끄러져 바로 다시 뛴다."""
+        saved = climbcore.CRUX_MISS
+        climbcore.CRUX_MISS = 1.0
+        try:
+            for seed in (3, 5):
+                sim = Climber(seed)
+                sim.tokens_on, sim.work = False, 3
+                sim.route.next_crux = 15.0
+                jug, low, roped = None, 1e9, False
+                for _ in range(60 * 300):
+                    sim.update(1 / 60)
+                    if sim.actions[-1:] == ["crux_miss"]:
+                        jug = jug or next(h for h in sim.holds if h.crux)
+                        low, roped = min(low, sim.body.y), roped or sim.rope is not None
+                    if sim.crux_log:
+                        break
+                self.assertTrue(roped, seed)
+                self.assertTrue(jug.crux_from - 8.0 < low < jug.crux_from - 1.0, (seed, low))   # 4~7m 떨어진다
+                self.assertEqual(sim.crux_log[0][0], 2, seed)
+                self.assertEqual((sim.tally["fall"], sim.tally["crux"]), (1, 1), seed)   # 일지에는 로프 추락으로도 센다
+                self.assertEqual(sim.missing, 0, seed)
+            bare = Climber(3)
+            bare.tokens_on, bare.work = False, 3
+            bare.route.next_crux = 15.0
+            for _ in range(60 * 300):
+                bare.bolts.clear()   # 볼트가 없어 퀵드로를 하나도 못 걸었다
+                bare.update(1 / 60)
+                self.assertIsNone(bare.rope)
+                if bare.crux_log:
+                    break
+            self.assertEqual(bare.crux_log[0][0], 2)
+            self.assertEqual(bare.tally["fall"], 0)
+            back = Climber(3)   # 다시 오를 때는 빠르게 (이미 오른 높이보다 1m 넘게 아래)
+            back.tokens_on, back.work = False, 1
+            run(back, 5.0)
+            self.assertEqual(back.pace, 1)
+            back.top_y = back.body.y + 3.0
+            self.assertEqual(back.pace, 2)
+            back.tokens_on, back.bank = True, 0.5
+            self.assertEqual(back.pace, 2)
+        finally:
+            climbcore.CRUX_MISS = saved
+
+    def test_retry_without_new_tokens_does_not_hang(self):
+        """토큰을 조금씩 받아 크럭스 앞에서 기다렸다 뛰고, 놓쳐 떨어진 뒤로는 토큰이 안 와도 다시 올라와 넘는다
+        (예전에는 크럭스 아래로 돌아와 쌓인 높이를 다시 따지다 한 프레임도 안 쓰고 같은 판단만 되풀이해 앱이 멈췄다)."""
+        import signal
+
+        def stuck(*_):
+            raise AssertionError("update 가 끝나지 않는다")
+        saved, old = climbcore.CRUX_MISS, signal.signal(signal.SIGALRM, stuck)
+        climbcore.CRUX_MISS = 1.0
+        try:
+            for seed in (13, 2):
+                sim = Climber(seed)
+                sim.route.next_crux = 15.0
+                fell = False
+                for i in range(30 * 700):
+                    if not fell and i % 60 == 0 and (sim.bank < 0.3 or sim.parked):
+                        sim.deposit(meters(0.3))
+                    signal.alarm(5)
+                    sim.update(1 / 30)
+                    signal.alarm(0)
+                    fell = fell or sim.rope is not None
+                    if sim.crux_log:
+                        break
+                self.assertTrue(fell, seed)
+                self.assertEqual(sim.crux_log[0][0], 2, seed)
+                self.assertGreater(sim.bank, -1.0, seed)   # 다시 뛴 높이는 처음 뛸 때 썼다
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+            climbcore.CRUX_MISS = saved
+
+    def test_climb_back_pace_only_on_the_wall(self):
+        sim = Climber(3)
+        sim.tokens_on, sim.work = False, 1
+        run(sim, 5.0)
+        sim.top_y = sim.body.y + 3.0
+        self.assertEqual((sim.pace, sim.steady_pace()), (2, 1))   # 다이노 섞기는 steady_pace 로
+        sim.grounded = True   # 땅·달에 앉아 있거나 벽 끝에서 떨어지는 동안은 빨라지지 않는다
+        self.assertEqual(sim.pace, 1)
+        sim.grounded, sim.falling = False, True
+        self.assertEqual(sim.pace, 1)
+        sim.falling, sim.work = False, 0   # 쉴 때는 쉰다
+        self.assertEqual(sim.pace, 0)
 
     def test_miss_then_retry_only_with_events(self):
         saved = climbcore.CRUX_MISS
