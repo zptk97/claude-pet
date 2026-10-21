@@ -437,6 +437,115 @@ class ClimberTest(unittest.TestCase):
             self.assertIn("dyno_sprint", sim.actions)
 
 
+class BalanceTest(unittest.TestCase):
+    """두 발이 한쪽 아래, 두 손이 반대쪽 위로 쏠리면 빈 쪽 (손 쪽 아래) 에 한 발을 둔다.
+    손발 어디에도 갈 데가 없으면 홀드를 만들기 전에 발을 고쳐 딛는다."""
+
+    def lopsided(self, spots=None):
+        """두 손은 오른쪽 위, 두 발은 왼쪽 아래에 잡은 아바타 (홀드는 그 넷뿐, 몸은 (0, 10)). spots 로 자리를 바꾼다."""
+        sim = Climber(7)
+        sim.events = False
+        sim.body, sim.vel, sim.tilt = climbcore.V(0.0, 10.0), climbcore.V(), 0.0
+        spots = spots or {"LH": (0.7, 11.3), "RH": (1.1, 11.2), "LF": (-0.9, 8.5), "RF": (-0.5, 8.4)}
+        sim.holds = []
+        for name, (x, y) in spots.items():
+            hold = climbcore.Hold(climbcore.V(x, y), 0.25, sim.rng)
+            sim.holds.append(hold)
+            sim.grab(sim.limbs[name], hold)
+        return sim
+
+    def add_hold(self, sim, x, y):
+        hold = climbcore.Hold(climbcore.V(x, y), 0.25, sim.rng)
+        sim.holds.append(hold)
+        return hold
+
+    def test_lopsided_moves_the_empty_side_foot_first(self):
+        sim = self.lopsided()
+        self.assertEqual(sim.lean_side(), 1)
+        self.assertTrue(sim.leaning())
+        self.assertIsNone(sim.fill_move())    # 디딜 홀드도, 손이 갈 홀드도 없으면 벽을 딛지 않는다 (곧 돌아온다)
+        self.add_hold(sim, 0.9, 11.9)
+        foot, hold = sim.fill_move()          # 손이 갈 데가 있고 오른쪽 아래에 디딜 홀드가 없으면 벽을 딛는다
+        self.assertEqual((foot.name, hold), ("RF", None))
+        under = self.add_hold(sim, 0.6, 8.1)
+        foot, hold = sim.fill_move()          # 있으면 그 홀드로
+        self.assertEqual((foot.name, hold), ("RF", under))
+        self.assertEqual(sim.lean_log, ["wall", "step"])
+        sim.moves.append("RF")                # 방금 그 발을 옮겼는데도 쏠려 있으면 맴돌지 않고 다른 동작으로 넘긴다
+        self.assertIsNone(sim.fill_move())
+        sim.tokens_on = False
+        self.assertNotEqual(sim.choose_move(), (sim.limbs["RF"], None))
+        self.assertEqual(sim.lean_log, ["wall", "step"])
+
+    def test_reach_into_lopsided_puts_a_foot_under_the_hands(self):
+        sim = self.lopsided()
+        target = self.add_hold(sim, 1.3, 12.0)
+        support, free, style = sim.reach_stance(sim.limbs["RH"], target)
+        self.assertEqual((support.name, free.name, style), ("LF", "RF", "balance"))
+        spot = sim.free_spot(free, style, sum(sim.hands_after(sim.limbs["RH"], target)) / 2)()
+        hip = free.root(sim.body, sim.tilt)
+        self.assertGreater(spot.x, sim.body.x + climbcore.LEAN_SIDE)   # 손 쪽 아래 벽
+        self.assertLess(spot.y, hip.y)
+        self.assertLessEqual((spot - hip).len(), free.reach * 0.95 + 1e-9)
+        self.assertIsNone(free.spot_hold)
+        under = self.add_hold(sim, 0.6, 8.1)
+        spot = sim.free_spot(free, style, 1.0)()   # 닿는 홀드가 있으면 그 위에 올려 둔다
+        self.assertIs(free.spot_hold, under)
+        self.assertLess((spot - under.grip("F")).len(), 1e-9)
+
+    def test_not_lopsided_keeps_the_usual_stance(self):
+        sim = self.lopsided()
+        sim.grab(sim.limbs["RF"], self.add_hold(sim, 0.5, 8.4))   # 오른발이 몸 오른쪽에 있다
+        self.assertEqual(sim.lean_side(), 0)
+        self.assertIsNone(sim.fill_move())
+        target = self.add_hold(sim, 1.3, 12.0)
+        self.assertNotEqual(sim.reach_stance(sim.limbs["RH"], target)[2], "balance")
+
+    def test_wall_foot_moves_the_body_under_the_hands(self):
+        sim = self.lopsided()
+        before = sim.hang_target()[0].x
+        rf = sim.limbs["RF"]
+        spot = sim.free_spot(rf, "balance", sum(sim.hands_x()) / 2)
+        rf.mode, rf.follow, rf.free_style = "follow", spot, "balance"
+        rf.pos = spot()
+        self.assertGreater(sim.hang_target()[0].x, before + 0.2)
+        self.assertFalse(sim.leaning())                     # 빈 쪽에 발이 있다
+        rf.free_style = "smear"                              # 다른 자세로 뗀 발은 몸 자리에 넣지 않는다
+        self.assertAlmostEqual(sim.hang_target()[0].x, sim.limbs["LF"].pos.x * 0.5 + sum(sim.hands_x()) / 4, places=6)
+
+    def test_stray_free_foot_goes_to_the_empty_side(self):
+        sim = self.lopsided()
+        rf = sim.limbs["RF"]
+        rf.mode, rf.free_style = "follow", "smear"           # 원래 홀드 아래 (왼쪽) 벽을 딛고 있다
+        rf.follow = sim.free_spot(rf, "smear")
+        rf.pos = rf.follow()
+        hands = sorted((sim.limbs["LH"], sim.limbs["RH"]), key=sim.held_y)
+        self.assertNotEqual(sim.free_foot_move(rf, hands), (rf, None))   # 손이 갈 데가 없으면 벽으로 가지 않는다
+        self.add_hold(sim, 0.9, 11.9)
+        self.assertEqual(sim.free_foot_move(rf, hands), (rf, None))   # 홀드가 없으면 빈 쪽 벽으로
+        self.assertEqual(sim.free_log[-1], "wall")
+        under = self.add_hold(sim, 0.6, 8.1)
+        self.assertEqual(sim.free_foot_move(rf, hands), (rf, under))
+        self.assertEqual(sim.free_log[-1], "fill")
+
+
+    def test_stuck_low_foot_lets_go_before_making_a_hold(self):
+        # 왼발은 몸보다 높이, 오른발은 한참 아래: 낮은 발에 묶여 몸이 못 일어서고 손이 닿는 데가 없다
+        spots = {"LH": (0.3, 12.1), "RH": (0.0, 12.7), "LF": (-1.0, 10.8), "RF": (0.25, 7.85)}
+        sim = self.lopsided(spots)
+        sim.tokens_on = False
+        self.assertEqual(sim.choose_move(), (sim.limbs["RF"], None))   # 낮은 발을 떼어 벽을 딛는다
+        self.assertEqual((sim.unstuck, sim.missing), (1, 0))
+        sim = self.lopsided(spots)
+        sim.tokens_on = False
+        lf = sim.limbs["LF"]
+        lf.mode, lf.free_style = "follow", "smear"            # 높은 발을 떼어 둔 채 막혔으면 그 홀드로 돌려 딛는다
+        lf.follow = sim.free_spot(lf, "smear")
+        lf.pos = lf.follow()
+        self.assertEqual(sim.choose_move(), (lf, lf.hold))
+        self.assertEqual((sim.unstuck, sim.missing), (1, 0))
+
+
 class SignalTest(unittest.TestCase):
 
     def test_hp_signals(self):
@@ -651,6 +760,9 @@ class WallTest(unittest.TestCase):
         self.assertTrue(3.0 <= dur <= 7.5 if height > 15 else dur <= 3.0, dur)   # 높으면 4~7초, 낮으면 짧게
         self.assertTrue(all(b <= a + 0.05 for a, b in zip(alts, alts[1:])))   # 높이는 줄기만 한다
         tail = [a for a in alts if a < 11.0]   # 마지막 12m 는 떨어지는 빠르기대로 (땅이 아래에서 올라온다)
+        floor = climbcore.GROUND + 1.0   # 땅에 앉은 높이: 낮은 데서 떨어지면 남은 시간 동안 여기 머문다 (그 샘플은 뺀다)
+        while len(tail) > 1 and abs(tail[-1] - floor) < 1e-6 and abs(tail[-2] - floor) < 1e-6:
+            tail.pop()
         if len(tail) > 3:
             steps = [(a - b) / 0.0667 for a, b in zip(tail, tail[1:-1])]
             self.assertTrue(all(5.0 < v < 11.0 for v in steps), steps)

@@ -117,6 +117,7 @@ WORKING = ("running", "background")          # 일하는 펫으로 치는 상태
 AWAKE = ("wake", "refill", "wall_end", "moon_top", "moon_leave")   # 자는 동안에도 받는 동작
 FREE_FOOT = 0.75                              # 손을 뻗을 때 한 발을 떼어 (삼지점) 플래그·벽 딛기로 균형을 잡을 비율
 FREE_HOLD = 0.3                               # 뗀 발은 손을 잡고 적어도 이만큼 (초) 더 균형을 잡은 뒤 홀드로 옮긴다
+LEAN_SIDE = 0.15                              # 몸 가운데에서 이만큼 넘게 떨어져야 그쪽에 있다고 친다 (두 손이 한쪽, 두 발이 반대쪽이면 쏠림)
 FOOT_SPAN = 3.6                               # 편한 자세에서 아래쪽 손과 발 사이 높이 (팔 펴고 다리로 민다, 무릎 약 100°)
 FOOT_HIGH = 2.6                               # 가끔 발을 높이 올릴 때
 FOOT_CEIL = 0.55                              # 발은 매달린 엉덩이보다 적어도 이만큼 아래에 둔다
@@ -376,6 +377,8 @@ class Limb:
         self.follow = None
         self.drop = False           # 드롭니 (무릎을 안·아래로 굽혀 몸을 튼다), 손을 뻗어 잡을 때까지
         self.kept = 0               # 뗀 발을 그대로 둔 채 손을 뻗은 횟수
+        self.free_style = None      # 뗀 발 자세 (flag, backflag, smear, 빈 쪽 벽 딛기 balance)
+        self.spot_hold = None       # 빈 쪽에 발을 올려 둔 홀드 (다음 차례에 딛는다)
         self.tucked = False         # 침낭 안에 넣었다 (안 그린다)
         self.fist = False
         self.wiggle = 0.0           # 잡은 뒤 손가락을 고쳐 쥐는 남은 시간 (그림만)
@@ -683,6 +686,7 @@ class Climber:
         self.charging = True        # 몸이 가장 높은 자리를 넘으면 쌓인 높이를 쓴다 (일 끝냄 다이노는 덤이라 안 쓴다)
         self.k_now = 1.0            # 지금 동작의 시간 배율 (빠를수록 몸도 또렷하게 따라간다)
         self.missing = 0            # 잡을 데가 없어 그 자리에 만든 홀드 수 (0 이어야 한다)
+        self.unstuck = 0            # 갈 데가 없어 뗀 발을 원래 홀드로 돌리거나 낮은 발을 뗀 횟수 (검사용)
         self.phase_target = None    # 손발을 옮기는 동작 단계가 정한 몸 자리 (함수)
         self.move_start = 0.0
         self.flagging = False
@@ -699,7 +703,9 @@ class Climber:
         self.squash_min = 1.0       # 지난 기록 뒤 몸통이 가장 눌린 정도 (검사용)
         self.drop_log = []          # 드롭니를 할 만한 손 뻗기마다 했는지 (검사용)
         self.pause_log = []         # 둘러보며 쉰 (시간, 본 곳 수) (검사용)
-        self.free_log = []          # 뗀 발로 한 다음 동작: up (올라가 딛기), match (합발), keep (그대로 두고 손), return (검사용)
+        self.free_log = []          # 뗀 발로 한 다음 동작: up (올라가 딛기), match (합발), keep (그대로 두고 손), return,
+                                    # spot (빈 쪽에 올려 둔 홀드), fill (빈 쪽 홀드), wall (빈 쪽 벽) (검사용)
+        self.lean_log = []          # 쏠렸을 때 빈 쪽에 발을 둔 동작: reach (손을 뻗으며), step (홀드로), wall (벽을 딛어) (검사용)
         self.switch_foot = None     # 합발 뒤 위로 옮길 발
         self.parked = False         # 남은 높이로 닿는 홀드가 없어 다음 토큰을 기다리는 중
         self.wait_for = 0.0         # 크럭스 앞에서 기다릴 때 모여야 할 높이
@@ -1326,6 +1332,73 @@ class Climber:
             out.append((score, id(h), h))
         return out
 
+    def hands_x(self):
+        """두 손 x: 잡은 홀드 (잠깐 뗀 손은 돌아갈 홀드), 홀드가 없으면 지금 자리."""
+        return [h.hold.grip("H").x if h.hold is not None else h.pos.x for h in (self.limbs["LH"], self.limbs["RH"])]
+
+    def hands_after(self, limb, hold):
+        """limb 이 hold 를 잡고 난 뒤의 두 손 x."""
+        other = self.other(limb)
+        return [hold.grip("H").x, other.hold.grip("H").x if other.hold is not None else other.pos.x]
+
+    def lean_side(self, hands_x=None, bx=None):
+        """두 손이 몸 (x 가 bx) 한쪽 위, 두 발 (디딘 홀드, 뗀 발은 돌아갈 홀드) 이 반대쪽 아래로 쏠렸으면 손 쪽 (빈 쪽, ±1),
+        아니면 0. 대각선으로 늘어나 손 쪽 아래가 비어 있어 균형이 무너져 보이는 자세."""
+        hands_x = self.hands_x() if hands_x is None else hands_x
+        bx = self.body.x if bx is None else bx
+        feet_x = [f.hold.p.x if f.hold is not None else f.pos.x for f in (self.limbs["LF"], self.limbs["RF"])]
+        for s in (1, -1):
+            if all(s * (x - bx) > LEAN_SIDE for x in hands_x) and all(s * (x - bx) < -LEAN_SIDE for x in feet_x):
+                return s
+        return 0
+
+    def leaning(self):
+        """쏠렸는데 빈 쪽에 발이 하나도 없다 (뗀 발·옮기는 발도 지금 자리로)."""
+        s = self.lean_side()
+        return bool(s) and not any(s * (f.pos.x - self.body.x) > LEAN_SIDE for f in (self.limbs["LF"], self.limbs["RF"]))
+
+    def fill_options(self, foot, s, relax=0):
+        """빈 쪽 (s) 아래에서 foot 이 디딜 홀드들 (점수, id, 홀드). 손 가운데 아래 가까이, 지금 발 높이에서 크게 내려가지
+        않고 다리를 쭉 펴지 않는 데만. relax 면 높이·거리 조건을 조금 푼다 (뗀 발이 반대쪽으로 돌아가기 전에)."""
+        hip = foot.root(V(self.body.x, min(self.body.y, self.arm_hang_y())), self.tilt)
+        hands_low = min(self.held_y(h) for h in (self.limbs["LH"], self.limbs["RH"]))
+        hx = sum(self.hands_x()) / 2
+        want_x = self.body.x + s * min(0.9, max(0.45, s * (hx - self.body.x)))
+        base = foot.hold.p.y if foot.hold is not None else foot.pos.y
+        top = hands_low - (FOOT_SPAN - 0.55) + 0.3 * relax
+        if self.pace <= 2 and not relax:
+            top = min(top, self.foot_ceiling())
+        other = self.other(foot)
+        out = []
+        for h in self.holds:
+            if h is foot.hold or h is other.hold or h.p.y > top or h.p.y < base - 0.45 - 0.35 * relax:
+                continue
+            if s * (h.p.x - self.body.x) < LEAN_SIDE or (h.grip("F") - hip).len() > foot.reach * (0.9 + 0.05 * relax):
+                continue
+            score = -abs(h.p.x - want_x) - 0.8 * abs(h.p.y - (hands_low - FOOT_SPAN)) + self.rng.uniform(0, 0.3)
+            out.append((score, id(h), h))
+        return out
+
+    def hands_can_move(self):
+        """어느 손이든 갈 홀드가 있다 (조건을 조금 풀어도)."""
+        return any(self.hand_options(h, relax) for relax in (0, 1) for h in (self.limbs["LH"], self.limbs["RH"]))
+
+    def fill_move(self):
+        """네 손발이 다 붙은 채 쏠려 있으면 (빈 쪽 발, 빈 쪽 홀드). 디딜 홀드가 없으면 홀드 자리에 None (벽을 딛는다).
+        쏠리지 않았거나, 방금 그 발을 옮겼는데도 쏠려 있거나 (같은 발을 또 옮기지 않게 평소 순서로 넘긴다), 디딜 홀드가
+        없는데 손도 갈 데가 없으면 (벽을 딛어도 다음 차례에 발이 그대로 돌아온다) None."""
+        if any(l.mode != "grip" for l in self.limbs.values()):
+            return None
+        s = self.lean_side()
+        foot = self.limbs["RF" if s > 0 else "LF"]
+        if not s or (self.moves and self.moves[-1] == foot.name):
+            return None
+        options = self.fill_options(foot, s)
+        if not options and not self.hands_can_move():
+            return None
+        self.lean_log.append("step" if options else "wall")
+        return foot, (max(options)[2] if options else None)
+
     def choose_move(self):
         """다음에 옮길 손발과 홀드. 정해진 순서 없이 그때 자세를 보고 고른다."""
         hands = sorted((self.limbs["LH"], self.limbs["RH"]), key=self.held_y)
@@ -1337,6 +1410,10 @@ class Climber:
                 return foot, max(options)[2]
         for foot in self.free_feet():   # 뗀 발은 다음 동작으로 (삼지점을 다시 만든다)
             move = self.free_foot_move(foot, hands)
+            if move is not None:
+                return move
+        if self.stall < 3 and not self.free_feet():   # 두 발이 한쪽 아래, 두 손이 반대쪽 위로 쏠렸으면 빈 쪽 발부터
+            move = self.fill_move()
             if move is not None:
                 return move
         if self.stall >= 3:   # 세 번 연속 제자리면: 아래에 펴진 채 남은 발을 끌어올리고, 손은 위로만 (작은 다이노까지)
@@ -1390,6 +1467,10 @@ class Climber:
         if reach:
             self.relaxed += 1
             return reach[1], reach[0]
+        move = self.unstick() if self.stall < 4 else None   # 발을 고쳐 디뎌 몸을 세운다 (맴돌면 그만두고 홀드를 만든다)
+        if move is not None:
+            self.unstuck += 1
+            return move
         self.missing += 1   # 그래도 없으면 가장 처진 손발 쪽 길 위에 하나 만든다
         limb = min(hands + feet, key=lambda l: self.held_y(l) - (self.body.y + (HAND_UP if l.kind == "H" else -FOOT_DOWN)))
         y = self.held_y(limb) + 0.6
@@ -1399,6 +1480,21 @@ class Climber:
             hold = Hold(V(x, y), 0.22, self.rng)
             self.holds.append(hold)
         return limb, hold
+
+    def unstick(self):
+        """손발 어디에도 갈 데가 없을 때 (홀드를 만들기 전에): 뗀 발은 원래 홀드에 다리가 닿으면 그리로 돌려 딛고, 두 발을 다
+        디뎠는데 한 발이 1.5 넘게 낮으면 그 발을 떼어 벽을 딛는다 (홀드 자리에 None). 낮은 발에 다리 길이만큼 묶여 몸이 못
+        일어서던 것을 높은 발로 일어서 손이 닿게 한다. 둘 다 아니면 None."""
+        for f in self.free_feet():
+            if (f.hold is not None and f.hold in self.holds and f.hold is not self.other(f).hold
+                    and (f.hold.grip("F") - f.root(self.body, self.tilt)).len() < f.reach * 0.98):
+                return f, f.hold
+        feet = (self.limbs["LF"], self.limbs["RF"])
+        if all(f.mode == "grip" for f in feet):
+            low, high = sorted(feet, key=lambda f: f.hold.p.y)
+            if high.hold.p.y - low.hold.p.y > 1.5:
+                return low, None
+        return None
 
     def pick_ahead(self, limb, options):
         """options 중 limb 이 갈 홀드. 좋은 순서대로 거기로 옮겼다고 치고, 다른 손발에 갈 데가 생기는 첫 홀드를 고른다
@@ -1495,14 +1591,17 @@ class Climber:
 
     def hang_target(self):
         """평소 자세: 팔을 쭉 펴고 뼈로 매달린다 (가장 높이 매달린 팔이 95% 펴지는 높이).
-        무릎을 살짝 굽힌 채 (다리 90%) 다리가 닿는 데까지만 내려가고, 엉덩이는 발보다 0.3 위에 둔다. 잠깐 뗀 손은 돌아갈 홀드 기준."""
+        무릎을 살짝 굽힌 채 (다리 90%) 다리가 닿는 데까지만 내려가고, 엉덩이는 발보다 0.3 위에 둔다. 잠깐 뗀 손은 돌아갈 홀드 기준.
+        몸 x 는 손 가운데와 발 가운데의 중간 (빈 쪽 벽을 딛은 발도 발로 쳐서 몸이 손 아래로 옮겨 간다)."""
         hands = [l for l in self.limbs.values() if l.kind == "H" and l.hold is not None and l.mode in ("grip", "move", "follow")]
         feet = [l for l in self.limbs.values() if l.kind == "F" and l.mode == "grip"]
         if not hands:
             return V(self.body.x, self.body.y), self.body.x
         grips = [(l, l.hold.grip("H")) for l in hands]
         hx = sum(g.x for _, g in grips) / len(grips)
-        fx = sum(f.pos.x for f in feet) / len(feet) if feet else hx
+        stand = feet + [f for f in self.limbs.values()   # 벽을 딛은 발은 홀드로 옮기는 동안에도 (몸이 반대쪽으로 흔들리지 않게)
+                        if f.kind == "F" and f.mode in ("follow", "move") and not f.tucked and f.free_style == "balance"]
+        fx = sum(f.pos.x for f in stand) / len(stand) if stand else hx
         wind = math.sin(self.t * 1.3) * 0.16 * self.precip() ** 2   # 거센 바람에 몸이 흔들린다
         x = hx * 0.5 + fx * 0.5 + wind
         # 어깨·엉덩이는 몸이 기운 만큼 돌린 자리로 잰다 (안 그러면 기울어 올라간 쪽 팔이 덜 펴진다)
@@ -1878,7 +1977,11 @@ class Climber:
             self.face, self.face_want = want, None
 
     def scan_ahead(self):
-        """한숨 돌리며 위쪽 홀드 2~3곳을 차례로 본다 (모두 0.6~1.5초, 쉴 일이 생기면 그만둔다)."""
+        """한숨 돌리며 위쪽 홀드 2~3곳을 차례로 본다 (모두 0.6~1.5초, 쉴 일이 생기면 그만둔다).
+        쏠린 채로는 쉬지 않고 균형을 잡은 다음 동작 뒤로 미룬다."""
+        if self.leaning():
+            self.burst_left = 1
+            return
         above = sorted((h for h in self.holds if 1.0 < h.p.y - self.body.y < 3.5), key=lambda h: h.p.y)
         if len(above) < 2:
             return
@@ -1893,7 +1996,8 @@ class Climber:
 
     def pause_time(self):
         lo, hi = PACE_PAUSE[max(1, self.pace)]
-        return self.rng.uniform(lo, hi) + (0.35 if self.hp <= 30 else 0.0)
+        pause = self.rng.uniform(lo, hi) + (0.35 if self.hp <= 30 else 0.0)
+        return pause * 0.3 if self.leaning() else pause   # 쏠렸으면 숨 고르지 않고 이어 간다
 
     def wait(self, seconds, stoppable=True, until=None):
         t = 0.0
@@ -1942,6 +2046,7 @@ class Climber:
         if new and limb.hold is not None:
             limb.recent.append(limb.hold)
         limb.mode, limb.hold = "grip", hold
+        limb.free_style = limb.spot_hold = None
         limb.pos = self.grip_point(limb, hold)
         self.grabs.append((self.t, limb.name, hold))
         if hold.snow > 0.3:   # 눈을 털어 낸다
@@ -2027,9 +2132,22 @@ class Climber:
         뻗는 동안 대개 한 발은 떼어 (삼지점) 플래그나 벽 딛기로 균형을 잡고, 잡은 뒤에도 그대로 두었다가
         다음 차례에 홀드로 옮긴다 (choose_move 가 뗀 발부터 고른다). 가까운 홀드는 천천히 다가가 멈추듯 잡고 (정적),
         먼 홀드는 살짝 가라앉았다 던지듯 잡은 뒤 잠깐 처진다 (데드포인트). 옆으로 멀리 뻗는데 같은 쪽 발이 높으면
-        그 무릎을 안·아래로 떨어뜨려 몸을 틀고 조금 더 멀리 닿는다 (드롭니)."""
+        그 무릎을 안·아래로 떨어뜨려 몸을 틀고 조금 더 멀리 닿는다 (드롭니). 잡고 나면 두 손이 한쪽 위, 두 발이 반대쪽 아래로
+        쏠리는 자세면 디딜 발에 무게를 조금만 싣고 빈 쪽 발을 먼저 손 아래쪽에 내려 둔 뒤 두 발 사이로 일어선다."""
         self.look_at = hold.p
         support, free, style = self.reach_stance(limb, hold)
+        shift = None
+        if style == "balance":
+            base = self.hang_target()[0]
+            x0 = self.body.x
+            lean = V(x0 + (support.pos.x - x0) * 0.25, base.y)
+            self.phase_target = lambda: lean
+            yield from self.settle(lean, 0.1 * k, 0.3 * k)
+            spot = self.free_spot(free, style, sum(self.hands_after(limb, hold)) / 2)
+            yield from self.move_limb(free.name, spot, 0.26 * k, arc=0.08)
+            free.free_style, free.kept = style, 0
+            shift = V(x0 + ((support.pos.x + free.pos.x) / 2 - x0) * 0.6, base.y)
+            free = None
         dist = (hold.p - limb.pos).len()
         kind = ("static" if dist < 1.0 else "dynamic" if dist >= 1.4 else "normal") if self.pace <= 1 else "normal"   # 빨리 오를 때는 다 날렵하게
         same = self.limbs["RF" if limb.side > 0 else "LF"]
@@ -2038,11 +2156,12 @@ class Climber:
             same.drop = self.rng.random() < DROP_KNEE
             self.drop_log.append(same.drop)
         base = self.hang_target()[0]
-        x0 = self.body.x
-        dx = ((support.pos.x if support.mode == "grip" else x0) - x0) * 0.55
-        if style is None and -limb.side * dx < 0.15:
-            dx = -limb.side * 0.15   # 적어도 조금은 반대쪽으로
-        shift = V(x0 + dx, base.y)
+        if shift is None:
+            x0 = self.body.x
+            dx = ((support.pos.x if support.mode == "grip" else x0) - x0) * 0.55
+            if style is None and -limb.side * dx < 0.15:
+                dx = -limb.side * 0.15   # 적어도 조금은 반대쪽으로
+            shift = V(x0 + dx, base.y)
         self.phase_target = lambda: shift
         yield from self.settle(shift, 0.16 * k, 0.4 * k)
         if free is not None:
@@ -2095,11 +2214,18 @@ class Climber:
     def reach_stance(self, limb, hold):
         """손을 뻗는 동안 (디딜 발, 뗄 발 또는 None, 뗀 발 자세). 뻗는 쪽 발이 몸 밑 가까이 잘 딛고 있으면 그 발로 딛고
         반대 발을 떼고 (대각선으로 버틴다. 옆으로 멀리 뻗으면 반대쪽으로 플래그), 아니면 반대 발로 딛고 뻗는 쪽 발을
-        뗀다 (같은 쪽 손발만 남아 몸이 열리려 하므로 멀리 뻗으면 뒤로 엇갈려 백플래그). 가깝게 뻗으면 뗀 발은 벽을 딛는다."""
+        뗀다 (같은 쪽 손발만 남아 몸이 열리려 하므로 멀리 뻗으면 뒤로 엇갈려 백플래그). 가깝게 뻗으면 뗀 발은 벽을 딛는다.
+        잡고 나면 쏠리는 자세면 (두 손이 한쪽 위, 두 발이 반대쪽 아래) 빈 쪽 발을 떼어 손 아래쪽에 둔다 (balance)."""
         feet = {f.side: f for f in (self.limbs["LF"], self.limbs["RF"])}
         same, opp = feet[limb.side], feet[-limb.side]
         if same.mode != "grip" or opp.mode != "grip":   # 이미 한 발이 떨어져 있다
             return (same if same.mode == "grip" else opp), None, None
+        hands_x = self.hands_after(limb, hold)
+        after = 0.5 * sum(hands_x) / 2 + 0.5 * (same.pos.x + opp.pos.x) / 2   # 잡고 나서 몸이 갈 x (hang_target)
+        s = self.lean_side(hands_x, after) or self.lean_side(hands_x)
+        if s:
+            self.lean_log.append("reach")
+            return feet[-s], feet[s], "balance"
         if self.rng.random() >= FREE_FOOT:
             return opp, None, None
         wide = limb.side * (hold.p.x - self.body.x) > 0.6
@@ -2109,14 +2235,27 @@ class Climber:
             return same, opp, ("flag" if wide else "smear")
         return opp, same, ("backflag" if wide else "smear")
 
-    def free_spot(self, foot, style):
+    def free_spot(self, foot, style, hx=None):
         """뗀 발이 갈 자리 (점을 돌려주는 함수). 플래그는 다리를 바깥으로 뻗고, 백플래그는 디딘 다리 뒤로 엇갈리고,
-        벽 딛기는 원래 홀드 조금 아래 벽에 발을 댄다 (몸이 멀어지면 다리가 닿는 데까지만)."""
+        벽 딛기는 원래 홀드 조금 아래 벽에 발을 댄다 (몸이 멀어지면 다리가 닿는 데까지만). 빈 쪽 (balance, 발 쪽) 은
+        다리가 닿는 홀드가 있으면 그 위에 올려 두고 (다음 차례에 딛는다), 없으면 손 가운데 (hx) 아래쪽 벽을 딛는다
+        (몸이 그쪽으로 옮겨 가도 몸 바깥에 남게)."""
         if style == "flag":
             return lambda: foot.root(self.body, self.tilt) + V(foot.side * 1.2, -0.8)
         if style == "backflag":
             return lambda: foot.root(self.body, self.tilt) + V(-foot.side * 0.95, -1.3)
-        spot = foot.pos + V(foot.side * 0.12, -0.3)
+        if style == "balance":
+            s = foot.side
+            hx = sum(self.hands_x()) / 2 if hx is None else hx
+            options = self.fill_options(foot, s)
+            foot.spot_hold = max(options)[2] if options else None
+            if foot.spot_hold is not None:
+                spot = foot.spot_hold.grip("F")
+            else:
+                x = self.body.x + s * min(1.1, max(0.55, s * (hx - self.body.x) - 0.1))
+                spot = V(max(-WALL_HALF + 0.2, min(WALL_HALF - 0.2, x)), self.body.y - 1.55)
+        else:
+            spot = foot.pos + V(foot.side * 0.12, -0.3)
 
         def smear():
             root = foot.root(self.body, self.tilt)
@@ -2131,14 +2270,41 @@ class Climber:
 
     def free_foot_move(self, foot, hands):
         """뗀 발로 할 다음 동작 (손발, 홀드). 더 높은 홀드가 있으면 올라가 딛고, 없으면 디딘 발 옆에 모아 (합발) 다음에
-        그 발을 올리고, 그것도 안 되면 뗀 발은 그대로 둔 채 다른 손을 뻗는다 (두 번까지). 다 안 되면 원래 높이 근처로."""
-        base = foot.hold.p.y
+        그 발을 올리고, 그것도 안 되면 뗀 발은 그대로 둔 채 다른 손을 뻗는다 (두 번까지). 다 안 되면 원래 높이 근처로.
+        빈 쪽 벽을 딛은 발은 올려 둔 홀드·빈 쪽 홀드부터 찾고, 손이 아직 그쪽 위면 합발보다 벽을 딛은 채 손 뻗기와 조건을
+        푼 빈 쪽 홀드가 먼저다. 손이 이 발 쪽으로 쏠렸는데 다른 자세로 뗀 발이 반대쪽에 떠 있으면 빈 쪽 홀드, 위쪽 홀드,
+        그것도 없으면 빈 쪽 벽으로 옮긴다 (홀드 자리에 None)."""
+        base, s = foot.hold.p.y, foot.side
+        wall = foot.free_style == "balance"
+        stray = not wall and self.lean_side() == s and s * (foot.pos.x - self.body.x) <= LEAN_SIDE
+        hold = foot.spot_hold if wall else None
+        if (hold is not None and hold in self.holds and hold is not self.other(foot).hold
+                and (hold.grip("F") - foot.root(self.body, self.tilt)).len() < foot.reach * 0.95):
+            self.free_log.append("spot")
+            return foot, hold
+        if wall or stray:
+            options = self.fill_options(foot, s) or (stray and self.fill_options(foot, s, relax=1))
+            if options:
+                self.free_log.append("fill")
+                return foot, max(options)[2]
         for relax in (0, 1):
             up = [o for o in self.foot_options(foot, relax) if o[2].p.y >= base + 0.15]
             if up:
                 self.free_log.append("up")
                 return foot, max(up)[2]
+        if stray and self.hands_can_move():   # 손이 갈 데가 없으면 벽을 딛어도 다음 차례에 돌아온다
+            self.free_log.append("wall")
+            return foot, None
         support = self.other(foot)
+        over = wall and all(s * (x - self.body.x) > LEAN_SIDE for x in self.hands_x())   # 손이 아직 빈 쪽 위
+        if over:
+            move = self.keep_free(foot, support, hands)
+            if move is not None:
+                return move
+            options = self.fill_options(foot, s, relax=1)
+            if options:
+                self.free_log.append("fill")
+                return foot, max(options)[2]
         if support.mode == "grip" and support.hold is not None:
             spot = support.hold.grip("F", foot.side)
             if ((spot - foot.root(self.body, self.tilt)).len() < foot.reach * 0.92
@@ -2146,6 +2312,17 @@ class Climber:
                 self.free_log.append("match")
                 self.switch_foot = support
                 return foot, support.hold
+        move = None if over else self.keep_free(foot, support, hands)
+        if move is not None:
+            return move
+        hold = self.free_foot_hold(foot)
+        if hold is not None:
+            self.free_log.append("return")
+            return foot, hold
+        return None
+
+    def keep_free(self, foot, support, hands):
+        """뗀 발은 그대로 둔 채 다른 손을 뻗는 동작 (두 번까지, 방금 뻗은 손은 빼고). 없으면 None."""
         if foot.kept < 2 and support.mode == "grip" and all(h.mode == "grip" for h in hands):
             last = self.limbs.get(self.moves[-1]) if self.moves else None
             for relax in (0, 1):
@@ -2155,10 +2332,6 @@ class Climber:
                         foot.kept += 1
                         self.free_log.append("keep")
                         return hand, self.pick_ahead(hand, options)
-        hold = self.free_foot_hold(foot)
-        if hold is not None:
-            self.free_log.append("return")
-            return foot, hold
         return None
 
     def free_foot_hold(self, foot):
@@ -2178,7 +2351,10 @@ class Climber:
 
     def foot_move(self, limb, hold, k):
         """발 옮기기: 아래를 보고 무게를 다른 발로 넘긴 뒤, 무릎을 들어 홀드 위에서 잠깐 겨눴다가 콕 놓는다.
-        뗀 발 (플래그·벽 딛기) 이면 손을 잡고 FREE_HOLD 초는 그대로 균형을 잡은 뒤에 옮긴다."""
+        뗀 발 (플래그·벽 딛기) 이면 손을 잡고 FREE_HOLD 초는 그대로 균형을 잡은 뒤에 옮긴다. hold 가 None 이면 빈 쪽 벽을 딛는다."""
+        if hold is None:
+            yield from self.wall_step(limb, k)
+            return
         free = limb.mode == "follow"
         if free:   # 빠르게 오를 때는 균형 잡는 시간도 짧게
             yield from self.wait(self.free_since + FREE_HOLD * k - self.t, stoppable=False)
@@ -2194,6 +2370,22 @@ class Climber:
         yield from self.move_limb(limb.name, above, (0.18 + 0.1 * dist + (0.1 if free else 0.0)) * k, arc=0.12)
         yield from self.wait(0.1 * k, stoppable=False)
         yield from self.move_limb(limb.name, hold, 0.09 * k, arc=0.0)
+
+    def wall_step(self, foot, k):
+        """빈 쪽 벽 딛기 (쏠렸는데 빈 쪽에 디딜 홀드가 없을 때): 디딘 발로 무게를 조금 옮기고, foot 을 떼어 손 가운데
+        아래쪽 벽을 딛은 뒤 두 발 사이로 몸을 옮긴다 (hang_target 이 벽을 딛은 발도 발로 친다)."""
+        other = self.other(foot)
+        base = self.hang_target()[0]
+        lean = V(base.x + (other.pos.x - base.x) * 0.25, base.y)
+        self.phase_target = lambda: lean
+        yield from self.settle(lean, 0.08 * k, 0.25 * k)
+        spot = self.free_spot(foot, "balance", sum(self.hands_x()) / 2)
+        self.look_at = spot()
+        yield from self.move_limb(foot.name, spot, 0.3 * k, arc=0.1)
+        foot.free_style, foot.kept = "balance", 0
+        self.free_since = self.t
+        self.phase_target = None
+        yield from self.settle(self.hang_target()[0], 0.1 * k, 0.3 * k)
 
     def bolt_to_clip(self):
         """하네스가 막 지나간, 아직 로프를 안 건 볼트. 너무 지나쳤으면 걸지 않고 넘어간다 (런아웃)."""

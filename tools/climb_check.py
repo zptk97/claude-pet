@@ -3,7 +3,7 @@
 
     python3 tools/climb_check.py
 
-일하는 펫 수로 오르는 검사 (홀드를 미리 깔아 둠, 쉬기, 다 씀·회복, 좌우 퍼짐, 제자리 구간, 날씨, 높이 기록,
+일하는 펫 수로 오르는 검사 (홀드를 미리 깔아 둠, 쉬기, 다 씀·회복, 좌우 퍼짐, 제자리 구간, 쏠림, 날씨, 높이 기록,
 로프 추락, 저절로 생기는 이벤트, 크럭스) 와 토큰으로 오르는 검사 (넣은 만큼 오름, 빠르기, 기다리기·쉬기, 실제 기록 읽기 비용).
 """
 import collections
@@ -44,6 +44,20 @@ def run(sim, seconds, events=(), feed=None):
             feed(sim, t)
         sim.update(1 / FPS)
         t += 1 / FPS
+
+
+def lopsided(sim):
+    """두 손이 몸 한쪽 위, 두 발 (디딘 홀드, 뗀 발은 돌아갈 홀드) 이 반대쪽 아래로 쏠렸는데 손 쪽 아래에 발이 하나도 없다
+    (오르는 동안만 본다)."""
+    if sim.mode != "spring" or sim.falling or sim.ledge is not None or sim.resting:
+        return False
+    L, bx, m = sim.limbs, sim.body.x, climbcore.LEAN_SIDE
+    hands = [L[n].hold.grip("H").x if L[n].hold is not None else L[n].pos.x for n in ("LH", "RH")]
+    feet = [L[n].hold.p.x if L[n].hold is not None else L[n].pos.x for n in ("LF", "RF")]
+    for s in (1, -1):
+        if all(s * (x - bx) > m for x in hands) and all(s * (x - bx) < -m for x in feet):
+            return not any(s * (L[n].pos.x - bx) > m for n in ("LF", "RF"))
+    return False
 
 
 def repeat4(seq):
@@ -169,21 +183,30 @@ def by_work():
     # 같은 손발을 연달아 옮기는 비율: 시드 8개 x 300초, 일하는 펫 1·3. 5% 이하, 빠르기는 자세 다듬기 (삼지점, 빠른 템포) 뒤
     # 값 (분당 6.4·9.1m) 의 95% 넘게 (보통 빠르기는 몇 동작마다 둘러보며 쉬어서 85% 넘게),
     # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임 12.5% 이하 (내다보기 전에는 약 13%, 내다본 뒤 9~10% 대,
-    # 뗀 발을 다음 동작으로 바꾼 뒤 시드 24개 평균 약 11%, 시드 묶음마다 ±1%p)
+    # 뗀 발을 다음 동작으로 바꾼 뒤 시드 24개 평균 약 11%, 시드 묶음마다 ±1%p).
+    # 두 발이 한쪽 아래, 두 손이 반대쪽 위로 쏠린 채 손 쪽 아래가 빈 프레임 9% 이하, 한 번에 4초 이하
+    # (빈 쪽에 발을 두기 전에는 약 14%, 한 번에 10초 넘게. 둔 뒤 6~7%, 한 번에 2~3초)
     for work, before, keep in ((1, 6.4, 0.85), (3, 9.1, 0.95)):
-        repeats = moves = far = made = frames = stretched = 0
+        repeats = moves = far = made = frames = stretched = leaned = run_frames = longest = 0
         speeds = []
 
-        def watch(s, t):   # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임
-            nonlocal frames, stretched
+        def watch(s, t):   # 잡은 손이 닿는 거리를 2% 넘게 늘어난 프레임, 빈 쪽이 빈 채 쏠린 프레임
+            nonlocal frames, stretched, leaned, run_frames, longest
             frames += 1
             stretched += any(l.mode == "grip" and (l.pos - l.root(s.body, s.tilt)).len() > l.reach * 1.02
                              for l in s.limbs.values() if l.kind == "H")
+            if lopsided(s):
+                leaned += 1
+                run_frames += 1
+                longest = max(longest, run_frames)
+            else:
+                run_frames = 0
 
         for seed in range(1, 9):
             sim = climber(seed)
             sim.work = work
             y0 = sim.top_y
+            run_frames = 0
             run(sim, 300, feed=watch)
             m = sim.moves
             repeats += sum(m[i] == m[i - 1] for i in range(1, len(m)))
@@ -195,6 +218,9 @@ def by_work():
               f"만든 홀드 {made}, 팔이 닿는 거리를 넘은 프레임 {stretched / frames:.2%}")
         check(speed >= before * keep,
               f"오르는 빠르기 (일하는 펫 {work}): 분당 {speed:.1f}m (자세 다듬기 뒤 {before}m 의 {keep:.0%} 넘게)")
+        check(leaned / frames <= 0.09 and longest / FPS <= 4.0,
+              f"쏠림 (일하는 펫 {work}): 두 발 한쪽 아래·두 손 반대쪽 위로 손 쪽 아래가 빈 프레임 {leaned / frames:.1%}, "
+              f"한 번에 가장 길게 {longest / FPS:.1f}초")
 
     # 날씨: 일하는 펫 3 (8초) ↔ 0 (12초) 를 20번. 비와 눈이 둘 다 나오고, 한 번 내리는 동안은 안 바뀐다
     sim = climber(5)
