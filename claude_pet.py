@@ -33,6 +33,7 @@ $1 어치마다 30m 를 쌓아 많이 쌓일수록 빠르게 오르고, 일하�
 
 import ctypes
 import fcntl
+import collections
 import json
 import math
 import os
@@ -60,6 +61,7 @@ import climbcore  # noqa: E402
 import journalcore  # noqa: E402
 import petcore  # noqa: E402
 from climbview import CARD_ID, ClimbWindow  # noqa: E402
+from journalview import JournalWindow  # noqa: E402
 
 APP_DIR = Path(__file__).resolve().parent
 # 직접 만든 펫, Petdex 등에서 받은 펫(git 제외), Codex 펫 순서로 찾는다. 같은 id 는 앞 폴더가 이긴다.
@@ -1499,6 +1501,8 @@ class PetManager(QObject):
         self.journal = self.load_journal()  # 등반 일지: 계정 사용량·시간별 토큰 기록 (오르기 기록과 같이 저장한다)
         self.journal_dirty = False
         self.backfill = None  # 지난 토큰을 되살리는 스레드 ([스레드, 결과]), 일지에 pending 이 있을 때
+        self.journal_window = None  # 등반 일지 창 (JournalWindow, 처음 열 때 만든다)
+        self.tally_wait = collections.Counter()  # 일지에 아직 못 넣은 등반 횟수 (리셋 뒤 새 주 사용량을 받기 전)
         self.start_backfill()
         QApplication.instance().aboutToQuit.connect(self.save_growth)
         QApplication.instance().aboutToQuit.connect(self.save_climb)
@@ -1718,6 +1722,10 @@ class PetManager(QObject):
             self.climber.deposit(added)
             self.climb_dirty = True
         if journalcore.add_hours(self.journal, self.meter.take_spent()):
+            self.journal_dirty = True
+        self.tally_wait.update(self.climber.take_tally())   # 넘은 크럭스·추락 같은 등반 횟수 (새 주를 아직 모르면 들고 있는다)
+        if self.tally_wait and journalcore.add_tally(self.journal, self.tally_wait, time.time()):
+            self.tally_wait.clear()
             self.journal_dirty = True
         self.tend_backfill()
         if self.climber.passed != self.climb_passed:
@@ -2377,6 +2385,7 @@ class PetManager(QObject):
         motion.triggered.connect(self.set_motion)
         menu.addAction(motion)
         menu.addAction(self.climb_action(menu))
+        menu.addAction("등반 일지", self.open_journal)
         gist = QAction("작업 요약 (Haiku 로 말풍선 요약)", menu, checkable=True, checked=self.gist_enabled())
         gist.triggered.connect(self.set_gist)
         menu.addAction(gist)
@@ -2397,9 +2406,29 @@ class PetManager(QObject):
         action.triggered.connect(self.set_climb_view)
         return action
 
+    def open_journal(self):
+        """등반 일지 창을 이번 주 쪽으로 연다. 이미 열려 다른 창 뒤에 있으면 GNOME 이 raise 를 막아서 확장으로 올린다."""
+        if self.journal_window is None:
+            self.journal_window = JournalWindow(self.journal_pages)
+        self.journal_window.open()
+        QTimer.singleShot(150, lambda: self.desktop.activate(self.journal_window.windowTitle()))
+
+    def journal_pages(self):
+        """등반 일지 창에 넘겨 볼 주의 요약 (오래된 주부터 이번 주까지). 이번 주 높이는 창이 보여 아바타가 이번 주 벽을
+        오르는 중이면 그 높이 (주간 % 사이를 토큰으로 채운 값), 아니면 (숨어서 멈췄거나 땅·떨어지는 중) 주간 % 의 눈금."""
+        now = time.time()
+        limits = self.account_limits()
+        climber = self.climber
+        climbing = self.base_on and not (climber.grounded or climber.wall_pending or climber.falling)
+        height = climber.peak if climbing and climber.week_pct is not None else None
+        resets = journalcore.week_resets(self.journal, now, limits.get("seven_day_reset") if limits else None)
+        return [journalcore.week_summary(self.journal, reset, now, self.walls, height) for reset in resets]
+
     def show_base_menu(self, pos):
         self.hide_card()
         menu = QMenu()
+        menu.addAction("등반 일지", self.open_journal)
+        menu.addSeparator()
         menu.addAction(self.climb_action(menu))
         events = QAction("추락 이벤트 (미끄러짐·낙석·로프 추락)", menu, checkable=True, checked=self.climb_events_enabled())
         events.triggered.connect(self.set_climb_events)

@@ -714,6 +714,7 @@ class Climber:
         self.stall = 0              # 제자리 (손발 높이 합이 안 오름) 로 이어진 손발 동작 수
         self.best_top = -1e9        # 손발 높이 합의 최고 기록
         self.moves, self.grabs, self.actions = [], [], []
+        self.tally = collections.Counter()   # 등반 일지 (journalcore.TALLY) 에 셀 일: crux, dyno (일 끝냄), fall, nap
         self.falling = False        # 벽의 끝으로 떨어지는 중 (카메라가 몸에 붙어 따라 내려간다)
         self.rope_cut = None        # 끊어진 줄이 남은 퀵드로 자리 (벽의 끝)
         self.wall_pending = False   # 벽이 끝나 새 벽을 기다린다 (떨어지는 장면을 아직 안 보였다)
@@ -1145,6 +1146,11 @@ class Climber:
         self.banner = None
         if target >= HIGH:
             self.drops = []   # 구름 위로 건너뛰면 아래에서 내리던 비·눈은 없다
+
+    def take_tally(self):
+        """지난번 뒤로 센 일 (넘은 크럭스, 일 끝냄 다이노, 로프 추락, 낮잠) 을 넘기고 비운다 (등반 일지)."""
+        tally, self.tally = self.tally, collections.Counter()
+        return tally
 
     def snapshot(self):
         """저장할 기록: 높이 (이번 길에서 가장 높이 올라간 자리), 최고 높이, 쌓인 높이, 받은 토큰 합."""
@@ -2509,6 +2515,7 @@ class Climber:
         if not clipped:
             return
         self.actions.append("fall")
+        self.tally["fall"] += 1
         top = max(clipped, key=lambda b: b.p.y)
         anchor = top.rope_point()
         self.rope = (anchor, (self.harness() - anchor).len() + 0.8)
@@ -2672,6 +2679,8 @@ class Climber:
         """다이노: 웅크렸다가 튀어 올라 멀리 있는 홀드 (jug, 없으면 dyno_jug) 를 두 손으로 잡고, 매달려 흔들리다
         발을 올린다. show 면 오른 높이를 글자로 띄운다 (세션이 일을 끝낼 때)."""
         self.actions.append(label or ("dyno" if show else "dyno_sprint"))
+        if show and label is None:
+            self.tally["dyno"] += 1
         self.charging = not show    # 일 끝냄 다이노는 덤 (brain 이 다음 동작 전에 되돌린다)
         hands = [self.limbs["LH"], self.limbs["RH"]]
         feet = [self.limbs["LF"], self.limbs["RF"]]
@@ -2856,6 +2865,7 @@ class Climber:
             yield from self.wait(0.9 if pace == 1 else 0.4, stoppable=False)
         yield from self.dyno(show=False, jug=jug, label="crux_dyno")
         self.crux_log.append((tries, approach))
+        self.tally["crux"] += 1
         self.texts.append(Float(jug.p + V(0, 0.8), "크럭스!"))
         if pace <= 2:
             yield from self.fist_pump("RH" if jug.p.x < 0 else "LH")   # 벽 안쪽 손으로
@@ -2928,6 +2938,8 @@ class Climber:
             return   # 이미 자고 있거나 펴는 중이거나 (같은 신호가 두 번 왔다), 그사이 체력이 돌아왔다
         self.nap = nap
         self.actions.append("nap" if nap else "exhaust")
+        if nap:   # 사용량 잠은 일지가 5시간 창이 다 찬 횟수로 센다
+            self.tally["nap"] += 1
         side = 1 if self.body.x < 0 else -1   # 넓은 쪽에 편다
         ax = max(-WALL_HALF + 1.2, min(WALL_HALF - 1.2, self.body.x + side * 0.9))
         ledge = self.ledge = Ledge(V(ax, self.body.y + 1.9))

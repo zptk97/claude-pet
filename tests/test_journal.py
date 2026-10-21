@@ -213,5 +213,225 @@ class BackfillTest(unittest.TestCase):
         self.assertEqual(no_time, ("x", 5, None))
 
 
+
+
+W = journalcore.WEEK_S
+START = RW - W         # 2026-10-15 08:00 KST, 이번 주 시작
+
+
+def usd(dollars):
+    return dollars / climbcore.TOKEN_USD
+
+
+def week(reset=RW, peak=40, full=None, **extra):
+    return {"reset": reset, "peak": peak, "first": reset - W + H, "last": reset - W + 2 * H, "full": full, **extra}
+
+
+def window(begin, peak, full=None):
+    return {"reset": begin + 5 * H, "peak": peak, "first": begin, "last": begin + H, "full": full}
+
+
+class SummaryTest(unittest.TestCase):
+    """일지 창 한 쪽: 하루 칸은 리셋 시각부터, 그 주에 시작한 5시간 창, 남긴 몫·배수."""
+
+    def test_days_split_at_the_reset_hour(self):
+        j = journalcore.new(0)
+        for at, dollars in ((START - H, 9), (START, 1), (START + 23 * H, 2), (START + 24 * H, 4),
+                            (RW - H, 8), (RW, 16), (START + 30 * H, 0.2)):
+            j["hours"][journalcore.hour_key(at)] = usd(dollars)
+        s = journalcore.week_summary(j, RW, RW + 10 * W)
+        self.assertEqual([round(d, 6) for d in s["days"]], [3, 4.2, 0, 0, 0, 0, 8])
+        self.assertAlmostEqual(s["usd"], 15.2)
+        self.assertEqual(s["work_hours"], 4)   # $0.5 아래 칸은 빼고
+        self.assertEqual(datetime.fromtimestamp(s["start"], KST).strftime("%m/%d %H"), "10/15 08")
+
+    def test_windows_in_the_week_and_blocked_time(self):
+        j = journalcore.new(0)
+        j["weeks"] = [week()]
+        j["windows"] = [window(START - 2 * H, 100, full=START + H),     # 지난주에 시작: 빼고
+                        window(START + 10 * H, 100, full=START + 13 * H),
+                        window(START + 30 * H, 45),
+                        window(RW - 3 * H, 100, full=RW - 2 * H)]       # 지금 열린 창
+        now = RW - H
+        s = journalcore.week_summary(j, RW, now)
+        self.assertEqual([w["peak"] for w in s["windows"]], [100, 45, 100])
+        self.assertEqual(s["full_windows"], 2)
+        self.assertEqual(s["blocked"], 2 * H + H)   # 다 찬 뒤 리셋까지, 열린 창은 지금까지
+
+    def test_left_share_rate_and_plan_multiple(self):
+        j = journalcore.new(0)
+        j["weeks"] = [week(peak=40)]
+        j["hours"][journalcore.hour_key(START + 5 * H)] = usd(520)
+        s = journalcore.week_summary(j, RW, RW + H)
+        self.assertAlmostEqual(s["rate"], 13)
+        self.assertEqual(s["left_pct"], 60)
+        self.assertAlmostEqual(s["left_usd"], 780)
+        self.assertAlmostEqual(journalcore.PLAN_WEEK_USD, 100 * 12 / 52)
+        self.assertAlmostEqual(s["multiple"], 520 / (100 * 12 / 52))
+        self.assertAlmostEqual(s["height"], climbcore.week_height(40))
+        self.assertEqual(s["end"], (None, None))
+
+    def test_rate_from_other_weeks_when_this_one_is_small(self):
+        j = journalcore.new(0)
+        j["weeks"] = [week(reset=RW - W, peak=50), week(peak=2)]
+        j["hours"][journalcore.hour_key(START - W + H)] = usd(600)
+        j["hours"][journalcore.hour_key(START + H)] = usd(100)
+        self.assertAlmostEqual(journalcore.week_summary(j, RW, RW + H)["rate"], 12)   # 지난주 $600 / 50%
+        empty = journalcore.new(0)
+        self.assertAlmostEqual(journalcore.week_summary(empty, RW, RW + H)["rate"], climbcore.WEEK_RATE * climbcore.TOKEN_USD)
+
+    def test_money_only_week(self):
+        j = journalcore.new(0)
+        j["hours"][journalcore.hour_key(START + H)] = usd(80)
+        s = journalcore.week_summary(j, RW, RW + H)
+        self.assertIsNone(s["pct"])
+        self.assertIsNone(s["left_usd"])
+        self.assertIsNone(s["height"])
+        self.assertEqual(s["diagnosis"], "주간 사용량 % 를 기록하기 전이라 금액만 있어요")
+
+    def test_walls_and_how_the_week_ended(self):
+        j = journalcore.new(0)
+        j["weeks"] = [week(reset=RW - W, peak=70), week(peak=100, full=RW - 18 * H)]
+        walls = [{"end": RW - W + 60, "height": 9000.0, "reason": "reset"},
+                 {"end": RW - 18 * H, "height": climbcore.MOON, "reason": "full"}]
+        last = journalcore.week_summary(j, RW - W, RW + H, walls)
+        self.assertEqual(last["end"], ("reset", RW - W + 60))
+        self.assertAlmostEqual(last["height"], climbcore.week_height(70))
+        this = journalcore.week_summary(j, RW, RW - H, walls, height=1234.0)
+        self.assertEqual(this["end"], ("moon", RW - 18 * H))
+        self.assertEqual(this["height"], 1234.0)   # 이번 주는 아바타 높이
+        going = journalcore.week_summary(journalcore.new(0), RW, RW - H)
+        self.assertEqual(going["end"], ("going", RW))
+
+
+class DiagnoseTest(unittest.TestCase):
+    """한 줄 진단: 위에서부터 맞는 것 하나."""
+
+    def summary(self, now, peak, full=None, windows=(), spent=100):
+        j = journalcore.new(0)
+        j["weeks"] = [week(peak=peak, full=full)]
+        j["windows"] = list(windows)
+        j["hours"][journalcore.hour_key(START + H)] = usd(spent)
+        return journalcore.week_summary(j, RW, now)
+
+    def test_this_week(self):
+        full = self.summary(RW - 18 * H, 100, full=RW - 30 * H)
+        self.assertEqual(full["diagnosis"], f"{journalcore.when(RW - 30 * H)}에 다 썼어요, 리셋까지 18시간 달에서 쉬어요")
+        fast = self.summary(START + 3 * 86400, 60)   # 하루 20% → 이틀 뒤 다 씀
+        self.assertAlmostEqual(fast["eta"], START + 5 * 86400)
+        self.assertEqual(fast["diagnosis"], f"이 빠르기면 {journalcore.when(START + 5 * 86400)}쯤 다 써요")
+        slow = self.summary(START + 4 * 86400, 20)   # 하루 5% → 리셋 때 35%
+        self.assertAlmostEqual(slow["projected"], 35)
+        self.assertEqual(slow["diagnosis"], "이 빠르기면 주간 약 35%로 끝나요")
+        early = self.summary(START + 12 * H, 5, spent=65)   # 하루가 안 지나면 가늠하지 않는다
+        self.assertEqual(early["diagnosis"], "주간 5% 썼어요, 남은 95% ≈ $1,235어치")
+
+    def test_past_weeks(self):
+        later = RW + H
+        full = self.summary(later, 100, full=RW - 18 * H)
+        self.assertEqual(full["diagnosis"], f"{journalcore.when(RW - 18 * H)}에 다 써서 18시간 막혔어요")
+        crowded = self.summary(later, 80, windows=[window(START + i * 20 * H, 100, full=START + i * 20 * H + 4 * H)
+                                                   for i in range(3)])
+        self.assertEqual(crowded["diagnosis"], "5시간 창이 3번 다 찼어요, 몰아 쓰는 편이에요")
+        low = self.summary(later, 38, spent=380)
+        self.assertEqual(low["diagnosis"], "주간 한도의 38%만 썼어요, $620어치 남겼어요")
+        plenty = self.summary(later, 72, spent=720)
+        self.assertEqual(plenty["diagnosis"], "주간 72% 썼어요, $280어치 남겼어요")
+
+    def test_time_words(self):
+        self.assertEqual(journalcore.when(kst(2026, 10, 21, 14, 20)), "수 14:20")
+        self.assertEqual(journalcore.span(18 * H), "18시간")
+        self.assertEqual(journalcore.span(H + 20 * 60), "1시간 20분")
+        self.assertEqual(journalcore.span(27 * H), "1일 3시간")
+        self.assertEqual(journalcore.span(40 * 60 - 5), "40분")
+
+
+class PagesTest(unittest.TestCase):
+    """넘겨 볼 주: 이번 주부터 기록이 있는 주까지, 기록된 주의 리셋 시각으로."""
+
+    def test_weeks_back_to_the_oldest_record(self):
+        j = journalcore.new(0)
+        j["weeks"] = [week(reset=RW + 60)]   # 리셋 시각이 1분 흔들려도 같은 주
+        j["hours"][journalcore.hour_key(START - 2 * W + H)] = usd(5)
+        now = RW - H
+        self.assertEqual(journalcore.week_resets(j, now, RW), [RW + 60 - 2 * W, RW + 60 - W, RW + 60])   # 시간 칸은 2주 전 주
+        self.assertEqual(journalcore.week_resets(j, RW + 2 * W + H)[-1], RW + 60 + 3 * W)   # 지난 리셋에서 7일씩
+        self.assertEqual(journalcore.week_resets(journalcore.new(0), now), [])
+        self.assertEqual(journalcore.week_resets(journalcore.new(now), now, RW), [RW])
+
+    def test_keep_window(self):
+        j = journalcore.new(0)
+        j["hours"][journalcore.hour_key(RW - 30 * W)] = usd(5)
+        resets = journalcore.week_resets(j, RW - H, RW)
+        self.assertEqual(len(resets), journalcore.KEEP_S // W)   # 시작이 지울 때보다 앞인 (덜 찬) 주는 빼고
+        self.assertGreaterEqual(resets[0] - W, RW - H - journalcore.KEEP_S)
+
+    def test_reset_day_moved(self):
+        """리셋 요일이 바뀌어도 (목 08시 → 월 10시) 지난 주는 기록된 리셋으로."""
+        j = journalcore.new(0)
+        monday = RW + 4 * 86400 + 2 * H
+        j["weeks"] = [week(reset=RW - W, peak=60), week(reset=RW, peak=70), week(reset=monday, peak=10)]
+        resets = journalcore.week_resets(j, monday - H, monday)
+        self.assertEqual(resets[-3:], [RW - W, RW, monday])
+        self.assertEqual([journalcore.week_summary(j, r, monday - H)["pct"] for r in resets[-3:]], [60, 70, 10])
+
+    def test_bad_reset_values(self):
+        j = journalcore.new(0)
+        now = RW - H
+        for bad in (float("inf"), float("nan"), RW * 1000, RW + 1000 * W, True, "x"):
+            self.assertEqual(journalcore.week_resets(j, now, bad), [], bad)
+        j["weeks"] = [week()]
+        self.assertEqual(journalcore.week_resets(j, now, RW * 1000), [RW])   # 일지의 주로
+
+    def test_hour_buckets_with_jittery_resets(self):
+        """리셋이 몇 초 흔들려도 시간 칸은 한 주에만, 빠짐없이."""
+        j = journalcore.new(0)
+        j["weeks"] = [week(reset=RW - W - 10), week(reset=RW + 10)]
+        for at in (RW - W - H, RW - W, RW - W + H, RW - H):
+            j["hours"][journalcore.hour_key(at)] = usd(10)
+        old = journalcore.week_summary(j, RW - W - 10, RW)
+        new = journalcore.week_summary(j, RW + 10, RW)
+        self.assertAlmostEqual(old["usd"] + new["usd"], 40)
+        self.assertAlmostEqual(new["usd"], 30)   # 08:00 칸은 새 주
+        self.assertAlmostEqual(new["days"][0], 20)
+
+
+class TallyTest(unittest.TestCase):
+    """등반 횟수: 아바타가 세고, 일지는 그때 든 주에 더한다."""
+
+    def test_add_to_the_current_week_and_restore(self):
+        j = journalcore.new(0)
+        self.assertFalse(journalcore.add_tally(j, {"crux": 1}, RW - H))   # 주를 모르면 버린다
+        j["weeks"] = [week(reset=RW - W), week()]
+        self.assertTrue(journalcore.add_tally(j, {"crux": 2, "fall": 1, "jump": 5}, RW - H))
+        self.assertTrue(journalcore.add_tally(j, {"crux": 1, "dyno": 0}, RW - 2 * H))
+        self.assertFalse(journalcore.add_tally(j, {}, RW - H))
+        self.assertEqual(j["weeks"][1]["climb"], {"crux": 3, "fall": 1})
+        self.assertNotIn("climb", j["weeks"][0])
+        data = json.loads(json.dumps(journalcore.state(j)))
+        data["weeks"][1]["climb"].update({"nap": True, "sleep": -1, "bogus": 3})
+        self.assertEqual(journalcore.restore(data, RW)["weeks"][1]["climb"], {"crux": 3, "fall": 1})
+        self.assertEqual(journalcore.week_summary(j, RW, RW - H)["climb"], {"crux": 3, "fall": 1})
+
+    def test_climber_counts(self):
+        sim = climbcore.Climber(seed=3)
+        sim.work = 1
+        for _ in range(60 * 8):
+            sim.update(1 / 60)
+        sim.signal("dyno")
+        for _ in range(60 * 8):
+            sim.update(1 / 60)
+        sim.hp = 0
+        sim.signal("exhaust")   # 사용량 잠은 세지 않는다 (5시간 창이 다 찬 횟수)
+        for _ in range(60 * 8):
+            sim.update(1 / 60)
+        self.assertTrue(sim.sleeping)
+        self.assertEqual(sim.take_tally(), {"dyno": 1})
+        self.assertEqual(sim.take_tally(), {})
+        nap = climbcore.Climber(seed=4)
+        next(nap.exhaust(nap=True))
+        self.assertEqual(nap.take_tally(), {"nap": 1})
+
+
 if __name__ == "__main__":
     unittest.main()
