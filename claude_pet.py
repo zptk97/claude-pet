@@ -1905,6 +1905,11 @@ class PetManager(QObject):
             self.journal_dirty = True
         week = self.check_week(limits, now)
         self.climber.set_week(*journalcore.week_scale(self.journal, limits, now / 1000))   # 높이는 주간 % 의 가속 눈금
+        records = []   # 지난 주들에 오른 높이는 이번 주에 따라잡을 기록 랜드마크 (높이가 주간 % 눈금일 때만)
+        if self.climber.week_pct is not None:
+            records = journalcore.past_reach(self.journal, now / 1000, limits.get("seven_day_reset") if limits else None,
+                                             self.walls)
+        self.climber.set_records(records)
         team = None
         if self.climb_enabled() and self.order:
             team = petcore.team_hp(limits, now)
@@ -1948,13 +1953,14 @@ class PetManager(QObject):
         한 주기에 한 번 (petcore.week_end, 기록 파일에 남긴다). 끝난 벽은 walls 에 쌓는다.
         끝났으면 그 까닭 ("full"/"reset"), 아니면 None."""
         state, reason = petcore.week_end(self.week, limits, now / 1000)
+        cycle = self.week.get("seen") if reason == "reset" else state.get("ended")   # 끝낸 주기 (리셋 시각)
         changed, self.week = state != self.week, state
         climber = self.climber
         locked = petcore.week_locked(limits, now)
         visible = self.base_on and self.base is not None and self.base.isVisible()
         if reason is not None and not climber.wall_pending:   # 떨어지는 장면을 기다리는 중이면 한 번으로
             height = climbcore.MOON if reason == "full" else round(max(climber.peak, climber.shown_altitude()), 1)
-            self.walls.append({"end": round(now / 1000), "height": height, "reason": reason})
+            self.walls.append({"end": round(now / 1000), "height": height, "reason": reason, "cycle": cycle})
             del self.walls[:-WALLS_KEEP]
             if reason == "full":   # 주간 사용량을 다 썼다: 기둥 위 끝 달에 올라 리셋까지 쉰다
                 climber.reach_moon(animate=visible)

@@ -396,6 +396,52 @@ class PagesTest(unittest.TestCase):
         self.assertAlmostEqual(new["days"][0], 20)
 
 
+class ReachTest(unittest.TestCase):
+    """지난 주들에 오른 높이 (기록 랜드마크): 일지 창의 높이와 같은 규칙, 넘겨 보는 주와 같은 이름."""
+
+    def test_reach_of_a_week(self):
+        j = journalcore.new(0)
+        j["weeks"] = [week(reset=RW - 2 * W, peak=100, full=RW - 2 * W - H), week(reset=RW - W, peak=40)]
+        walls = [{"end": RW - 2 * H, "height": 1234.5, "reason": "full"}]
+        self.assertEqual(journalcore.reach(j, RW - 2 * W), climbcore.MOON)
+        self.assertEqual(journalcore.reach(j, RW - W + 60), climbcore.week_height(40))   # 리셋이 흔들려도 같은 주
+        self.assertEqual(journalcore.reach(j, RW, walls), 1234.5)   # % 가 없으면 그 주에 끝난 벽
+        self.assertIsNone(journalcore.reach(j, RW))
+        self.assertEqual(journalcore.week_summary(j, RW - W, RW - H)["height"], climbcore.week_height(40))
+
+    def test_past_weeks(self):
+        j = journalcore.new(0)
+        j["weeks"] = [week(reset=RW - n * W, peak=10 * n) for n in (1, 3, 4, 5)] + [week(reset=RW, peak=5)]
+        now = RW - H
+        self.assertEqual(journalcore.past_reach(j, now, RW),   # 2주 전은 기록이 없어 빠지고, 5주 전은 4주 밖
+                         [("지난주", climbcore.week_height(10)), ("3주 전", climbcore.week_height(30)),
+                          ("4주 전", climbcore.week_height(40))])
+        self.assertEqual(journalcore.past_reach(j, now, RW, weeks=1), [("지난주", climbcore.week_height(10))])
+        self.assertEqual(journalcore.past_reach(j, RW + H, RW + W)[0], ("지난주", climbcore.week_height(5)))   # 리셋 뒤
+        self.assertEqual(journalcore.past_reach(journalcore.new(0), now, RW), [])
+        self.assertEqual([journalcore.weeks_ago(n) for n in (1, 2, 4)], ["지난주", "2주 전", "4주 전"])
+
+    def test_week_just_ended_with_a_late_reset(self):
+        """일지의 주가 리셋을 1분 늦게 들고 있어도, 리셋 바로 뒤 그 주는 지난주."""
+        j = journalcore.new(0)
+        j["weeks"] = [week(reset=RW - W, peak=20), week(reset=RW + 59, peak=30)]
+        self.assertEqual(journalcore.past_reach(j, RW + 10, RW + W),
+                         [("지난주", climbcore.week_height(30)), ("2주 전", climbcore.week_height(20))])
+
+    def test_wall_of_the_cycle_it_ended(self):
+        """펫이 한 주 넘게 꺼져 있다 늦게 끝낸 벽은 끝낸 주기 (cycle) 의 주에."""
+        j = journalcore.new(0)
+        walls = [{"end": RW + 3 * 86400, "height": 777.0, "reason": "reset", "cycle": RW - W}]
+        self.assertEqual(journalcore.reach(j, RW - W, walls), 777.0)
+        self.assertIsNone(journalcore.reach(j, RW, walls))
+        self.assertEqual(journalcore.reach(j, RW, [dict(walls[0], cycle=None)]), 777.0)   # cycle 없는 옛 기록은 끝난 때로
+
+    def test_broken_hour_keys(self):
+        j = journalcore.restore({"hours": {"2026-10-00T10": 5.0, "2026-10-20T25": 5.0, "2026-10-20T10": 5.0}}, RW)
+        self.assertEqual(list(j["hours"]), ["2026-10-20T10"])
+        self.assertTrue(journalcore.week_resets(j, RW - H, RW))
+
+
 class TallyTest(unittest.TestCase):
     """등반 횟수: 아바타가 세고, 일지는 그때 든 주에 더한다."""
 

@@ -109,6 +109,7 @@ SCALE_K = math.log(3843) / 50                 # 가속 눈금: 높이 = SCALE_A 
 SCALE_A = MOON / math.expm1(100 * SCALE_K)    # 약 26m
 WEEK_RATE = 13.4 / TOKEN_USD                  # 주간 1% 에 드는 토큰 (출력 환산) 을 모를 때 (2026-10 기록에서 1% 에 약 $13.4)
 PCT_STEP = 0.98                               # 주간 % 사이를 토큰으로 채울 때 다음 % 의 이만큼 앞까지
+CARVE_GAP = 1.8                               # 지난 주 기록 자국이 이만큼 (m) 안에 있으면 새 자국 글자는 다른 쪽에 (겹치지 않게)
 PCT_EASE = (1.5, 0.3)                         # 보이는 주간 % 가 따라붙는 빠르기: 남은 만큼의 비율 (1/s), 가장 느릴 때 (%/s)
 LAST_ROOM = 0.3                               # 남은 오를 높이가 이보다 적은데 가까운 홀드가 없으면 멈추고 다음 토큰과 합쳐 오른다
 COOLDOWN = {"dyno": 8.0, "chalk": 15.0}      # 잦은 신호는 이 간격 (초) 안이면 버린다 (일 끝냄 → 다이노, 사용량 → 초크)
@@ -663,7 +664,10 @@ class Climber:
         self.week_tokens = 0.0      # 계정 주간 % 를 마지막으로 받은 뒤 (오르거나 처음) 받은 토큰 (% 사이를 채운다)
         self.pct_shown = 0.0        # 보이는 주간 % (가속 눈금 높이는 이것으로)
         self.peak = 0.0             # 가장 높이 올라간 높이 (기록은 이걸로 센다)
-        self.passed = 0             # 넘은 기록 수 (MILESTONES 앞에서부터)
+        self.passed = 0             # 넘은 기록 수 (landmarks 앞에서부터)
+        self.records = []           # 지난 주들에 오른 높이 (set_records): (높이, 짧은 이름, 말풍선, (새길 이름, 높이 글자))
+        self.landmarks = MILESTONES  # 넘을 기록: MILESTONES 에 records 를 높이 순으로 섞은 것
+        self.carved = []            # 넘으며 바위에 새긴 지난 주 기록 (벽 y, 글자 쪽 -1/1, 이름, 높이 글자). 새 벽이면 지운다
         self.banner = None          # [말풍선, 나이]
         self.banners = []           # 넘은 기록 높이 (검사용)
         self.drop_scale = 1.0       # 창이 넓으면 빗방울도 그만큼 많이 (Look 이 정한다)
@@ -858,7 +862,7 @@ class Climber:
         self.sit(x)
         self.clear_above_moon(gripped=False)
         self.cam = self.body.y + 0.45
-        self.pct_shown, self.peak, self.passed = 100.0, float(MOON), len(MILESTONES)
+        self.pct_shown, self.peak, self.passed = 100.0, float(MOON), len(self.landmarks)
 
     def clear_above_moon(self, gripped=True):
         """달 표면 위의 홀드·볼트를 치운다 (gripped 면 잡고 있는 홀드는 둔다)."""
@@ -1114,10 +1118,12 @@ class Climber:
             self.rebase(min(self.pct_shown, self.week_target()))
 
     def rebase(self, pct):
-        """보이는 주간 % 를 pct 로 낮추고 최고 높이와 넘은 기록도 거기에 맞춘다 (말풍선 없이)."""
+        """보이는 주간 % 를 pct 로 낮추고 최고 높이와 넘은 기록도 거기에 맞춘다 (말풍선 없이). 새 주에 다시 따라잡을
+        지난 주 기록 자국은 지운다."""
         self.pct_shown = pct
         self.peak = min(self.peak, week_height(pct))
-        self.passed = sum(1 for m in MILESTONES if m[0] <= self.peak)
+        self.passed = self.count_passed()
+        self.carved = []
 
     def week_target(self):
         """보일 주간 %: 계정 값에 그 뒤 받은 토큰만큼 (다음 % 는 넘지 않게)."""
@@ -1142,8 +1148,9 @@ class Climber:
         self.top_y = self.body.y
         self.pct_shown = height_pct(target)
         self.peak = max(target, peak or 0.0)
-        self.passed = sum(1 for m in MILESTONES if m[0] <= self.peak)
+        self.passed = self.count_passed()
         self.banner = None
+        self.carved = []
         if target >= HIGH:
             self.drops = []   # 구름 위로 건너뛰면 아래에서 내리던 비·눈은 없다
 
@@ -1182,7 +1189,30 @@ class Climber:
             self.new_wall(grounded=True, banner=False)
 
     def next_milestone(self):
-        return MILESTONES[self.passed] if self.passed < len(MILESTONES) else None
+        return self.landmarks[self.passed] if self.passed < len(self.landmarks) else None
+
+    def count_passed(self):
+        """최고 높이까지의 기록 수. 기록 파일은 높이를 0.01m 로 반올림해서 그만큼 너그럽게 (다시 켠 뒤 같은 % 에서 끝난
+        지난 주 기록을 또 넘지 않게)."""
+        return sum(1 for m in self.landmarks if m[0] <= self.peak + 0.01)
+
+    def set_records(self, records):
+        """지난 주들에 오른 높이 [(이름 '지난주'·'2주 전'…, 높이 m)] (journalcore.past_reach) 를 랜드마크에 섞는다. 높이
+        글자가 같으면 하나로 묶고, 0 이하나 달 (달 도착 장면이 따로 있다) 은 뺀다. 지금 최고 높이 아래 기록은 말풍선 없이
+        넘은 걸로 친다. 지난주가 51% 로 끝났으면 이번 주도 51% 에서 닿아서 '넘었어요' 대신 '따라잡았어요'."""
+        merged = {}
+        for name, height in records:
+            if 0 < height < MOON:
+                mark = merged.setdefault(fmt_alt(height), [height, []])
+                mark[0] = min(mark[0], height)
+                mark[1].append(name)
+        marks = sorted((height, f"{'·'.join(names)} 기록", f"{'·'.join(names)} 기록({label})을 따라잡았어요!",
+                        ("·".join(names), label)) for label, (height, names) in merged.items())
+        if marks == self.records:
+            return
+        self.records = marks
+        self.landmarks = sorted(MILESTONES + marks, key=lambda m: (m[0], len(m) == 3))   # 같은 높이면 지난 주 기록 먼저
+        self.passed = self.count_passed()
 
     def precip(self):
         """비·눈의 양 (흐림까지는 0, 구름 위로는 없다)."""
@@ -1768,7 +1798,7 @@ class Climber:
                 self.texts.append(Float(self.body + V(-0.5 * self.face, 1.0), self.wrng.choice(("z", "Z")), "z"))
 
     def move_milestones(self, dt):
-        """기록을 넘으면 말풍선과 색종이. 같은 기록은 한 번만."""
+        """기록을 넘으면 말풍선과 색종이 (지난 주 기록이면 그 자리 바위에 자국도). 같은 기록은 한 번만."""
         if self.banner is not None:
             self.banner[1] += dt
             if self.banner[1] > 3.5:
@@ -1778,14 +1808,22 @@ class Climber:
             return
         self.peak = alt
         quiet = self.scaled() and self.week_target() - self.pct_shown > 1.0   # 멀리서 따라붙는 중이면 조용히 넘는다
-        while self.passed < len(MILESTONES) and alt >= MILESTONES[self.passed][0]:
-            height, name, text = MILESTONES[self.passed]
+        record = False   # 같은 때 넘은 기록들 중에서는 지난 주 기록 말풍선을 남긴다
+        while self.passed < len(self.landmarks) and alt >= self.landmarks[self.passed][0]:
+            height, name, text, *carve = self.landmarks[self.passed]
             self.passed += 1
             if quiet:
                 continue
-            self.banner = [text, 0.0]
+            if carve or not record:
+                self.banner = [text, 0.0]
             self.banners.append(height)
             self.confetti(26)
+            if carve:   # 지난 주 기록은 닿은 자리 바위에 새긴다 (글자는 몸 반대쪽, 가까운 자국이 그쪽에 있으면 다른 쪽)
+                record = True
+                side = 1 if self.body.x < 0 else -1
+                if any(abs(y - self.body.y) < CARVE_GAP and other == side for y, other, *_ in self.carved):
+                    side = -side
+                self.carved.append((self.body.y, side, *carve[0]))
 
     def confetti(self, n):
         for _ in range(n):

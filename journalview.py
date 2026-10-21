@@ -184,7 +184,7 @@ class JournalWindow(QWidget):
             p.setFont(self.text_font)
             p.setPen(TEXT if enabled else QColor(255, 255, 255, 50))
             p.drawText(rect, Qt.AlignCenter, label)
-        title = "이번 주" if s["current"] else "지난주" if self.back == 1 else f"{self.back}주 전"
+        title = "이번 주" if s["current"] else journalcore.weeks_ago(self.back)
         x, width = pad + arrow + self.px(6), inner - 2 * (arrow + self.px(6))
         y += self.text(p, self.title_font, TEXT, x, y, title, width, Qt.AlignHCenter)
         y += self.text(p, self.small_font, MUTED, x, y + 2, f"{day_label(s['start'])} ~ {day_label(s['reset'])}",

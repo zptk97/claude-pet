@@ -1041,6 +1041,102 @@ class ScaleTest(unittest.TestCase):
         self.assertTrue(sim.grounded)
 
 
+class RecordTest(unittest.TestCase):
+    """지난 주들에 오른 높이: 랜드마크에 섞여 다음 목표가 되고, 닿으면 말풍선과 바위에 새긴 자국."""
+
+    def climber(self, pct, seed=4):
+        sim = Climber(seed)
+        sim.tokens_on, sim.work = False, 1
+        sim.set_week(pct, 1000.0)
+        run(sim, 4.0)
+        return sim
+
+    def test_records_mix_into_landmarks(self):
+        H = climbcore.week_height
+        sim = Climber(4)
+        sim.set_records([("지난주", H(40)), ("2주 전", H(30)), ("3주 전", H(40)), ("4주 전", climbcore.MOON),
+                         ("5주 전", 0.0)])
+        self.assertEqual([m[1] for m in sim.records], ["2주 전 기록", "지난주·3주 전 기록"])   # 같은 높이는 묶고 달·0 은 빼고
+        self.assertEqual(sim.records[1][2:], ("지난주·3주 전 기록(19.2km)을 따라잡았어요!", ("지난주·3주 전", "19.2km")))
+        heights = [m[0] for m in sim.landmarks]
+        self.assertEqual(heights, sorted(heights))
+        self.assertEqual(len(sim.landmarks), len(climbcore.MILESTONES) + 2)
+        sim.set_records([])
+        self.assertEqual(sim.landmarks, climbcore.MILESTONES)
+
+    def test_reaching_a_record(self):
+        H = climbcore.week_height
+        sim = self.climber(39)
+        sim.set_records([("지난주", H(40))])
+        self.assertEqual(sim.next_milestone()[1], "지난주 기록")   # 높이 상자의 '다음:'
+        self.assertEqual(sim.carved, [])
+        sim.set_week(40)
+        run(sim, 2.0)
+        self.assertIn(H(40), sim.banners)
+        self.assertEqual(len(sim.carved), 1)
+        y, side, name, alt = sim.carved[0]
+        self.assertEqual((name, alt), ("지난주", "19.2km"))
+        self.assertLess(abs(y - sim.body.y), 1.0)   # 닿은 자리 바위에
+        self.assertIn(side, (-1, 1))
+        sim.end_wall(animate=False, locked=False)   # 새 벽이면 지운다
+        self.assertEqual(sim.carved, [])
+
+    def test_quiet_records(self):
+        H = climbcore.week_height
+        high = self.climber(45)
+        high.set_records([("지난주", H(40))])   # 이미 넘은 높이: 말풍선 없이 넘은 걸로
+        run(high, 2.0)
+        self.assertNotIn(H(40), high.banners)
+        self.assertEqual(high.passed, sum(1 for m in high.landmarks if m[0] <= high.peak))
+        self.assertNotEqual(high.next_milestone()[1], "지난주 기록")
+        far = self.climber(10)
+        far.set_records([("지난주", H(20))])
+        far.set_week(30)   # 멀리서 따라붙는 동안은 기존 랜드마크처럼 조용히
+        run(far, 8.0)
+        self.assertNotIn(H(20), far.banners)
+        self.assertEqual(far.carved, [])
+        moon = self.climber(99)
+        moon.set_records([("지난주", H(60))])
+        moon.reach_moon(animate=False)
+        self.assertIsNone(moon.next_milestone())
+
+    def test_restart_and_new_week(self):
+        H = climbcore.week_height
+        for pct in (6, 7, 11, 14, 51):   # 기록 파일의 0.01m 반올림으로 최고 높이가 기록보다 조금 낮아지는 %
+            sim = self.climber(pct - 1)
+            sim.set_records([("지난주", H(pct))])
+            sim.set_week(pct)
+            run(sim, 2.0)
+            self.assertEqual(sim.banners.count(H(pct)), 1, pct)
+            again = Climber(5)
+            again.tokens_on, again.work = False, 1
+            again.restore(json.loads(json.dumps(sim.snapshot())))
+            again.set_week(pct, 1000.0)
+            again.set_records([("지난주", H(pct))])
+            run(again, 2.0)
+            self.assertNotIn(H(pct), again.banners, pct)   # 다시 켜도 또 따라잡지 않는다
+            self.assertEqual(again.carved, [])
+        sim.rebase(10.0)   # 벽이 끝나지 않은 채 새 주: 다시 따라잡을 기록의 자국은 지운다
+        self.assertEqual(sim.carved, [])
+
+    def test_same_height_as_a_milestone_and_close_marks(self):
+        H = climbcore.week_height
+        sim = self.climber(49)
+        sim.set_records([("지난주", H(50))])   # 카르만 선 (100km) 과 같은 높이
+        self.assertEqual(sim.next_milestone()[1], "지난주 기록")
+        sim.set_week(50)
+        run(sim, 2.0)
+        self.assertEqual(sim.banners[-2:], [H(50), 100000])
+        self.assertTrue(sim.banner[0].startswith("지난주 기록"))   # 같은 때 넘으면 지난 주 기록 말풍선을 남긴다
+        close = self.climber(30)
+        close.set_records([("지난주", H(31)), ("2주 전", H(31.5))])
+        close.set_week(32)   # 한꺼번에 넘어 같은 자리에 새긴다
+        run(close, 3.0)
+        self.assertEqual(len(close.carved), 2)
+        self.assertLess(abs(close.carved[0][0] - close.carved[1][0]), climbcore.CARVE_GAP)
+        self.assertNotEqual(close.carved[0][1], close.carved[1][1])   # 글자는 서로 다른 쪽
+
+
 class MoonTest(unittest.TestCase):
     """주간 사용량 100%: 기둥 위 끝 달에 올라서 깃발을 꽂고 리셋까지 쉬다가, 리셋이면 뛰어내려 지구로 떨어진다."""
 

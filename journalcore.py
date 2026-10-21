@@ -13,7 +13,8 @@
      "windows": [{"reset": <epoch 초>, "peak": 72, "first": <초>, "last": <초>, "full": <초 또는 null>}, ...],
      "weeks": [같은 꼴, 등반 횟수 "climb": {"crux": 3, ...}], "hours": {"2026-10-20T14": <출력 환산 토큰>, ...}}
 
-일지 창 (journalview) 은 week_resets 로 넘길 주를 고르고 week_summary 로 한 주씩 요약한다.
+일지 창 (journalview) 은 week_resets 로 넘길 주를 고르고 week_summary 로 한 주씩 요약한다. 지난 주들에 오른 높이
+(past_reach) 는 아바타가 이번 주에 따라잡을 기록 랜드마크가 된다 (climbcore.Climber.set_records).
 """
 import collections
 import functools
@@ -40,6 +41,7 @@ WORK_USD = 0.5                            # 한 시간 칸에 이만큼 ($) 넘�
 CROWDED = 3                               # 지난 주 5시간 창이 이만큼 다 찼으면 몰아 쓰는 편
 LOW_PCT = 50                              # 지난 주 주간 사용량이 이보다 적으면 '...만 썼어요'
 WEEKDAYS = "월화수목금토일"
+RECORD_WEEKS = 4                          # 오른 높이를 기록 랜드마크로 쓸 지난 주 수
 
 
 def new(now_s):
@@ -75,7 +77,7 @@ def restore(data, now_s):
         journal[name] = sorted(filter(None, map(_period, items)), key=lambda e: e["reset"])
     hours = data.get("hours") if isinstance(data.get("hours"), dict) else {}
     journal["hours"] = {k: v for k, v in hours.items()
-                        if isinstance(k, str) and HOUR_KEY.fullmatch(k) and _number(v) is not None and v > 0}
+                        if isinstance(k, str) and _hour_ok(k) and _number(v) is not None and v > 0}
     pending = data.get("pending")
     if _number(data.get("backfilled")) is not None:
         journal["backfilled"] = data["backfilled"]
@@ -223,6 +225,17 @@ def _hour_ts(key):
     return datetime.strptime(key, "%Y-%m-%dT%H").replace(tzinfo=climbcore.KST).timestamp()
 
 
+def _hour_ok(key):
+    """시간 칸 이름이 있는 날짜·시각인지 (2026-10-00T10 처럼 꼴만 맞으면 펫이 1초마다 넘길 주를 고를 때 멈춘다)."""
+    if not HOUR_KEY.fullmatch(key):
+        return False
+    try:
+        _hour_ts(key)
+    except ValueError:
+        return False
+    return True
+
+
 def _week_near(journal, reset, slack=petcore.WEEK_SLACK_S):
     """리셋 시각이 reset 에서 slack 안인 주 기록 중 가장 가까운 것, 없으면 None."""
     near = [e for e in journal["weeks"] if abs(e["reset"] - reset) <= slack]
@@ -258,16 +271,48 @@ def week_resets(journal, now_s, reset=None):
 
 
 def _wall(walls, start, reset):
-    """그 주 (start ~ reset) 에 끝난 벽 (PetManager.walls): 다 써서 (full) 그 주 안에, 리셋으로 (reset) 그 리셋 뒤 한 주 안에."""
+    """그 주 (start ~ reset) 에 끝난 벽 (PetManager.walls): 끝낸 주기 (cycle, 리셋 시각) 가 그 주인 벽. cycle 이 없는
+    옛 기록은 다 써서 (full) 그 주 안에, 리셋으로 (reset) 그 리셋 뒤 한 주 안에 끝난 벽 (펫이 한 주 넘게 꺼져 있었으면
+    늦게 끝낸 벽이 다음 주에 붙는다)."""
     slack = petcore.WEEK_SLACK_S
     found = None
     for wall in walls:
-        end = _number(wall.get("end"))
-        if end is None:
+        end, cycle = _number(wall.get("end")), _number(wall.get("cycle"))
+        if cycle is not None:
+            if abs(cycle - reset) <= slack:
+                found = wall
+        elif end is None:
             continue
-        if (wall.get("reason") == "full" and start <= end < reset + slack) or \
+        elif (wall.get("reason") == "full" and start <= end < reset + slack) or \
                 (wall.get("reason") == "reset" and reset - slack <= end < reset + WEEK_S - slack):
             found = wall
+    return found
+
+
+def weeks_ago(n):
+    """n 주 전의 이름 (1 이면 '지난주')."""
+    return "지난주" if n == 1 else f"{n}주 전"
+
+
+def reach(journal, reset, walls=()):
+    """리셋 시각이 reset 인 주에 오른 높이 (m): 주간 % 를 기록했으면 그 가속 눈금 (다 썼으면 달), 아니면 그 주에 끝난 벽
+    높이, 그것도 없으면 None. 일지 창과 기록 랜드마크가 같은 높이를 쓰게 한 곳에서 정한다."""
+    entry = _week_near(journal, reset)
+    if entry:
+        return climbcore.MOON if entry["peak"] >= FULL else climbcore.week_height(entry["peak"])
+    wall = _wall(walls, reset - WEEK_S, reset)
+    return _number(wall.get("height")) if wall else None
+
+
+def past_reach(journal, now_s, reset=None, walls=(), weeks=RECORD_WEEKS):
+    """지난 weeks 주에 오른 높이 [(이름 '지난주'·'2주 전'…, 높이 m)] (일지 창이 넘겨 보는 주와 같다, reset 은 계정 주간
+    리셋 시각). 높이를 모르는 주는 뺀다."""
+    found = []
+    past = week_resets(journal, now_s, reset)[:-1][::-1][:weeks]   # 끝은 늘 이번 주 (일지 창도 자리로 이름을 붙인다)
+    for n, r in enumerate(past, 1):
+        height = reach(journal, r, walls)
+        if height is not None:
+            found.append((weeks_ago(n), height))
     return found
 
 
@@ -308,10 +353,7 @@ def week_summary(journal, reset, now_s, walls=(), height=None):
     if full_at is None and wall and wall.get("reason") == "full":
         full_at = _number(wall.get("end"))
     if not current or height is None:
-        if pct is not None:
-            height = climbcore.MOON if pct >= FULL else climbcore.week_height(pct)
-        else:
-            height = _number(wall.get("height")) if wall else None
+        height = reach(journal, reset, walls)
     if full_at is not None:
         end = ("moon", full_at)
     elif current:

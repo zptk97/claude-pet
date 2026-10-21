@@ -144,6 +144,7 @@ class Look:
         self.pebbles = [(rng.random(), rng.uniform(0.15, 1.2), rng.uniform(0.06, 0.16), rng.choice((92, 108, 124)))
                         for _ in range(22)]   # 땅의 돌 (가로 자리 0~1, 땅 아래 깊이 m, 크기 m, 밝기)
         self.hold_cache = {}        # id(홀드) → (홀드, 그린 상태, 그림, pad)
+        self.carved_cache = {}      # 지난 주 기록 자국 글자 → (그림, 붙일 자리)
         self.layer_drawn = None     # 지금 바위 층을 그린 상태 (layer_key)
         self.hud_key = self.hud = None   # 높이 상자 그림과 그린 내용
         self.hud_rect = self.banner_rect = QRect()   # 마지막으로 그린 높이 상자·기록 말풍선 (클릭 받는 곳)
@@ -206,8 +207,9 @@ class Look:
         ledge = (sim.ledge.anchor.x, sim.ledge.anchor.y) if sim.ledge is not None else None
         snow = round(sim.precip() * 60) if sim.weather_kind == "snow" else 0
         moon = (round(sim.moon * self.R) if sim.moon is not None else None, sim.moon_flag is not None)
+        carved = tuple(mark for mark in sim.carved if bottom_y - 1.5 < mark[0] < top_y + 1)
         return (round(cam * self.R), round(k * 4000), round(sim.gloom() * 60), snow, holds, bolts, ledge,
-                round(sim.t * 30) if moving else 0, round(self.night_amount(sim) * 60), moon)
+                round(sim.t * 30) if moving else 0, round(self.night_amount(sim) * 60), moon, carved)
 
     def paint(self, painter, sim):
         cam = self.view_cam(sim)
@@ -374,7 +376,7 @@ class Look:
             below = QPainterPath()
             below.addRect(QRectF(0, surface, W, H - surface + 1))
             clip = clip.intersected(below)
-        self.clip = clip
+        rock = self.clip = clip   # 바위만 (땅·달 표면을 더하기 전)
         lp.setClipPath(clip)
         th = self.rock.height()
         if th > 0:
@@ -410,7 +412,9 @@ class Look:
             self.clip = clip   # 밤에 헤드램프가 땅도 비춘다
         if surface is not None and -MOON_SLAB * R < surface < H + 2.0 * R:   # 기둥 위 끝 달 표면과 깃발 (위로 2m)
             lp.setClipping(False)
-            clip = clip.united(self.paint_moon_top(lp, sim, surface, cam))   # 밤에 같이 어두워지고 헤드램프가 비춘다
+            top = self.paint_moon_top(lp, sim, surface, cam)
+            clip = clip.united(top)   # 밤에 같이 어두워지고 헤드램프가 비춘다
+            rock = rock.subtracted(top)
             self.clip = clip
         night = self.night_amount(sim)
         if night > 0.01:   # 밤: 헤드램프가 비출 밝은 바위를 남겨 두고, 바위도 어둡게 (하늘보다 덜, 홀드가 보이게)
@@ -420,6 +424,18 @@ class Look:
             lp.setRenderHint(QPainter.Antialiasing)
             lp.setClipPath(clip)
             lp.fillRect(QRectF(0, 0, W, H), QColor(*NIGHT_TINT, round(180 * night)))
+        marks = [mark for mark in sim.carved if bottom_y - 1.5 < mark[0] < top_y + 1]
+        if marks:   # 지난 주 기록 자국은 바위에만, 밤에도 덜 어둡게 (어둡게 한 뒤에), 헤드램프 빛 안에서는 밝게
+            targets = [(lp, 1 - 0.4 * night)]
+            if night > 0.01:
+                targets.append((QPainter(self.lit), 1.0))
+            for painter, fade in targets:
+                painter.setRenderHint(QPainter.Antialiasing)
+                painter.setClipPath(rock)
+                for mark in marks:
+                    self.paint_carved(painter, mark, cam, fade)
+            if night > 0.01:
+                targets[1][0].end()
         lp.setClipping(False)
         self.forget_holds(sim.holds)
         gloom = sim.gloom()
@@ -776,6 +792,57 @@ class Look:
             p.drawPolyline(QPolygonF([pt for pt, (x, y) in zip(poly(1.0, 0, -r * 0.1), hold.shape) if y > -0.1]))
         p.end()
         return pixmap, pad
+
+    def paint_carved(self, p, mark, cam, fade):
+        """바위에 새긴 지난 주 기록: 기둥을 가로지르는 초크 점선과 그 위 side 쪽 가장자리에 두 줄 ('지난주', '52.3km').
+        fade 만큼 흐리게 (밤)."""
+        y, side, name, alt = mark
+        R = self.R
+        left, right = self.to_screen(V(edge_x(y, -1), y), cam), self.to_screen(V(edge_x(y, 1), y), cam)
+        pen = QPen(QColor(255, 255, 255, round(190 * fade)), max(1.5, R * 0.07), Qt.CustomDashLine, Qt.RoundCap)
+        pen.setDashPattern([2.5, 2.0])
+        p.setPen(pen)
+        p.drawLine(left, right)
+        image, dx, dy = self.carved_text(name, alt, side, int((right.x() - left.x()) * 0.62))
+        x = right.x() - R * 0.4 if side > 0 else left.x() + R * 0.4
+        p.setOpacity(fade)
+        p.drawImage(QPoint(round(x + dx), round(left.y() + dy)), image)
+        p.setOpacity(1.0)
+
+    def carved_text(self, name, alt, side, width):
+        """자국 글자 두 줄 (이름 위, 높이 아래) 을 테두리까지 그린 그림과 붙일 자리 (side 쪽 글자 끝, 점선에서 떨어진 만큼).
+        좁으면 글자를 줄이고 그래도 넘치면 말줄임. 바위 층은 카메라가 움직이면 매번 다시 그려서 글자는 그려 둔다."""
+        key = (name, alt, side, width)
+        if key not in self.carved_cache:
+            if len(self.carved_cache) > 16:
+                self.carved_cache.clear()
+            font = QFont(self.small)
+            size = max(9, round(self.small.pixelSize() * 0.85))
+            while True:
+                font.setPixelSize(size)
+                metrics = QFontMetrics(font)
+                if size <= 8 or max(metrics.horizontalAdvance(t) for t in (name, alt)) <= width:
+                    break
+                size -= 1
+            path = QPainterPath()
+            for i, line in enumerate((alt, name)):   # 아래 줄부터, side 쪽 끝 (x 0) 에 맞춰
+                text = metrics.elidedText(line, Qt.ElideRight, width)
+                path.addText(-metrics.horizontalAdvance(text) if side > 0 else 0, -i * metrics.height(), font, text)
+            box = path.boundingRect().adjusted(-2, -2, 2, 2).toAlignedRect()
+            image = QImage(box.size(), QImage.Format_ARGB32_Premultiplied)
+            image.fill(Qt.transparent)
+            ip = QPainter(image)
+            ip.setRenderHint(QPainter.Antialiasing)
+            ip.translate(-box.x(), -box.y())
+            ip.setPen(QPen(QColor(60, 30, 10, 150), 2.5))   # 바위 무늬 위에서도 읽히게 어두운 테두리
+            ip.setBrush(Qt.NoBrush)
+            ip.drawPath(path)
+            ip.setPen(Qt.NoPen)
+            ip.setBrush(QColor(255, 255, 255, 230))
+            ip.drawPath(path)
+            ip.end()
+            self.carved_cache[key] = (image, box.x(), box.y() - self.R * 0.12 - metrics.descent())
+        return self.carved_cache[key]
 
     def paint_bolt(self, p, bolt, cam):
         """볼트 고리와 퀵드로 (아래 카라비너까지)."""
