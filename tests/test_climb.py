@@ -681,7 +681,7 @@ class CruxTest(unittest.TestCase):
         sim.route.fill(sim, 30.0)
         jug = sim.route.jugs[0]
         start = jug.crux_from
-        self.assertTrue(1.5 <= jug.p.y - start <= 2.5 and jug.big)
+        self.assertTrue(climbcore.CRUX_GAP[0] <= jug.p.y - start <= climbcore.CRUX_GAP[1] and jug.big)
         gap = [h for h in sim.holds if start <= h.p.y < jug.p.y - 0.01 and not h.foot]
         self.assertEqual(gap, [])   # 크럭스 구간에는 손으로 잡을 홀드가 없다
         below = [h for h in sim.holds if start - 1.5 < h.p.y < start and not h.foot]
@@ -692,7 +692,7 @@ class CruxTest(unittest.TestCase):
         self.assertEqual(len(chips), 3)
         self.assertTrue(all(h.p.x * jug.p.x > 0 for h in chips))
         self.assertEqual(sum(1 for h in chips if h.p.y < jug.p.y - 2), 2)
-        self.assertEqual(sum(1 for h in chips if start < h.p.y < jug.p.y), 1)
+        self.assertEqual(sum(1 for h in chips if jug.p.y - 2 < h.p.y < jug.p.y), 1)   # 구간 가운데 (구간은 2m 넘게 길다)
         gap_bolts = [b for b in sim.bolts if start - 1.0 < b.p.y < jug.p.y]
         self.assertEqual(gap_bolts, [])   # 구간 안에는 볼트가 없고
         base = [b for b in sim.bolts if start - 2.0 < b.p.y <= start - 1.0]
@@ -738,6 +738,14 @@ class CruxTest(unittest.TestCase):
         self.assertEqual(sim.missing, 0)
         run(sim, 45.0)   # 넘은 뒤에도 계속 오른다
         self.assertGreater(sim.top_y, jug.p.y + 3.0)
+
+    def test_jumps_from_the_lower_edge_without_climbing_into_it(self):
+        """위쪽 손이 크럭스 아래 끝 띠 (CRUX_EDGE) 에 닿으면 띠 안에 잡을 홀드가 남아 있어도 더 올라서지 않고 뛴다.
+        이 시드들은 띠 규칙이 없으면 띠 안 작은 홀드로 3~7번 더 올라선 뒤 뛰었다."""
+        for seed in (3, 5, 12):
+            sim = self.climb_to_crux(seed)
+            self.assertEqual(len(sim.crux_log), 1, seed)
+            self.assertEqual(sim.crux_log[0][1], 0, seed)   # 띠에 닿은 뒤 뛰기까지 손발 동작 수
 
     def test_no_limb_jumps_during_crux(self):
         """뛰고, 놓쳐 로프에 걸려 떨어지고, 다시 붙고, 다시 뛰는 동안 몸과 그려지는 발끝이 한 프레임에 크게 튀지 않는다

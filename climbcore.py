@@ -127,7 +127,8 @@ FOOT_HIGH = 2.6                               # 가끔 발을 높이 올릴 때
 FOOT_CEIL = 0.55                              # 발은 매달린 엉덩이보다 적어도 이만큼 아래에 둔다
 FOOT_WIDTH = 0.35                             # 발을 몸 가운데에서 옆으로 두는 거리 (엉덩이 너비 가까이)
 CRUX_EVERY = (40.0, 80.0)     # 크럭스 간격 (m)
-CRUX_GAP = (1.5, 2.5)         # 크럭스: 이 높이만큼 홀드를 비우고 끝에 큰 홀드를 몸 반대쪽 끝에 둔다 (다이노로 넘는다)
+CRUX_GAP = (2.0, 3.0)         # 크럭스: 이 높이만큼 홀드를 비우고 끝에 큰 홀드를 몸 반대쪽 끝에 둔다 (다이노로 넘는다)
+CRUX_EDGE = 0.8               # 크럭스 아래 끝 띠: 위쪽 손이 구간 시작보다 이만큼 아래에 닿으면 남은 홀드가 있어도 뛴다
 CRUX_MISS = 0.2               # 크럭스에서 손이 미끄러져 다시 뛸 확률 (추락 이벤트를 켰을 때)
 CRUX_BOLT = 1.4               # 크럭스 볼트: 구간 시작보다 이만큼 아래 (뛰기 전 손 높이. 놓치면 4~7m 떨어져 로프에 걸린다)
 CRUX_CLIP = 1.06              # 크럭스 볼트는 팔을 쭉 뻗어 이만큼 (팔 길이의 배) 까지 닿으면 건다 (홀드를 잡은 손 높이라 조금 넘는다)
@@ -2213,7 +2214,7 @@ class Climber:
         limb, hold = move
         self.moves.append(limb.name)
         top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
-        if any(h.crux and h.crux_from - 0.8 < top < h.p.y for h in self.holds):
+        if any(h.crux and h.crux_from - CRUX_EDGE < top < h.p.y for h in self.holds):
             self.moves_since_crux += 1   # 크럭스 아래 끝에서 맴돈다
         else:
             self.moves_since_crux = 0
@@ -2938,12 +2939,15 @@ class Climber:
         self.texts.append(Float(self.body + V(0.6, 1.3), after))
 
     def crux_ready(self):
-        """크럭스 끝 홀드로 뛸 때면 그 홀드: 손보다 1~3.6m 위에 있고, 손이 더 오를 데가 없고 (제자리로 맴돌기 시작했으면
-        고쳐 잡기도 없다고 친다), 발도 더 올릴 데가 없다."""
+        """크럭스 끝 홀드로 뛸 때면 그 홀드: 손보다 1~4m 위에 있고, 위쪽 손이 크럭스 아래 끝 띠 (CRUX_EDGE) 에 닿았거나
+        (띠 안 작은 홀드로 더 올라서지 않고 멀리 뛴다), 손이 더 오를 데가 없고 (제자리로 맴돌기 시작했으면 고쳐 잡기도
+        없다고 친다) 발도 더 올릴 데가 없다."""
         top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
-        jug = next((h for h in self.holds if h.crux and 1.0 < h.p.y - top < 3.6), None)
+        jug = next((h for h in self.holds if h.crux and 1.0 < h.p.y - top < 4.0), None)
         if jug is None or any(l.hold is jug for l in self.limbs.values()):
             return None
+        if top > jug.crux_from - CRUX_EDGE:
+            return jug
         hands = (self.limbs["LH"], self.limbs["RH"])
         if any(self.hand_options(l, 0) for l in hands) or (self.stall < 2 and any(self.hand_options(l, 1) for l in hands)):
             return None
