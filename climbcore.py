@@ -732,10 +732,9 @@ class Climber:
         self.squash_min = 1.0       # 지난 기록 뒤 몸통이 가장 눌린 정도 (검사용)
         self.drop_log = []          # 드롭니를 할 만한 손 뻗기마다 했는지 (검사용)
         self.pause_log = []         # 둘러보며 쉰 (시간, 본 곳 수) (검사용)
-        self.free_log = []          # 뗀 발로 한 다음 동작: up (올라가 딛기), match (합발), keep (그대로 두고 손), return,
+        self.free_log = []          # 뗀 발로 한 다음 동작: up (올라가 딛기), keep (그대로 두고 손), return,
                                     # spot (빈 쪽에 올려 둔 홀드), fill (빈 쪽 홀드), wall (빈 쪽 벽) (검사용)
         self.lean_log = []          # 쏠렸을 때 빈 쪽에 발을 둔 동작: reach (손을 뻗으며), step (홀드로), wall (벽을 딛어) (검사용)
-        self.switch_foot = None     # 합발 뒤 위로 옮길 발
         self.parked = False         # 남은 높이로 닿는 홀드가 없어 다음 토큰을 기다리는 중
         self.wait_for = 0.0         # 크럭스 앞에서 기다릴 때 모여야 할 높이
         self.crux_log = []          # 넘은 크럭스마다 (시도 횟수, 크럭스 아래 끝에 닿은 뒤 뛰기까지 손발 동작 수) (검사용)
@@ -794,7 +793,7 @@ class Climber:
         self.sleeping = self.nap = self.resting = self.parked = False
         self.lids, self.idle_since, self.wait_for = 0.0, None, 0.0
         self.bank, self.carry, self.token_buf = self.carry, 0.0, 0   # 지난 벽에서 못 오른 높이는 버리고, 끝난 뒤 받은 것만
-        self.best_top, self.stall, self.moves_since_crux, self.switch_foot = -1e9, 0, 0, None
+        self.best_top, self.stall, self.moves_since_crux = -1e9, 0, 0
         self.lay_wall(random.Random(self.rng.random()))
         self.jump(0.0, 0.0)
         self.start_pose = (self.body, {n: l.hold for n, l in self.limbs.items()})
@@ -1493,11 +1492,6 @@ class Climber:
         """다음에 옮길 손발과 홀드. 정해진 순서 없이 그때 자세를 보고 고른다."""
         hands = sorted((self.limbs["LH"], self.limbs["RH"]), key=self.held_y)
         feet = sorted((self.limbs["LF"], self.limbs["RF"]), key=self.held_y)
-        if self.switch_foot is not None:   # 합발 뒤: 원래 디뎠던 발을 위로 (발 바꾸기)
-            foot, self.switch_foot = self.switch_foot, None
-            options = foot.mode == "grip" and (self.foot_options(foot, 0) or self.foot_options(foot, 1))
-            if options:
-                return foot, max(options)[2]
         for foot in self.free_feet():   # 뗀 발은 다음 동작으로 (삼지점을 다시 만든다)
             move = self.free_foot_move(foot, hands)
             if move is not None:
@@ -2383,11 +2377,11 @@ class Climber:
         return [f for f in (self.limbs["LF"], self.limbs["RF"]) if f.mode == "follow" and not f.tucked]
 
     def free_foot_move(self, foot, hands):
-        """뗀 발로 할 다음 동작 (손발, 홀드). 더 높은 홀드가 있으면 올라가 딛고, 없으면 디딘 발 옆에 모아 (합발) 다음에
-        그 발을 올리고, 그것도 안 되면 뗀 발은 그대로 둔 채 다른 손을 뻗는다 (두 번까지). 다 안 되면 원래 높이 근처로.
-        빈 쪽 벽을 딛은 발은 올려 둔 홀드·빈 쪽 홀드부터 찾고, 손이 아직 그쪽 위면 합발보다 벽을 딛은 채 손 뻗기와 조건을
-        푼 빈 쪽 홀드가 먼저다. 손이 이 발 쪽으로 쏠렸는데 다른 자세로 뗀 발이 반대쪽에 떠 있으면 빈 쪽 홀드, 위쪽 홀드,
-        그것도 없으면 빈 쪽 벽으로 옮긴다 (홀드 자리에 None)."""
+        """뗀 발로 할 다음 동작 (손발, 홀드). 더 높은 홀드가 있으면 올라가 딛고, 없으면 뗀 발은 그대로 둔 채 다른 손을
+        뻗는다 (두 번까지). 다 안 되면 원래 높이 근처로. 디딘 발 옆에 모았다가 그 발을 올리는 합발은 하지 않는다 (발 하나
+        올리는 데 두 수가 들어 동작이 길어졌다). 빈 쪽 벽을 딛은 발은 올려 둔 홀드·빈 쪽 홀드부터 찾고, 손이 아직 그쪽
+        위면 벽을 딛은 채 손 뻗기와 조건을 푼 빈 쪽 홀드가 먼저다. 손이 이 발 쪽으로 쏠렸는데 다른 자세로 뗀 발이 반대쪽에
+        떠 있으면 빈 쪽 홀드, 위쪽 홀드, 그것도 없으면 빈 쪽 벽으로 옮긴다 (홀드 자리에 None)."""
         base, s = foot.hold.p.y, foot.side
         wall = foot.free_style == "balance"
         stray = not wall and self.lean_side() == s and s * (foot.pos.x - self.body.x) <= LEAN_SIDE
@@ -2419,13 +2413,6 @@ class Climber:
             if options:
                 self.free_log.append("fill")
                 return foot, max(options)[2]
-        if support.mode == "grip" and support.hold is not None:
-            spot = support.hold.grip("F", foot.side)
-            if ((spot - foot.root(self.body, self.tilt)).len() < foot.reach * 0.92
-                    and (self.foot_options(support, 0) or self.foot_options(support, 1))):
-                self.free_log.append("match")
-                self.switch_foot = support
-                return foot, support.hold
         move = None if over else self.keep_free(foot, support, hands)
         if move is not None:
             return move
