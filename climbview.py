@@ -21,18 +21,18 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGra
                          QPixmap, QPolygonF, QRadialGradient, QRegion, QTransform)
 from PyQt5.QtWidgets import QWidget
 
-from climbcore import (ARM, BANDS, KST, LEG, M_PER_TOKEN, MOON, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF,
+from climbcore import (ARM, BANDS, BODY, KST, LEG, M_PER_TOKEN, MOON, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF,
                        edge_x, fmt_alt, height_pct, night_level, smooth, two_bone)
 
 APP_DIR = Path(__file__).resolve().parent
 ASSET_DIR = APP_DIR / "assets" / "climb"
 AVATAR_DIR = APP_DIR / "avatar"   # 내 아바타 (git 제외): body.png (투명 배경), avatar.json (몸통 공·눈 자리)
-UNIT_PX = 50                      # 몸통 반지름 (px, 펫 크기 배율을 곱한다: 보통이면 25 → 창 높이 300)
+UNIT_PX = 50                      # 1m (처음 몸의 몸통 반지름) 의 px (펫 크기 배율을 곱한다: 보통이면 25 → 창 높이 300)
 FRAME_MS = 16                     # 늘 60fps (쉬거나 잘 때 낮추면 비·눈이 끊겨 보인다)
 STEP_MAX = 0.05                   # 계산 한 번에 넘기는 시간 (초). 프레임이 길면 나눠서 넘긴다
 NIGHT_EVERY = 5.0                 # 시계를 보고 밤 정도를 다시 정하는 간격 (초)
 NIGHT_TINT = (8, 12, 30)          # 밤에 덮는 색 (하늘·바위·아바타)
-LAMP = (-0.40, -0.70)             # 헤드램프 자리 (몸통 공 중심에서, 반지름 단위, 그림 좌표: 왼쪽 위가 -)
+LAMP = (-0.40, -0.70)             # 헤드램프 자리 (몸통 공 중심에서, 몸통 반지름 단위, 그림 좌표: 왼쪽 위가 -)
 LAMP_POOL = 1.3                   # 헤드램프가 벽을 비추는 웅덩이 반지름 (m)
 MOON_SLAB = 1.6                   # 기둥 위 끝 달 표면 띠의 두께 (m)
 SPACE_MOON = (0.823, 0.147, 0.045)   # 우주 배경 그림 속 달: 가운데 (그림 폭·높이 비율), 반지름 (그림 폭 비율)
@@ -96,7 +96,7 @@ class Look:
         self.H = self.wall_h
         body, info = load_avatar() or plain_avatar()
         cx, cy, r = info["ball"]
-        k = self.R / r
+        k = self.R * BODY / r
         self.body = QPixmap.fromImage(body.scaled(round(body.width() * k), round(body.height() * k),
                                                   Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
         self.anchor = (cx * k, cy * k)
@@ -162,7 +162,7 @@ class Look:
             return QRect(int(left), int(top), int(right - left) + 2, int(bottom - top) + 2).intersected(window)
 
         region = QRegion(box([sim.body] + [l.pos for l in sim.limbs.values()] + [p.p for p in sim.particles]
-                             + [f.p for f in sim.texts], 1.6 * R + (3.0 * R if sim.texts else 0), 1.6 * R))
+                             + [f.p for f in sim.texts], 1.9 * R + (3.0 * R if sim.texts else 0), 1.9 * R))
         if sim.events:   # 로프 (paint_rope 와 같은 마디)
             rope = [sim.harness()] + ([sim.limbs[sim.rope_hand].pos] if sim.rope_hand is not None else [])
             rope += [b.rope_point() for b in sorted((b for b in sim.bolts if b.clipped), key=lambda b: -b.p.y)]
@@ -328,7 +328,7 @@ class Look:
     def paint_beam(self, p, sim, cam, night):
         """램프 렌즈의 빛과 비추는 곳까지 옅은 빛줄기 (어둡게 한 아바타 위에 그린다)."""
         R = self.R
-        lamp = self.body_transform(sim, cam).map(QPointF(LAMP[0] * R, LAMP[1] * R))
+        lamp = self.body_transform(sim, cam).map(QPointF(LAMP[0] * R * BODY, LAMP[1] * R * BODY))
         c = self.to_screen(sim.lamp, cam)
         d = c - lamp
         length = math.hypot(d.x(), d.y())
@@ -941,8 +941,9 @@ class Look:
             return
         if ledge.hung and ledge.open >= 0.05:
             if ledge.bag > 0:   # 침낭
-                top = bed.y + 0.1 + 0.62 * smooth(ledge.bag)
-                rect = QRectF(self.to_screen(V(sim.body.x - 0.95, top), cam), self.to_screen(V(sim.body.x + 0.95, bed.y), cam))
+                top = bed.y + (0.1 + 0.62 * smooth(ledge.bag)) * BODY
+                rect = QRectF(self.to_screen(V(sim.body.x - 0.95 * BODY, top), cam),
+                              self.to_screen(V(sim.body.x + 0.95 * BODY, bed.y), cam))
                 p.setPen(QPen(QColor(20, 70, 85), max(1.0, R * 0.05)))
                 p.setBrush(QColor(44, 140, 160))
                 p.drawRoundedRect(rect, R * 0.3, R * 0.3)
@@ -1055,7 +1056,7 @@ class Look:
             p.save()
             p.translate(bag)
             p.rotate(-math.degrees(tilt))
-            bw, bh = 0.36 * R, 0.44 * R
+            bw, bh = 0.36 * R * BODY, 0.44 * R * BODY
             p.setPen(QPen(QColor(40, 20, 20), max(1.0, R * 0.05)))
             p.setBrush(QColor(196, 60, 46))
             p.drawRoundedRect(QRectF(-bw / 2, -bh / 2, bw, bh), bw * 0.25, bw * 0.25)
@@ -1065,7 +1066,7 @@ class Look:
             p.drawRect(QRectF(-bw / 2 + 2, -bh / 2 + 2 + (bh - 4) * (1 - level), bw - 4, (bh - 4) * level))
             p.restore()
         # 팔다리 (몸 뒤)
-        pen = QPen(QColor(18, 18, 20), max(2.0, R * 0.13))
+        pen = QPen(QColor(18, 18, 20), max(2.0, R * 0.13 * BODY))
         pen.setJoinStyle(Qt.MiterJoin)
         pen.setCapStyle(Qt.FlatCap)
         tremble = sim.hp <= 30 and not sim.sleeping
@@ -1086,17 +1087,17 @@ class Look:
             p.setBrush(Qt.NoBrush)
             p.drawPolyline(QPolygonF(pts))
             fore = math.atan2(tip.y - elbow.y, tip.x - elbow.x)
-            thin = QPen(QColor(18, 18, 20), max(1.5, R * 0.09))
+            thin = QPen(QColor(18, 18, 20), max(1.5, R * 0.09 * BODY))
             thin.setCapStyle(Qt.RoundCap)
             p.setPen(thin)
             if limb.kind == "H":
                 base = fore if limb.mode != "grip" else fore * 0.4 + (-math.pi / 2) * 0.6
-                length = 0.08 if limb.fist else 0.2 if limb.mode != "grip" else 0.16
+                length = (0.08 if limb.fist else 0.2 if limb.mode != "grip" else 0.16) * BODY
                 for da in (-0.55, 0.0, 0.55):
                     f = tip + V(math.cos(base + da), math.sin(base + da)) * length
                     p.drawLine(pts[2], self.to_screen(f, cam))
             else:
-                toe = tip + V(limb.side * 0.24, -0.04)
+                toe = tip + V(limb.side * 0.24, -0.04) * BODY
                 p.drawLine(pts[2], self.to_screen(toe, cam))
         # 몸통 (숨쉬기·찌그러짐·돌아보기)
         sy, fx = self.body_pose(sim)
@@ -1106,19 +1107,20 @@ class Look:
         p.scale(fx / math.sqrt(sy), sy)
         p.drawPixmap(QPointF(-self.anchor[0], -self.anchor[1]), self.body)
         if night > 0.01:   # 헤드램프 띠와 몸통 (빛은 아바타를 어둡게 한 뒤 paint_beam 이 그린다)
-            strap = QPen(QColor(40, 44, 52), max(1.5, R * 0.1))
+            b = R * BODY   # 몸통 반지름 (px)
+            strap = QPen(QColor(40, 44, 52), max(1.5, b * 0.1))
             strap.setCapStyle(Qt.FlatCap)
-            band = QPainterPath(QPointF(-0.9 * R, -0.42 * R))
-            band.quadTo(QPointF(-0.45 * R, -0.82 * R), QPointF(0.35 * R, -0.93 * R))
+            band = QPainterPath(QPointF(-0.9 * b, -0.42 * b))
+            band.quadTo(QPointF(-0.45 * b, -0.82 * b), QPointF(0.35 * b, -0.93 * b))
             p.setPen(strap)
             p.setBrush(Qt.NoBrush)
             p.drawPath(band)
-            lx, ly = LAMP[0] * R, LAMP[1] * R
-            p.setPen(QPen(QColor(25, 25, 30), max(1.0, R * 0.04)))
+            lx, ly = LAMP[0] * b, LAMP[1] * b
+            p.setPen(QPen(QColor(25, 25, 30), max(1.0, b * 0.04)))
             p.setBrush(QColor(70, 74, 84))
-            p.drawRoundedRect(QRectF(lx - 0.15 * R, ly - 0.11 * R, 0.3 * R, 0.22 * R), 0.05 * R, 0.05 * R)
+            p.drawRoundedRect(QRectF(lx - 0.15 * b, ly - 0.11 * b, 0.3 * b, 0.22 * b), 0.05 * b, 0.05 * b)
             p.setBrush(QColor(255, 244, 200) if sim.lamp is not None else QColor(110, 110, 104))
-            p.drawEllipse(QPointF(lx, ly), 0.075 * R, 0.075 * R)
+            p.drawEllipse(QPointF(lx, ly), 0.075 * b, 0.075 * b)
         closure = sim.closure()
         if closure > 0.03:   # 눈꺼풀
             for ex, ey, rx, ry, color in self.eyes:

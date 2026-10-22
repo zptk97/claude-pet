@@ -7,7 +7,7 @@
 (Climber.signal) 로 다이노·로프 추락·초크·잠·기상 같은 동작을 끼워 넣는다. 높이 기록 (아파트 10층 ~ 달) 을
 넘으면 한 번씩 말풍선을 띄운다.
 
-길이는 몸통 반지름을 1 로 둔 단위 (높이는 1 = 1m 로 센다), y 는 위가 +.
+길이는 m (처음 몸의 몸통 반지름을 1 로 두었다. 지금 몸통 반지름은 BODY), y 는 위가 +.
 동작은 제너레이터로 쓰고 한 프레임마다 dt 를 보낸다 (yield from 으로 잇는다).
 """
 import collections
@@ -19,12 +19,15 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# ---- 몸 치수 (몸통 반지름 = 1) ----------------------------------------------
+# ---- 몸 치수 (m. 처음 몸은 몸통 반지름 1, 그 뒤로 키웠다) ------------------------
 
-SHOULDER = (0.60, 0.26)     # 어깨 (몸 중심에서, x 는 좌우 대칭)
-HIP = (0.40, -0.60)
-ARM = (0.84, 0.84)          # 위팔, 아래팔
-LEG = (0.80, 0.86)          # 넓적다리, 정강이
+BODY = 1.1                  # 몸통 반지름. 어깨·엉덩이와 몸에 붙은 자리 (하네스·초크백 등) 도 이 배율
+LIMB = 1.2                  # 팔다리 길이 배율 (처음 팔다리는 홀드 간격에 비해 짧아 팔이 닿는 거리를 넘긴 채 매달렸다)
+SHOULDER0, HIP0 = (0.60, 0.26), (0.40, -0.60)   # 처음 몸의 어깨·엉덩이
+SHOULDER = (SHOULDER0[0] * BODY, SHOULDER0[1] * BODY)   # 어깨 (몸 중심에서, x 는 좌우 대칭)
+HIP = (HIP0[0] * BODY, HIP0[1] * BODY)
+ARM = (0.84 * LIMB, 0.84 * LIMB)                # 위팔, 아래팔
+LEG = (0.80 * LIMB, 0.86 * LIMB)                # 넓적다리, 정강이
 HAND_UP = 1.30              # 편한 자세에서 손 높이 (몸 중심 위)
 FOOT_DOWN = 1.62            # 편한 자세에서 발 높이 (몸 중심 아래)
 WALL_HALF = 2.35            # 홀드를 둘 수 있는 벽 반폭
@@ -119,7 +122,7 @@ AWAKE = ("wake", "refill", "wall_end", "moon_top", "moon_leave")   # 자는 동�
 FREE_FOOT = 0.75                              # 손을 뻗을 때 한 발을 떼어 (삼지점) 플래그·벽 딛기로 균형을 잡을 비율
 FREE_HOLD = 0.3                               # 뗀 발은 손을 잡고 적어도 이만큼 (초) 더 균형을 잡은 뒤 홀드로 옮긴다
 LEAN_SIDE = 0.15                              # 몸 가운데에서 이만큼 넘게 떨어져야 그쪽에 있다고 친다 (두 손이 한쪽, 두 발이 반대쪽이면 쏠림)
-FOOT_SPAN = 3.6                               # 편한 자세에서 아래쪽 손과 발 사이 높이 (팔 펴고 다리로 민다, 무릎 약 100°)
+FOOT_SPAN = 3.6                               # 편한 자세에서 아래쪽 손과 발 사이 높이 (팔 펴고 다리로 민다, 무릎 약 90°)
 FOOT_HIGH = 2.6                               # 가끔 발을 높이 올릴 때
 FOOT_CEIL = 0.55                              # 발은 매달린 엉덩이보다 적어도 이만큼 아래에 둔다
 FOOT_WIDTH = 0.35                             # 발을 몸 가운데에서 옆으로 두는 거리 (엉덩이 너비 가까이)
@@ -133,6 +136,7 @@ CRUX_RUNOUT = 5.0             # 놓쳤을 때 마지막 퀵드로가 하네스�
 BREAK_CHANCE = 1 / 1000                       # 오르며 손으로 새 홀드를 잡을 때 그 홀드가 부서질 확률
 DROP_KNEE = 0.75                               # 옆으로 멀리 뻗는데 같은 쪽 발이 높으면 드롭니를 할 비율
 SWAY = 0.35                                   # 손을 떼면 몸이 남은 손 쪽으로 기우는 정도 (플래그 중이면 0.35 배)
+PULL_SPEED = 5.0                              # 잡은 손발이 몸을 닿는 거리 안으로 끄는 가장 빠른 빠르기 (m/s. 보통은 99.9% 가 이보다 느리다)
 FACE_HOLD = 2.5                               # 길이 한쪽으로 이만큼 (초) 넘게 이어져야 몸을 돌린다
 WEATHER = {0: 0.0, 1: 0.3, 2: 0.65, 3: 1.0}  # 일하는 펫 수 → 날씨 세기 (0 맑음, 0.3 흐림, 비·눈, 폭풍우·눈보라)
 
@@ -240,6 +244,19 @@ def two_bone(root, end, a, b, side, kind, flip=False):
         if best is None or (score < best[0] if flip else score > best[0]):
             best = (score, e)
     return best[1], tip
+
+
+def pose(dx, dy, kind):
+    """처음 몸 (몸통 반지름 1, 팔다리 1배) 에 맞춰 둔 손발 자리 (몸 중심에서 dx, dy) 를 지금 몸으로 옮긴다:
+    어깨·엉덩이까지는 BODY 배, 거기서 손발 끝까지는 LIMB 배라 팔다리 모양이 그대로다 (장면 자세에 쓴다)."""
+    rx, ry = SHOULDER0 if kind == "H" else HIP0
+    rx = math.copysign(rx, dx)
+    return V(rx * BODY + (dx - rx) * LIMB, ry * BODY + (dy - ry) * LIMB)
+
+
+def stand_h(h, kind="F"):
+    """처음 몸이 바닥 위 h 에 있고 손발 끝 (kind) 이 바닥 (+0.05) 에 닿은 자세에서 지금 몸의 바닥 위 높이."""
+    return 0.05 - pose(0.0, 0.05 - h, kind).y
 
 
 class Hold:
@@ -765,6 +782,8 @@ class Climber:
         """새 벽: 길·홀드·볼트를 새로 깔고 바닥 (0m) 에서 다시 시작한다. 높이 기록도 새로 세고, 못 오른 높이는 버린다.
         지난 벽 높이를 말풍선으로 띄운다. restart 면 하던 동작을 버리고 처음부터 (brain 안에서 부를 때는 False).
         grounded 면 벽에 붙지 않고 땅에 앉는다 (keep = (카메라 - 몸 높이, 몸 x) 면 화면 속 자리를 그대로)."""
+        if restart:   # 하던 동작을 먼저 끝낸다 (버린 동작의 finally 가 나중에 돌면 로프 추락의 mode = "spring" 이 앉은 몸을 띄운다)
+            self.brain_task.close()
         last = self.peak
         self.holds, self.bolts, self.rocks, self.particles, self.texts, self.requests = [], [], [], [], [], []
         self.cam, self.falling, self.rope_cut, self.wall_pending = 0.45, False, None, False
@@ -814,7 +833,7 @@ class Climber:
 
     def sit(self, x):
         """땅 (달) 에 주저앉는다: 몸통이 바닥에 닿고 다리는 양옆으로 뻗고 손은 옆 바닥을 짚는다."""
-        self.body = V(max(-WALL_HALF + 0.6, min(WALL_HALF - 0.6, x)), self.seat_y() + 1.0)
+        self.body = V(max(-WALL_HALF + 0.6, min(WALL_HALF - 0.6, x)), self.seat_y() + BODY)
         self.mode, self.vel, self.tilt, self.tilt_vel = "script", V(), 0.0, 0.0
         for name, goal in self.sit_goals().items():
             limb = self.limbs[name]
@@ -822,8 +841,22 @@ class Climber:
             limb.pos = limb.follow()
 
     def sit_goals(self):
-        return {name: (lambda dx=dx, dy=dy: V(self.body.x + dx, self.seat_y() + dy))
-                for name, (dx, dy) in {"LF": (-1.0, 0.1), "RF": (1.0, 0.1), "LH": (-1.25, 0.25), "RH": (1.25, 0.25)}.items()}
+        """앉은 자세의 손발 자리: 바닥 위 그대로, x 는 처음 몸 (몸통이 바닥 위 1) 에 맞춘 자리를 지금 몸으로 옮겨서."""
+        goals = {"LF": (-1.0, 0.1), "RF": (1.0, 0.1), "LH": (-1.25, 0.25), "RH": (1.25, 0.25)}
+        return {name: (lambda dx=pose(x, y - 1.0, LIMBS[name][1]).x, dy=y: V(self.body.x + dx, self.seat_y() + dy))
+                for name, (x, y) in goals.items()}
+
+    def stand_goals(self, floor):
+        """바닥 (floor: 바닥 y 를 돌려주는 함수) 에 선 자세의 손발 자리: 발은 엉덩이 아래 바닥, 손은 몸 옆에 늘어뜨린다.
+        몸 높이는 floor() + stand_h(2.15)."""
+        fx, hand = pose(0.35, 0.0, "F").x, pose(0.75, -0.55, "H")
+        return {"LF": lambda: V(self.body.x - fx, floor() + 0.05), "RF": lambda: V(self.body.x + fx, floor() + 0.05),
+                "LH": lambda: self.body + V(-hand.x, hand.y), "RH": lambda: self.body + hand}
+
+    def arms_up(self, dy=1.75):
+        """두 팔을 위로 (만세·기지개·뛰어오르기): 처음 몸에서 손이 몸 중심 위 dy 인 자세."""
+        up = pose(0.6, dy, "H")
+        return {"LH": lambda: self.body + V(-up.x, up.y), "RH": lambda: self.body + up}
 
     def rise(self, animate=True):
         """주간 사용량이 돌아왔다: 땅에서 일어나 새 벽에 붙는다 (animate 면 걸어가 첫 홀드를 잡는 get_up, 아니면 바로)."""
@@ -854,8 +887,7 @@ class Climber:
     def place_on_moon(self):
         """장면 없이 달 위에 앉힌다 (창이 숨어 있었거나 다시 켰을 때, 올라서는 도중에 숨었을 때). 깃발은 꽂혀 있다.
         brain 밖에서만 부른다 (하던 동작을 버리고 brain 을 새로 띄운다)."""
-        hands = [self.held_y(self.limbs[n]) for n in ("LH", "RH")]
-        self.moon, self.moon_t, self.moon_pending = min(max(hands) + 0.8, self.body.y + 1.75), self.t - 10.0, False
+        self.moon, self.moon_t, self.moon_pending = self.lip_y(), self.t - 10.0, False
         self.clear_above_moon()
         self.ledge, self.sleeping, self.nap, self.rope, self.rope_hand = None, False, False, None, None
         self.phase_target = self.look_at = None
@@ -871,6 +903,11 @@ class Climber:
         self.cam = self.body.y + 0.45
         self.pct_shown, self.peak, self.passed = 100.0, float(MOON), len(self.landmarks)
 
+    def lip_y(self):
+        """달 표면 높이: 매달린 몸에서 손이 닿는 높이 (잡은 손 홀드보다 낮지 않게, 0.8 넘게 높지 않게)."""
+        top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
+        return min(top + 0.8, max(top, self.body.y + pose(0.0, 1.75, "H").y))
+
     def clear_above_moon(self, gripped=True):
         """달 표면 위의 홀드·볼트를 치운다 (gripped 면 잡고 있는 홀드는 둔다)."""
         keep = {id(l.hold) for l in self.limbs.values() if l.mode == "grip"} if gripped else set()
@@ -879,7 +916,7 @@ class Climber:
 
     def flag_spot(self, x):
         side = 1 if x < 0 else -1   # 넓은 쪽에 꽂는다
-        return V(x + side * 1.0, self.moon)
+        return V(x + side * BODY, self.moon)   # 앉은 몸통 공 옆에 붙여
 
     def leave_moon(self, animate=True):
         """달에서 주간 리셋: animate 면 다음 동작으로 뛰어내려 지구까지 떨어지는 장면 (moon_leave), 아니면 바로 새 벽에
@@ -901,8 +938,7 @@ class Climber:
         if self.sleeping and self.ledge is not None:
             yield from self.wake()
         self.actions.append("moon_top")
-        top = max(self.held_y(self.limbs[n]) for n in ("LH", "RH"))
-        lip = self.moon = min(top + 0.8, self.body.y + 1.75)   # 매달린 몸에서 손이 닿는 높이
+        lip = self.moon = self.lip_y()
         self.moon_t, self.moon_pending = self.t, False
         self.clear_above_moon()
         self.phase_target, self.rope, self.rope_hand = None, None, None
@@ -910,21 +946,24 @@ class Climber:
         yield from self.wait(0.7, stoppable=False)
         x0 = max(-WALL_HALF + 0.8, min(WALL_HALF - 0.8, self.body.x))
 
-        def at(dx, dy, base=None):
-            return lambda: V(self.body.x + dx, (lip if base is None else self.body.y) + dy)
-        yield from self.move_limb("LH", at(-0.55, 0.05), 0.35)   # 두 손을 달 표면 끝에 건다
-        yield from self.move_limb("RH", at(0.55, 0.05), 0.35)
-        yield from self.move_all({"LF": at(-0.45, -1.35, "body"), "RF": at(0.45, -1.35, "body")}, 0.8,
-                                 body_to=lambda: V(x0, lip - 0.15), tilt_to=0.0)   # 몸을 끌어 올린다
-        yield from self.move_all({"RF": at(0.45, 0.05)}, 0.6, body_to=lambda: V(x0, lip + 0.9))   # 눌러 올라서며 한 발을 올린다
-        yield from self.move_all({"LF": at(-0.35, 0.05), "RF": at(0.35, 0.05), "LH": at(-0.75, -0.55, "body"),
-                                  "RH": at(0.75, -0.55, "body")}, 0.7, body_to=lambda: V(x0, lip + 2.15))   # 일어선다
+        def at(dx, dy, kind, base=None):   # 처음 몸에 맞춘 손발 자리: x 는 몸에서, y 는 달 표면에서 (base 면 몸에서)
+            p = pose(dx, dy, kind)
+            if base is None:
+                return lambda: V(self.body.x + p.x, lip + dy)
+            return lambda: self.body + p
+        yield from self.move_limb("LH", at(-0.55, 0.05, "H"), 0.35)   # 두 손을 달 표면 끝에 건다
+        yield from self.move_limb("RH", at(0.55, 0.05, "H"), 0.35)
+        yield from self.move_all({"LF": at(-0.45, -1.35, "F", "body"), "RF": at(0.45, -1.35, "F", "body")}, 0.8,
+                                 body_to=lambda: V(x0, lip + stand_h(-0.15, "H")), tilt_to=0.0)   # 몸을 끌어 올린다
+        yield from self.move_all({"RF": at(0.45, 0.05, "F")}, 0.6, body_to=lambda: V(x0, lip + stand_h(0.9)))   # 눌러 올라서며 한 발을 올린다
+        yield from self.move_all(self.stand_goals(lambda: lip), 0.7, body_to=lambda: V(x0, lip + stand_h(2.15)))   # 일어선다
         spot = self.flag_spot(x0)
         hand = "RH" if spot.x > x0 else "LH"
         self.face = -1 if spot.x > x0 else 1
         self.look_at = spot + V(0, 0.5)
-        yield from self.move_limb(hand, lambda: V(spot.x, lip + 1.5), 0.4, arc=0.1)   # 깃대를 들어
-        yield from self.move_limb(hand, lambda: V(spot.x, lip + 0.8), 0.14, arc=0.0)   # 푹 꽂는다
+        lift, plant = pose(1.0, -0.65, "H").y, pose(1.0, -1.35, "H").y   # 선 몸에서 손 높이 (처음 몸에서 몸 아래 0.65·1.35)
+        yield from self.move_limb(hand, lambda: V(spot.x, self.body.y + lift), 0.4, arc=0.1)   # 깃대를 들어
+        yield from self.move_limb(hand, lambda: V(spot.x, self.body.y + plant), 0.14, arc=0.0)   # 푹 꽂는다
         self.moon_flag = spot
         self.puff(spot, n=10, speed=0.9, size=0.15, life=0.9)
         self.texts.append(Float(spot + V(0, 2.3), "푹!"))
@@ -932,10 +971,10 @@ class Climber:
         self.look_at = None
         self.banner = [f"이번 주 완등! 달 {fmt_alt(MOON)}", 0.0]
         self.confetti(40)
-        yield from self.move_all({"LH": lambda: self.body + V(-0.6, 1.75), "RH": lambda: self.body + V(0.6, 1.75)}, 0.4)   # 만세
+        yield from self.move_all(self.arms_up(), 0.4)   # 만세
         self.squash_vel -= 1.5
         yield from self.wait(1.6, stoppable=False)
-        yield from self.move_all(self.sit_goals(), 0.6, body_to=lambda: V(x0, lip + 1.0), tilt_to=0.0)   # 앉는다
+        yield from self.move_all(self.sit_goals(), 0.6, body_to=lambda: V(x0, lip + BODY), tilt_to=0.0)   # 앉는다
         self.grounded = True
         self.sit(x0)
         self.clear_above_moon(gripped=False)
@@ -950,17 +989,17 @@ class Climber:
         self.lids, self.look_at = 0.0, None
         self.sleeping, self.nap, self.ledge = False, False, None
 
-        def at(dx, dy):
-            return lambda: V(self.body.x + dx, self.body.y + dy)
-        yield from self.move_all({"LF": lambda: V(self.body.x - 0.35, lip + 0.05), "RF": lambda: V(self.body.x + 0.35, lip + 0.05),
-                                  "LH": at(-0.75, -0.55), "RH": at(0.75, -0.55)}, 0.7, body_to=lambda: V(x0, lip + 2.15),
-                                 tilt_to=0.0)   # 일어선다
+        def at(dx, dy):   # 처음 몸에 맞춘 손 자리 (몸에서)
+            p = pose(dx, dy, "H")
+            return lambda: self.body + p
+        stand = self.stand_goals(lambda: lip)
+        yield from self.move_all(stand, 0.7, body_to=lambda: V(x0, lip + stand_h(2.15)), tilt_to=0.0)   # 일어선다
         self.texts.append(Float(self.body + V(0, 1.6), "다시 지구로!"))
         yield from self.move_all({"RH": at(0.7, 1.6)}, 0.3)   # 손을 흔들고
         yield from self.move_all({"RH": at(0.9, 1.3)}, 0.2)
         yield from self.move_all({"RH": at(0.7, 1.6)}, 0.2)
-        yield from self.move_all({"LH": at(-0.75, -0.55), "RH": at(0.75, -0.55)}, 0.3, body_to=lambda: V(x0, lip + 1.7))   # 웅크렸다
-        yield from self.move_all({"LH": at(-0.6, 1.6), "RH": at(0.6, 1.6)}, 0.3, body_to=lambda: V(x0, lip + 2.8))   # 뛰어오른다
+        yield from self.move_all({"LH": stand["LH"], "RH": stand["RH"]}, 0.3, body_to=lambda: V(x0, lip + stand_h(1.7)))   # 웅크렸다
+        yield from self.move_all(self.arms_up(1.6), 0.3, body_to=lambda: V(x0, lip + stand_h(2.8)))   # 뛰어오른다
         self.grounded = False
         for limb in self.limbs.values():   # 허우적
             limb.mode, limb.tucked = "free", False
@@ -979,11 +1018,8 @@ class Climber:
         body, holds = self.start_pose
 
         def stand(x):
-            return lambda: V(x, self.ground_y() + 2.15)
-        feet = {"LF": lambda: V(self.body.x - 0.35, self.ground_y() + 0.05),
-                "RF": lambda: V(self.body.x + 0.35, self.ground_y() + 0.05),
-                "LH": lambda: V(self.body.x - 0.75, self.body.y - 0.55), "RH": lambda: V(self.body.x + 0.75, self.body.y - 0.55)}
-        yield from self.move_all(feet, 0.7, body_to=stand(self.body.x), tilt_to=0.0)   # 일어선다
+            return lambda: V(x, self.ground_y() + stand_h(2.15))
+        yield from self.move_all(self.stand_goals(self.ground_y), 0.7, body_to=stand(self.body.x), tilt_to=0.0)   # 일어선다
         steps = max(1, round(abs(body.x - self.body.x) / 0.6))
         x0 = self.body.x
         for i in range(steps):   # 벽 앞으로 걸어간다 (콩콩)
@@ -1000,7 +1036,7 @@ class Climber:
         if self.hp <= 0:
             if self.lids < 0.85:
                 yield from self.tween(self, "lids", self.lids, 0.9, 0.8)
-            self.texts.append(Float(self.body + V(-0.5 * self.face, 1.0), self.wrng.choice(("z", "Z")), "z"))
+            self.texts.append(Float(self.body + V(-0.5 * self.face, 1.0) * BODY, self.wrng.choice(("z", "Z")), "z"))
             yield from self.wait(2.4, until=lambda: bool(self.requests) or self.hp > 0)
             return
         if self.lids > 0.1:
@@ -1732,11 +1768,19 @@ class Climber:
                     self.body = self.body - n * (dist - length - 0.7)
                     if along > 0:
                         self.vel = self.vel - n * along
-        old = self.body
-        free = old + self.vel * dt
-        moved = self.project(free)
-        self.vel = self.vel + (moved - free) * (0.5 / dt)   # 끌려간 만큼의 속도는 반만 남긴다 (튀어 오르지 않게)
-        self.body = moved
+        free = self.body + self.vel * dt
+        pull = self.project(free) - free
+        if self.mode == "spring" and pull.len() > PULL_SPEED * dt:
+            # 닿는 거리를 넘겨 벌린 자세에서 발을 떼면 남은 손이 몸을 한 번에 끌어 올린다 (튄다): PULL_SPEED 로 몇 프레임에
+            # 나눠 끈다. 끌리는 반대쪽으로 가던 속도만 없애고 끈 만큼은 속도에 더하지 않는다 (더하면 프레임마다 빨라진다)
+            n = pull * (1 / pull.len())
+            along = self.vel.x * n.x + self.vel.y * n.y
+            if along < 0:
+                self.vel = self.vel - n * along
+            pull = n * (PULL_SPEED * dt)
+        else:
+            self.vel = self.vel + pull * (0.5 / dt)   # 끌려간 만큼의 속도는 반만 남긴다 (튀어 오르지 않게)
+        self.body = free + pull
         self.tilt_vel += ((tilt_goal - self.tilt) * 60 - self.tilt_vel * 11) * dt
         self.tilt += self.tilt_vel * dt
 
@@ -1797,7 +1841,7 @@ class Climber:
             if self.sweat_t <= 0:
                 self.sweat_t = 1.6 if self.hp > 30 else 0.8
                 side = self.wrng.choice((-1, 1))
-                self.particles.append(Particle(self.body + V(side * 0.7, 0.75).rot(self.tilt),
+                self.particles.append(Particle(self.body + (V(side * 0.7, 0.75) * BODY).rot(self.tilt),
                                                V(side * 0.6, 0.6), 1.1, 0.12, "sweat"))
         # 눈 깜빡임과 잠꼬대
         if self.blink_age is not None:
@@ -1812,7 +1856,7 @@ class Climber:
             self.z_t -= dt
             if self.z_t <= 0:
                 self.z_t = 1.3
-                self.texts.append(Float(self.body + V(-0.5 * self.face, 1.0), self.wrng.choice(("z", "Z")), "z"))
+                self.texts.append(Float(self.body + V(-0.5 * self.face, 1.0) * BODY, self.wrng.choice(("z", "Z")), "z"))
 
     def move_milestones(self, dt):
         """기록을 넘으면 말풍선과 색종이 (지난 주 기록이면 그 자리 바위에 자국도). 같은 기록은 한 번만."""
@@ -1856,7 +1900,7 @@ class Climber:
             rock[1] = rock[1] + V(0, -GRAVITY * 0.3) * dt
             rock[0] = rock[0] + rock[1] * dt
             rock[2] += rock[3] * dt
-            if not rock[5] and rock[0].y < self.body.y + 1.0:   # 바위 턱에 튕겨 옆으로
+            if not rock[5] and rock[0].y < self.body.y + BODY:   # 바위 턱에 튕겨 옆으로
                 rock[5] = True
                 side = 1 if rock[0].x > self.body.x else -1
                 rock[1] = V(side * rng.uniform(1.5, 2.5), 1.5)
@@ -1951,19 +1995,19 @@ class Climber:
 
     def harness(self):
         """하네스 (로프를 묶은 곳)."""
-        return self.body + V(0, -0.62).rot(self.tilt)
+        return self.body + V(0, -0.62 * BODY).rot(self.tilt)
 
     def bag_mouth(self, depth=0.0):
         """허리 뒤 초크백 입구 (보는 쪽의 반대편)."""
-        return self.body + V(0.46 * self.face, -0.78 - depth).rot(self.tilt)
+        return self.body + (V(0.46 * self.face, -0.78 - depth) * BODY).rot(self.tilt)
 
     def blow_point(self):
-        return self.body + V(-1.05 * self.face, -0.05).rot(self.tilt)
+        return self.body + V(-1.05 * self.face * BODY, -0.05 * BODY).rot(self.tilt)
 
     def tucked(self, name):
         """침낭 안에 넣은 손발 자리."""
         side, kind = LIMBS[name]
-        offset = V(side * 0.55, -0.35) if kind == "H" else V(side * 0.35, -0.85)
+        offset = (V(side * 0.55, -0.35) if kind == "H" else V(side * 0.35, -0.85)) * BODY
 
         def point():
             return self.body + offset.rot(self.tilt)
@@ -2310,9 +2354,9 @@ class Climber:
         다리가 닿는 홀드가 있으면 그 위에 올려 두고 (다음 차례에 딛는다), 없으면 손 가운데 (hx) 아래쪽 벽을 딛는다
         (몸이 그쪽으로 옮겨 가도 몸 바깥에 남게)."""
         if style == "flag":
-            return lambda: foot.root(self.body, self.tilt) + V(foot.side * 1.2, -0.8)
+            return lambda: foot.root(self.body, self.tilt) + V(foot.side * 1.2, -0.8) * LIMB
         if style == "backflag":
-            return lambda: foot.root(self.body, self.tilt) + V(-foot.side * 0.95, -1.3)
+            return lambda: foot.root(self.body, self.tilt) + V(-foot.side * 0.95, -1.3) * LIMB
         if style == "balance":
             s = foot.side
             hx = sum(self.hands_x()) / 2 if hx is None else hx
@@ -2721,7 +2765,7 @@ class Climber:
             def hang(wiggle=0.0, limb=limb):
                 root = limb.root(self.body, self.tilt)
                 shake = math.sin(self.t * 2 * math.pi * 4.5) * wiggle
-                return root + V(limb.side * (0.95 + shake), -1.15 + shake * 0.5)
+                return root + V(limb.side * (0.95 + shake), -1.15 + shake * 0.5) * LIMB
 
             yield from self.move_limb(name, hang, 0.3, arc=0.1)
             yield from self.move_limb(name, lambda hang=hang: hang(0.17), 1.0, arc=0.0)
@@ -2764,7 +2808,7 @@ class Climber:
         self.mode = "script"
         start = self.body
         swing = 1 if start.x < jug.p.x else -1
-        apex = jug.p + V(-swing * 0.35, -1.45)
+        apex = jug.p - pose(swing * 0.35, 1.45, "H")   # 손이 홀드에 닿는 몸 자리 (처음 몸에서 홀드 0.35 옆·1.45 아래)
         hand_from = [l.pos for l in hands]
         for l in hands:
             l.mode = "move"
@@ -2851,7 +2895,7 @@ class Climber:
     def fall_home(self, height, after):
         """height (m) 에서 땅까지 떨어진다 (wall_end·moon_leave): 몸은 같은 빠르기, 높이 숫자와 배경은 가속 눈금을 따라.
         쿵 하고 새 벽의 땅에 주저앉아 after 를 말한다."""
-        land = GROUND + 1.0   # 몸통이 땅에 닿는 높이
+        land = GROUND + BODY   # 몸통이 땅에 닿는 높이
         final = min(height, 12.0)   # 마지막 이만큼은 떨어지는 빠르기대로 (땅이 아래에서 올라와 닿는다)
         pct, pct_end = height_pct(height), height_pct(final)   # 그 위는 높이 숫자만 가속 눈금을 따라
         slow = FALL_SPEED / (SCALE_K * (SCALE_A + final))   # final 에서 FALL_SPEED 가 되는 % 빠르기
@@ -2887,7 +2931,7 @@ class Climber:
             self.holds = [h for h in self.holds if h.p.y < self.cam + 15]
             self.bolts = [b for b in self.bolts if b.p.y < self.cam + 15]
         self.new_wall(restart=False, grounded=True, keep=(self.cam - self.body.y, self.body.x))   # 땅에 주저앉는다
-        self.puff(self.body + V(0, -0.9), n=16, speed=2.2, size=0.22, life=0.9)   # 쿵
+        self.puff(self.body + V(0, -0.9 * BODY), n=16, speed=2.2, size=0.22, life=0.9)   # 쿵
         self.texts.append(Float(self.body + V(0, 1.6), "쿵!"))
         self.squash_vel -= 4.0
         yield from self.wait(1.0, stoppable=False)
@@ -2952,7 +2996,7 @@ class Climber:
         self.mode = "script"
         start = self.body
         swing = 1 if start.x < jug.p.x else -1
-        apex = jug.p + V(-swing * 0.45, -1.75)   # 조금 못 미친다
+        apex = jug.p - pose(swing * 0.45, 1.75, "H")   # 조금 못 미친다
         hand_from = [l.pos for l in hands]
         touch = [jug.grip("H", l.side) + V(-swing * 0.12, -0.2) for l in hands]
         for l in hands:
@@ -3033,7 +3077,7 @@ class Climber:
         # 2. 펼친다
         yield from self.tween(ledge, "open", 0.0, 1.0, 0.7)
         # 3. 손발을 놓고 침대에 올라앉는다
-        seat = ledge.bed + V(0, 0.92)
+        seat = ledge.bed + V(0, 0.92 * BODY)
         yield from self.move_all({n: self.tucked(n) for n in self.limbs}, 0.9, body_to=lambda: seat, tilt_to=0.12, hop=0.5)
         self.crouch = 0.0
         # 4. 침낭을 끌어올리고 잔다
@@ -3056,7 +3100,7 @@ class Climber:
         yield from self.tween(self, "lids", 1.0, 0.0, 0.35)
         yield from self.wait(0.3, stoppable=False)
         self.squash_vel += 1.8
-        yield from self.move_all({"LH": lambda: self.body + V(-0.6, 1.75), "RH": lambda: self.body + V(0.6, 1.75)}, 0.45)
+        yield from self.move_all(self.arms_up(), 0.45)
         yield from self.wait(0.5, stoppable=False)
         yield from self.move_all({"LH": self.tucked("LH"), "RH": self.tucked("RH")}, 0.35)
         yield from self.tween(ledge, "bag", 1.0, 0.0, 0.4)
@@ -3089,10 +3133,10 @@ class Climber:
         limb.fist = True
 
         def up():
-            return limb.root(self.body, self.tilt) + V(limb.side * 0.55, 0.8)
+            return limb.root(self.body, self.tilt) + V(limb.side * 0.55, 0.8) * LIMB
 
         def down():
-            return limb.root(self.body, self.tilt) + V(limb.side * 0.6, 0.35)
+            return limb.root(self.body, self.tilt) + V(limb.side * 0.6, 0.35) * LIMB
 
         yield from self.move_limb(name, up, 0.3, arc=0.1)
         for _ in range(2):

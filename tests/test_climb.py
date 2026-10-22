@@ -324,6 +324,41 @@ class ClimberTest(unittest.TestCase):
         sim.update(1e-5)
         self.assertLess(abs(sim.body.y - y), 0.01)
 
+    def test_far_hands_pull_the_body_over_several_frames(self):
+        """손이 닿는 거리보다 몸이 아래에 있으면 (벌린 자세에서 발이 빠졌다) 잡은 손은 몸을 한 프레임에 끌어 올리지 않고
+        PULL_SPEED 로 몇 프레임에 나눠 끈다."""
+        sim = Climber(5)
+        sim.tokens_on = False
+        run(sim, 5.0)
+        hands = [sim.limbs["LH"], sim.limbs["RH"]]
+        for limb in hands:
+            limb.mode, limb.pos = "grip", sim.grip_point(limb, limb.hold)
+        for name in ("LF", "RF"):
+            sim.limbs[name].mode = "free"
+        sim.mode, sim.vel, sim.phase_target = "spring", climbcore.V(), None
+        sim.body = sim.body - climbcore.V(0, 0.8)
+        start = sim.body
+        sim.move_body(1 / 60)
+        self.assertLess((sim.body - start).len(), 0.12)   # 초당 5m 면 한 프레임 0.08m 남짓 (안 막으면 0.35m)
+        for _ in range(30):
+            sim.move_body(1 / 60)
+        for limb in hands:   # 0.5초 안에는 다 끌어 올렸다
+            self.assertLess((limb.pos - limb.root(sim.body, sim.tilt)).len(), limb.reach)
+
+    def test_body_does_not_jump_when_a_foot_lets_go(self):
+        """보통 오르기에서 몸이 한 프레임에 0.6m 넘게 튀지 않는다. 이 시드들은 PULL_SPEED 가 없으면 25초 안에 손발을
+        닿는 거리 넘게 벌린 채 발을 떼어 (클립·미끄러짐) 남은 손이 몸을 한 번에 끌어 올렸다."""
+        for seed in (2, 9, 16):
+            sim = Climber(seed)
+            sim.tokens_on, sim.work = False, 3
+            worst = 0.0
+            while sim.t < 25:
+                body, mode = sim.body, sim.mode
+                sim.update(DT)
+                if sim.t > 3 and mode == sim.mode == "spring":
+                    worst = max(worst, (sim.body - body).len())
+            self.assertLess(worst, 0.6, seed)
+
     def test_exhaust_twice_makes_one_portaledge(self):
         sim = Climber(7)
         sim.hp = 0
@@ -866,7 +901,7 @@ class WallTest(unittest.TestCase):
         self.assertTrue(3.0 <= dur <= 7.5 if height > 15 else dur <= 3.0, dur)   # 높으면 4~7초, 낮으면 짧게
         self.assertTrue(all(b <= a + 0.05 for a, b in zip(alts, alts[1:])))   # 높이는 줄기만 한다
         tail = [a for a in alts if a < 11.0]   # 마지막 12m 는 떨어지는 빠르기대로 (땅이 아래에서 올라온다)
-        floor = climbcore.GROUND + 1.0   # 땅에 앉은 높이: 낮은 데서 떨어지면 남은 시간 동안 여기 머문다 (그 샘플은 뺀다)
+        floor = climbcore.GROUND + climbcore.BODY   # 땅에 앉은 높이: 낮은 데서 떨어지면 남은 시간 동안 여기 머문다 (그 샘플은 뺀다)
         while len(tail) > 1 and abs(tail[-1] - floor) < 1e-6 and abs(tail[-2] - floor) < 1e-6:
             tail.pop()
         if len(tail) > 3:
@@ -884,7 +919,7 @@ class WallTest(unittest.TestCase):
         self.assertTrue(all(h.p.y < 20 for h in sim.holds))
         self.assertEqual(sim.grounded, grounded)
         if grounded:   # 땅에 주저앉아 있다
-            self.assertAlmostEqual(sim.body.y, sim.ground_y() + 1.0, delta=0.05)
+            self.assertAlmostEqual(sim.body.y, sim.ground_y() + climbcore.BODY, delta=0.05)
             self.assertTrue(all(l.mode == "follow" for l in sim.limbs.values()))
         else:
             self.assertTrue(all(l.mode == "grip" for l in sim.limbs.values()) or sim.sleeping or sim.ledge is not None)
@@ -913,7 +948,7 @@ class WallTest(unittest.TestCase):
         self.check_new_wall(sim)
         run(sim, 30.0)   # 주간 사용량이 돌아오기 전에는 땅에서 기다린다 (일하는 펫이 있어도)
         self.assertTrue(sim.grounded)
-        self.assertAlmostEqual(sim.body.y, sim.ground_y() + 1.0, delta=0.05)
+        self.assertAlmostEqual(sim.body.y, sim.ground_y() + climbcore.BODY, delta=0.05)
         for name in ("chalk", "dyno", "fall", "wake"):   # 다른 동작은 받지 않는다
             sim.request(name)
         self.assertEqual(sim.requests, [])
@@ -951,6 +986,22 @@ class WallTest(unittest.TestCase):
         run(sim, 20.0)
         self.assertFalse(sim.grounded)
         self.assertTrue(sim.sleeping)   # 일어나 벽에 붙은 뒤 포타레지에서 잔다
+
+    def test_wall_ends_hidden_while_hanging_on_the_rope(self):
+        """로프에 매달린 동안 (창이 숨어) 벽이 끝나 땅에 앉아도, 버린 로프 추락 동작이 앉은 몸을 스프링으로 띄우지 않는다."""
+        sim = Climber(3)
+        sim.tokens_on, sim.work = False, 1
+        run(sim, 20.0)
+        sim.request("fall")
+        for _ in range(600):
+            if sim.rope is not None:
+                break
+            run(sim, DT)
+        self.assertIsNotNone(sim.rope)
+        sim.end_wall(animate=False, locked=True)
+        run(sim, 2.0)
+        self.check_new_wall(sim)
+        self.assertEqual(sim.mode, "script")
 
     def test_hidden_or_without_events(self):
         sim = Climber(3)
@@ -1266,7 +1317,7 @@ class MoonTest(unittest.TestCase):
     def check_on_moon(self, sim):
         self.assertTrue(sim.grounded)
         self.assertIsNotNone(sim.moon)
-        self.assertAlmostEqual(sim.body.y, sim.moon + 1.0, delta=0.05)   # 달 표면에 앉아 있다
+        self.assertAlmostEqual(sim.body.y, sim.moon + climbcore.BODY, delta=0.05)   # 달 표면에 앉아 있다
         self.assertIsNotNone(sim.moon_flag)
         self.assertEqual(sim.altitude(), climbcore.MOON)
         self.assertEqual(sim.shown_altitude(), climbcore.MOON)
@@ -1298,6 +1349,22 @@ class MoonTest(unittest.TestCase):
         again.set_week(100)   # 다시 켜도 달 위 (내려오지 않는다)
         run(again, 5.0)
         self.check_on_moon(again)
+
+    def test_moon_surface_is_not_below_the_hands(self):
+        """달 표면은 잡고 있던 손 홀드보다 낮지 않다 (손이 표면 위 허공의 안 보이는 홀드를 쥐고 있지 않게. 팔이 길어
+        매달린 몸이 손에서 멀어도)."""
+        for seed in (1, 3, 5, 10):
+            sim = Climber(seed)
+            sim.tokens_on, sim.work = False, 1
+            sim.set_week(99, 1000.0, 1_792_623_600)
+            run(sim, 20.0)
+            sim.set_week(100)
+            sim.reach_moon()
+            while "moon_top" not in sim.actions:
+                run(sim, DT)
+            top = max(sim.held_y(sim.limbs[n]) for n in ("LH", "RH"))
+            self.assertLessEqual(top, sim.moon + 1e-6, seed)
+            self.assertLessEqual(sim.moon - top, 0.8 + 1e-6, seed)
 
     def test_from_the_portaledge_and_hidden(self):
         sim = self.at_moon(seed=7, sleep=True)   # 자다가 100%: 깨어 포타레지를 접고 오른다
@@ -1341,7 +1408,7 @@ class MoonTest(unittest.TestCase):
         reach.reach_moon()
         while reach.moon is None:
             reach.update(DT)
-        self.assertLess(reach.moon - reach.body.y, 1.9)   # 팔이 닿는 거리 (어깨 0.26 + 팔 1.68) 안
+        self.assertLess(reach.moon - reach.body.y, climbcore.SHOULDER[1] + sum(climbcore.ARM))   # 팔이 닿는 거리 안
 
     def test_leaves_the_moon_falls_home_and_climbs_again(self):
         sim = self.at_moon(seed=9)
