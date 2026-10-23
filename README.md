@@ -134,8 +134,8 @@ $23.08, `journalcore.PLAN_MONTH_USD`) 의 몇 배인지, 1% 에 드는 금액과
 Claude Code 기록만 센다. 열려 있는 동안 10초마다 새로 읽는다. 글자 배율 (GNOME 큰 글씨) 에 맞춰 창도 커진다.
 길(홀드)은 켤 때마다 새로 깐다. 바위와 배경 그림(`assets/climb/`)은 이 저장소용으로 그림 생성 AI 로 만들었다.
 
-아바타는 `avatar/body.png`(팔다리 없는 투명 배경 몸통 그림) 와 `avatar/avatar.json`(몸통 공·눈 자리) 이다
-(개인 캐릭터라 git 에 넣지 않는다). 몸통 그림 하나로 `python3 tools/avatar_prep.py 몸통.png` 를 한 번 돌려 만든다
+아바타는 `avatar/body.png`(팔다리 없는 투명 배경 몸통 그림) 와 `avatar/avatar.json`(몸통 공·눈 자리) 이다.
+몸통 그림 하나로 `python3 tools/avatar_prep.py 몸통.png` 를 한 번 돌려 만든다
 (numpy·scipy 가 필요하다). 팔다리는 코드로 그리고, 눈 자리는 눈 깜빡임에 쓴다. 없으면 회색 공을 그린다.
 
 ## 구성
@@ -154,7 +154,7 @@ gnome-extension/claude-pet-focus@claude-pet/   펫 클릭 시 창 올리기, 메
 pets/              직접 만든 펫
 pets-downloaded/   Petdex 등에서 받은 펫 (git 제외)
 assets/climb/      끝없이 오르기 바위·배경 그림
-avatar/            내 아바타 몸통 그림 (git 제외, tools/avatar_prep.py 로 만든다)
+avatar/            내 아바타 몸통 그림 (tools/avatar_prep.py 로 만든다)
 tools/             펫 만들기 도구 (docs/making-pets.md), 작업 요약 사용량 재기 gist_usage.py (docs/gist-usage.md),
                    확인용 가짜 세션 fake_session.py 와 시험 모드 pet_test_mode.sh, 끝없이 오르기 긴 검사 climb_check.py
                    (아래 "확인하기")

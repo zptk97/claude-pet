@@ -5,7 +5,7 @@ avatar/body.png 와 avatar/avatar.json (몸통 공의 중심·반지름, 눈 자
 
     python3 tools/avatar_prep.py 몸통.png
 
-numpy 와 scipy 가 필요하다 (이 도구만 쓴다). avatar/ 는 개인 캐릭터라 git 에 넣지 않는다.
+numpy 와 scipy 가 필요하다 (이 도구만 쓴다).
 """
 import json
 import sys

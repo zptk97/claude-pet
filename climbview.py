@@ -1,7 +1,7 @@
 """끝없이 오르기 창: 펫 줄 오른쪽 끝에 바위 기둥과 내 아바타를 그린다 (계산은 climbcore).
 
 그림은 assets/climb/ (바위 rock.jpg, 높이 구간별 배경 bg/*.jpg) 과 내 아바타 avatar/body.png + avatar.json
-(개인 캐릭터라 git 에 넣지 않는다, tools/avatar_prep.py 로 만든다. 없으면 회색 공을 그린다).
+(tools/avatar_prep.py 로 만든다. 없으면 회색 공을 그린다).
 창 폭은 바위 기둥의 SCENE_W 배라 양옆으로 배경과 날씨가 보이고, 클릭은 바위 기둥과 높이 상자에서만 받는다
 (X11 입력 모양, 양옆은 아래 창으로 지나간다). 늘 60fps 로 그리고 숨기면 멈춘다 (계산도 멈춘다). 밤 (서울 해 지는
 시각, climbcore.night_level) 에는 하늘·바위·아바타를 어둡게 하고 별을 띄우고, 아바타가 헤드램프로 다음 홀드 쪽을 비춘다. 왼쪽 버튼으로 끌면
@@ -26,7 +26,7 @@ from climbcore import (ARM, BANDS, BODY, KST, LEG, M_PER_TOKEN, MOON, PACE_BANK,
 
 APP_DIR = Path(__file__).resolve().parent
 ASSET_DIR = APP_DIR / "assets" / "climb"
-AVATAR_DIR = APP_DIR / "avatar"   # 내 아바타 (git 제외): body.png (투명 배경), avatar.json (몸통 공·눈 자리)
+AVATAR_DIR = APP_DIR / "avatar"   # 내 아바타: body.png (투명 배경), avatar.json (몸통 공·눈 자리)
 UNIT_PX = 50                      # 1m (처음 몸의 몸통 반지름) 의 px (펫 크기 배율을 곱한다: 보통이면 25 → 창 높이 300)
 FRAME_MS = 16                     # 늘 60fps (쉬거나 잘 때 낮추면 비·눈이 끊겨 보인다)
 STEP_MAX = 0.05                   # 계산 한 번에 넘기는 시간 (초). 프레임이 길면 나눠서 넘긴다
