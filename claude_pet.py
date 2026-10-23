@@ -289,7 +289,9 @@ class X11:
     페이저처럼 _NET_RESTACK_WINDOW 로 다른 창 바로 아래에 두는 요청은 받아 준다 (위로 올리는 건 안 된다).
     항상 위 창끼리만 순서가 바뀌고 보통 창보다는 계속 위에 있다.
     모니터별 작업 영역: 모니터가 여럿이면 Qt5 는 _NET_WORKAREA 를 쓰지 않아 독·상단바 자리까지 화면으로 보므로,
-    GNOME 이 모니터마다 알려 주는 _GTK_WORKAREAS_D<데스크톱> 을 읽는다."""
+    GNOME 이 모니터마다 알려 주는 _GTK_WORKAREAS_D<데스크톱> 을 읽는다.
+    그림 막힘: GNOME 은 창 속성 _XWAYLAND_ALLOW_COMMITS 를 0 으로 해서 XWayland 창의 그림을 잠깐 막았다가 1 로
+    푸는데, 숨겼다 다시 보이는 창에 0 이 남는 일이 있어서 다시 보이기 전에 1 로 되돌린다."""
 
     STACK_BELOW = 1        # ConfigureWindow stack_mode Below
     SOURCE_PAGER = 2       # 창 관리자가 앱 요청이 아니라 사용자 뜻으로 보고 들어준다
@@ -297,6 +299,7 @@ class X11:
     SUBSTRUCTURE_MASK = (1 << 19) | (1 << 20)  # SubstructureNotify | SubstructureRedirect
     XA_CARDINAL = 6
     XA_WINDOW = 33
+    PROP_MODE_REPLACE = 0
     SHAPE_INPUT = 2        # XShape: 클릭을 받는 모양
     SHAPE_SET = 0
 
@@ -320,6 +323,8 @@ class X11:
             ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p)]
         lib.XFree.argtypes = [ctypes.c_void_p]
+        lib.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
         display = lib.XOpenDisplay(None)
         if not display:
             return
@@ -328,6 +333,7 @@ class X11:
         self.restack_atom = lib.XInternAtom(display, b"_NET_RESTACK_WINDOW", 0)
         self.stacking_atom = lib.XInternAtom(display, b"_NET_CLIENT_LIST_STACKING", 0)
         self.desktop_atom = lib.XInternAtom(display, b"_NET_CURRENT_DESKTOP", 0)
+        self.allow_commits_atom = lib.XInternAtom(display, b"_XWAYLAND_ALLOW_COMMITS", 0)
 
     def root_property(self, atom, kind):
         """루트 창의 32비트 값 목록 속성. 없거나 못 읽으면 []."""
@@ -379,6 +385,16 @@ class X11:
         message.data[1] = lowest
         message.data[2] = self.STACK_BELOW
         self.lib.XSendEvent(self.display, self.root, 0, self.SUBSTRUCTURE_MASK, ctypes.byref(event))
+        self.lib.XFlush(self.display)
+
+    def allow_commits(self, window):
+        """숨겨 둔 window 를 다시 보이기 직전에 부른다. 지난번에 보일 때 남은 _XWAYLAND_ALLOW_COMMITS 0 을 1 로 되돌린다
+        (0 이 남아 있으면 창은 떠 있어도 XWayland 가 그림을 화면에 내보내지 않아 보이지 않는다)."""
+        if self.lib is None:
+            return
+        value = (ctypes.c_long * 1)(1)
+        self.lib.XChangeProperty(self.display, window, self.allow_commits_atom, self.XA_CARDINAL, 32,
+                                 self.PROP_MODE_REPLACE, value, 1)
         self.lib.XFlush(self.display)
 
     def set_input_shape(self, window, rects):
@@ -858,7 +874,7 @@ class PetWindow(QWidget):
 
     def effect(self, kind, count):
         if self.effects is None:
-            self.effects = EffectLayer()
+            self.effects = EffectLayer(self.manager.x11)
         self.effects.add(kind, QRect(self.pos() + self.pet_rect.topLeft(), self.pet_rect.size()), count)
 
     # ---- 혼자 움직이기 -------------------------------------------------------
@@ -1116,13 +1132,14 @@ class EffectLayer(QWidget):
     """펫 둘레에 잠깐 뜨는 효과 (쓰다듬기 하트, 축하 색종이). 펫 창 마스크 밖까지 그려야 해서 따로 띄우고,
     입력은 통과시켜 아래 펫을 그대로 누를 수 있다. 효과가 다 끝나면 숨는다 (펫 창이 닫힐 때 같이 닫힌다)."""
 
-    def __init__(self):
+    def __init__(self, x11):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
                          | Qt.NoDropShadowWindowHint | Qt.WindowDoesNotAcceptFocus
                          | Qt.WindowTransparentForInput)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowTitle("Claude Pet Effect")
+        self.x11 = x11
         self.particles = []  # 화면 좌표로 둔다 (창을 옮겨도 제자리에 남는다)
         self.timer = QTimer(self, interval=EFFECT_TICK_MS, timeout=self.step)
         self.last = 0.0
@@ -1165,6 +1182,7 @@ class EffectLayer(QWidget):
         if area != self.geometry():
             self.setGeometry(area)
         if not self.isVisible():
+            self.x11.allow_commits(int(self.winId()))
             self.show()
         if not self.timer.isActive():
             self.last = now
@@ -1227,7 +1245,7 @@ class EffectLayer(QWidget):
 class UsageCard(QWidget):
     """펫에 마우스를 올리면 그 펫 위에 뜨는 카드: 세션 제목·상태, 펫 레벨, 컨텍스트, 계정 5시간·주간 사용량."""
 
-    def __init__(self):
+    def __init__(self, x11):
         # 카드가 마우스를 가로채면 펫에서 leave 가 와서 깜빡이므로 입력을 통과시킨다
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
                          | Qt.NoDropShadowWindowHint | Qt.WindowDoesNotAcceptFocus
@@ -1235,6 +1253,7 @@ class UsageCard(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowTitle("Claude Pet Usage")
+        self.x11 = x11
         family = self.font().family()
         self.title_font = QFont(family, 10, QFont.Bold)
         self.text_font = QFont(family, 9)
@@ -1276,6 +1295,7 @@ class UsageCard(QWidget):
         y = max(pet.top() - self.height() - 6, area.top() + 4)
         self.move(x, y)
         if not self.isVisible():
+            self.x11.allow_commits(int(self.winId()))
             self.show()
         self.raise_()
 
@@ -1467,7 +1487,7 @@ class PetManager(QObject):
         self.view_states = {}  # session_id -> 지금 보이는 상태 (접혀서 안 보이는 세션도)
         self.titles_by_sid = {}
         self.folded_summary = False  # 접혔는데 손이 필요한 세션이 없어 요약 펫을 세웠는지
-        self.card = UsageCard()
+        self.card = UsageCard(self.x11)
         self.hover_sid = None
         self.hover_timer = QTimer(self, singleShot=True, interval=HOVER_DELAY_MS, timeout=self.update_card)
         saved = self.config.get("assignments")

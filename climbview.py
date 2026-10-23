@@ -1190,6 +1190,7 @@ class ClimbWindow(QWidget):
         self.setGeometry(left, floor - height, width, height)
         self.actor = None           # 다음에는 창 전체를 그린다
         if not self.isVisible():
+            self.manager.x11.allow_commits(int(self.winId()))
             self.show()
             self.shape = None       # 창을 다시 보이면 클릭 영역을 다시 건다
         if not self.timer.isActive():
