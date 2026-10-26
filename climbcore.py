@@ -40,6 +40,7 @@ FILL_AHEAD = VIEW_TOP + 2.5  # 홀드를 미리 깔아 두는 높이 (화면 위
 
 SCENE_W = 1.8               # 창 폭 = 바위 기둥 폭의 몇 배 (양옆으로 배경과 날씨가 보인다)
 HIGH = 9500                 # 이 높이 (m) 위로는 비·눈이 없고 흐리지도 않다 (구름바다 위)
+METEOR_FROM = 12000         # 이 높이 (m) 위로는 날씨 대신 유성이 떨어진다 (성층권부터 하늘 위쪽이 어둡다)
 SUNLIT = (90000, 100000)    # 이 두 높이 (m) 사이에서 밤에 어두워지는 게 서서히 없어진다 (배경이 우주로 넘어가는 곳. 우주는 늘 햇빛)
 SEOUL = (37.57, 126.98)     # 해 뜨고 지는 시각을 셀 곳 (위도, 경도)
 KST = timezone(timedelta(hours=9))   # 서울 시각
@@ -141,6 +142,7 @@ SWAY = 0.35                                   # 손을 떼면 몸이 남은 손 
 PULL_SPEED = 5.0                              # 잡은 손발이 몸을 닿는 거리 안으로 끄는 가장 빠른 빠르기 (m/s. 보통은 99.9% 가 이보다 느리다)
 FACE_HOLD = 2.5                               # 길이 한쪽으로 이만큼 (초) 넘게 이어져야 몸을 돌린다
 WEATHER = {0: 0.0, 1: 0.3, 2: 0.65, 3: 1.0}  # 일하는 펫 수 → 날씨 세기 (0 맑음, 0.3 흐림, 비·눈, 폭풍우·눈보라)
+METEORS = [(0.1, 0.0), (0.3, 0.12), (0.65, 0.45), (1.0, 2.5)]   # 날씨 세기 → 유성 수 (개/초): 쉬면 없고 1개 가끔, 2개 자주, 3개 유성우
 
 
 class V:
@@ -188,6 +190,16 @@ def week_height(pct):
 def height_pct(m):
     """week_height 의 거꾸로: 높이 (m) → 주간 사용량 (%)."""
     return math.log1p(max(0.0, m) / SCALE_A) / SCALE_K
+
+
+def meteor_rate(weather):
+    """날씨 세기 → 유성이 떨어지는 빠르기 (개/초). METEORS 사이를 곧게 잇는다."""
+    if weather <= METEORS[0][0]:
+        return 0.0
+    for (w0, r0), (w1, r1) in zip(METEORS, METEORS[1:]):
+        if weather <= w1:
+            return r0 + (r1 - r0) * (weather - w0) / (w1 - w0)
+    return METEORS[-1][1]
 
 
 def smooth(k):
@@ -658,6 +670,7 @@ class Climber:
     def __init__(self, seed=7):
         self.rng = random.Random(seed)
         self.wrng = random.Random(seed + 1)   # 날씨·눈 깜빡임 (등반 결정과 따로)
+        self.mrng = random.Random(seed + 2)   # 유성 (날씨와도 따로: 낙석·미끄러짐 순서가 바뀌지 않게)
         self.t = 0.0
         self.cam = 0.45
         self.mode = "spring"        # spring (손발로 버팀), hang (손만, 중력), script (동작이 직접 옮김)
@@ -681,6 +694,8 @@ class Climber:
         self.precipitating = False
         self.wind = 0.0
         self.flash, self.flash_t, self.flash2 = 0.0, 4.0, None
+        self.meteors = []           # 유성 [x, y, 속도 x, 속도 y, 나이, 수명, 밝기] (창 폭·높이에 대한 비율, 아래가 +y)
+        self.meteor_dir = self.mrng.uniform(2.3, 2.5)   # 유성이 날아가는 쪽 (창 각도: 오른쪽 위에서 왼쪽 아래로)
         self.holds, self.particles, self.texts = [], [], []
         self.requests = []
         self.sweat_t = 0.0
@@ -1327,6 +1342,7 @@ class Climber:
         self.move_effects(dt)
         self.squash_min = min(self.squash_min, self.squash)
         self.move_weather(dt)
+        self.move_meteors(dt)
         self.move_milestones(dt)
         self.move_events(dt)
         if self.falling:   # 떨어지는 동안은 wall_end 가 카메라를 옮긴다
@@ -1971,6 +1987,25 @@ class Climber:
         snowing = not rain and amount > 0
         for h in self.holds:
             h.snow = min(1.0, h.snow + dt * 0.12 * amount) if snowing else max(0.0, h.snow - dt * 0.04)
+
+    def move_meteors(self, dt):
+        """성층권 위에서는 일하는 펫 수 (날씨 세기) 만큼 유성이 떨어진다. 모두 한쪽에서 와서 유성우처럼 보인다."""
+        for m in self.meteors:
+            m[0] += m[2] * dt
+            m[1] += m[3] * dt
+            m[4] += dt
+        self.meteors = [m for m in self.meteors if m[4] < m[5]]
+        rng = self.mrng
+        if self.altitude() >= METEOR_FROM and rng.random() < meteor_rate(self.weather) * dt:
+            a = self.meteor_dir + rng.uniform(-0.12, 0.12)
+            speed, life = rng.uniform(0.4, 0.7), rng.uniform(0.4, 0.8)   # 좁은 하늘 띠 안에서 지나가게 느리게
+            vx, vy = math.cos(a) * speed, math.sin(a) * speed
+            side = (1 - 1 / SCENE_W) / 2   # 사는 동안 가운데 자리는 바위 기둥 양옆 하늘 위쪽
+            mx, my = rng.uniform(0.02, side), rng.uniform(0.08, 0.32)
+            if rng.random() < 0.5:
+                mx = 1 - mx
+            bright = 1.6 if rng.random() < 0.05 else rng.uniform(0.5, 1.0)   # 가끔 밝은 불덩이
+            self.meteors.append([mx - vx * life / 2, my - vy * life / 2, vx, vy, 0.0, life, bright])
 
     def new_drop(self, rain, y):
         """빗방울·눈송이 [x, y, 떨어지는 빠르기, 크기, 흔들림 위상] (창 높이에 대한 비율)."""

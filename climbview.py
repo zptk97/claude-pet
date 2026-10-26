@@ -538,6 +538,19 @@ class Look:
                 p.setBrush(QColor(255, 255, 240, round(220 * a)))
                 r = max(0.8, self.R * 0.035 * size)
                 p.drawEllipse(QPointF(x * W, y * H), r, r)
+        for x, y, vx, vy, age, life, bright in sim.meteors:   # 유성 (머리에서 지나온 쪽으로 꼬리가 옅어진다)
+            a = min(1.0, bright * math.sin(math.pi * age / life))
+            head = QPointF(x * W, y * H)
+            tail = head - QPointF(vx * W, vy * H) * 0.25
+            g = QLinearGradient(head, tail)
+            g.setColorAt(0.0, QColor(255, 252, 235, round(235 * a)))
+            g.setColorAt(1.0, QColor(200, 220, 255, 0))
+            p.setPen(QPen(QBrush(g), max(1.3, self.R * 0.05 * bright), Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(head, tail)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 245, round(200 * a)))
+            r = max(1.2, self.R * 0.045 * bright)
+            p.drawEllipse(head, r, r)
         name = BANDS[i][1]
         if night > 0.01:
             p.setOpacity(1.0 - 0.7 * night)   # 밤에는 지나가는 것도 어둡게

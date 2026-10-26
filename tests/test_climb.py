@@ -461,6 +461,24 @@ class ClimberTest(unittest.TestCase):
             self.assertEqual(flashes > 0, storm)
             self.assertEqual(bool(sim.drops), storm)
 
+    def test_meteors_follow_work_above_stratosphere(self):
+        counts = {}
+        for height, work in ((200000.0, 0), (200000.0, 1), (200000.0, 3), (5000.0, 3)):
+            sim = Climber(7)
+            sim.tokens_on, sim.work, sim.events = False, work, False
+            sim.jump(height)
+            run(sim, 10)   # 날씨 세기가 일하는 펫 수를 따라잡을 때까지
+            new = 0
+            for _ in range(60 * 30):
+                sim.update(DT)
+                new += sum(m[4] == 0.0 for m in sim.meteors)
+            counts[height, work] = new
+        self.assertEqual(counts[200000.0, 0], 0)   # 쉬면 없다
+        self.assertGreater(counts[200000.0, 1], 0)
+        self.assertGreater(counts[200000.0, 3], 60)   # 폭풍우 세기면 유성우
+        self.assertGreater(counts[200000.0, 3], 5 * counts[200000.0, 1])
+        self.assertEqual(counts[5000.0, 3], 0)   # 성층권 아래에는 비·눈
+
     def test_holds_break_only_when_climbing_onto_new_holds(self):
         chance = climbcore.BREAK_CHANCE
         try:
