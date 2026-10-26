@@ -1952,13 +1952,13 @@ class Climber:
             kept.append(self.new_drop(rain, rng.uniform(-0.15, 0.0)))
         self.drops = kept
         self.wind = wind
-        # 폭풍우에는 가끔 번개
+        # 폭풍우에는 가끔 번개 (비가 내릴 때만이라 구름 위에서는 없다)
         self.flash = max(0.0, self.flash - dt * 5)
         if self.flash2 is not None:
             self.flash2 -= dt
             if self.flash2 <= 0:
                 self.flash, self.flash2 = 0.8, None
-        if rain and self.weather > 0.88:
+        if rain and amount > 0 and self.weather > 0.88:
             self.flash_t -= dt
             if self.flash_t <= 0:
                 self.flash_t, self.flash, self.flash2 = rng.uniform(5.0, 11.0), 1.0, 0.14

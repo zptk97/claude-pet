@@ -448,6 +448,19 @@ class ClimberTest(unittest.TestCase):
         self.assertTrue(sim.nap)
         self.assertGreater(sim.weather, 0.6)
 
+    def test_no_lightning_above_clouds(self):
+        for height, storm in ((500.0, True), (200000.0, False)):
+            sim = Climber(7)
+            sim.work, sim.events, sim.weather_kind = 3, False, "rain"
+            sim.weather, sim.precipitating = 1.0, True   # 이미 내리는 비 (비·눈을 다시 뽑지 않는다)
+            sim.jump(height)
+            flashes = 0
+            for _ in range(60 * 30):
+                sim.update(DT)
+                flashes += sim.flash == 1.0
+            self.assertEqual(flashes > 0, storm)
+            self.assertEqual(bool(sim.drops), storm)
+
     def test_holds_break_only_when_climbing_onto_new_holds(self):
         chance = climbcore.BREAK_CHANCE
         try:
