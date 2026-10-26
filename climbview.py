@@ -5,8 +5,9 @@
 창 폭은 바위 기둥의 SCENE_W 배라 양옆으로 배경과 날씨가 보이고, 클릭은 바위 기둥과 높이 상자에서만 받는다
 (X11 입력 모양, 양옆은 아래 창으로 지나간다). 늘 60fps 로 그리고 숨기면 멈춘다 (계산도 멈춘다). 밤 (서울 해 지는
 시각, climbcore.night_level) 에는 하늘·바위·아바타를 어둡게 하고 별을 띄우고, 아바타가 헤드램프로 다음 홀드 쪽을 비춘다
-(우주는 늘 햇빛이라 어둡게 하지 않는다). 왼쪽 버튼으로 끌면 펫처럼 줄 전체를 옮긴다. 바위 층은 바뀔 때만 다시 그리고,
-카메라가 멈춰 있고 비·눈이 없으면 아바타 둘레와 높이 상자만 다시 그린다 (창 관리자가 다시 합성할 넓이도 줄어든다).
+(우주는 늘 햇빛이라 어둡게 하지 않고, 아래 지구가 밤쪽이 되어 도시 불빛이 보인다). 왼쪽 버튼으로 끌면 펫처럼 줄
+전체를 옮긴다. 바위 층은 바뀔 때만 다시 그리고, 카메라가 멈춰 있고 비·눈이 없으면 아바타 둘레와 높이 상자만 다시
+그린다 (창 관리자가 다시 합성할 넓이도 줄어든다).
 """
 import json
 import math
@@ -17,8 +18,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtCore import QLineF, QPoint, QPointF, QRect, QRectF, Qt, QTimer
-from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
-                         QPixmap, QPolygonF, QRadialGradient, QRegion, QTransform)
+from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QImageReader, QLinearGradient, QPainter,
+                         QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient, QRegion, QTransform)
 from PyQt5.QtWidgets import QWidget
 
 from climbcore import (ARM, BANDS, BODY, KST, LEG, M_PER_TOKEN, MOON, PACE_BANK, SCENE_W, V, VIEW_H, VIEW_TOP, WALL_HALF,
@@ -37,6 +38,9 @@ LAMP_POOL = 1.3                   # 헤드램프가 벽을 비추는 웅덩이 �
 MOON_SLAB = 1.6                   # 기둥 위 끝 달 표면 띠의 두께 (m)
 SPACE_MOON = (0.823, 0.147, 0.045)   # 우주 배경 그림 속 달: 가운데 (그림 폭·높이 비율), 반지름 (그림 폭 비율)
 SPACE_SKY = (15, 18, 24)          # 그 달 둘레의 하늘색 (달 위에 있을 때 그림 속 달을 덮는다)
+SPACE_EARTH = (0.396, 1.4475, 1.4056)   # 우주 배경 그림 속 지구 (대기 띠 바깥 끝): 가운데 (그림 폭·높이 비율), 반지름 (그림 폭 비율)
+CITY = (255, 196, 112)            # 밤쪽 지구의 도시 불빛
+LAND_NIGHT = (24, 30, 46)         # 밤쪽 지구의 대륙 (구름을 걷은 바다보다 조금 밝다)
 
 
 def clock_night():
@@ -126,6 +130,7 @@ class Look:
                 else:
                     image = image.scaledToWidth(self.W, Qt.SmoothTransformation)
                 self.backs[name] = QPixmap.fromImage(image)
+        self.earth = self.night_earth()   # 우주의 밤에 지구에 덮을 그림과 반짝일 불빛 (우주 그림이 없으면 None)
         # 창 가장자리를 투명하게 흐리는 가림 (위아래 14%, 양옆 10%)
         self.mask = QImage(self.W, self.wall_h, QImage.Format_ARGB32_Premultiplied)
         self.mask.fill(QColor(255, 255, 255))
@@ -485,18 +490,25 @@ class Look:
             if pix is None:
                 p.fillRect(QRectF(0, 0, W, H), QColor(150, 190, 230))
                 return
+            at = QPointF((W - pix.width()) / 2, -(pix.height() - H) * (1 - k))
             p.setOpacity(opacity)
-            p.drawPixmap(QPointF((W - pix.width()) / 2, -(pix.height() - H) * (1 - k)), pix)
+            p.drawPixmap(at, pix)
+            if name == "space" and self.earth is not None and sim.night > 0.01:   # 밤: 우주는 햇빛 그대로, 지구만 밤쪽
+                p.setOpacity(opacity * sim.night)
+                self.paint_earth_night(p, at, sim.t)
             p.setOpacity(1.0)
 
         draw(BANDS[i][1], k, 1.0)
         if i + 1 < len(BANDS) and k > 0.95:   # 구간 끝 5% 에서 다음 구간으로
             draw(BANDS[i + 1][1], 0.0, (k - 0.95) / 0.05)
-        disk = None   # 덧그린 하늘의 달 (그 앞에는 별을 그리지 않는다)
+        covers = []   # 덧그린 하늘의 달과 그림 속 지구 (그 앞에는 별을 그리지 않는다)
         if BANDS[i][1] == "space" and self.backs.get("space") is not None:   # 그림 속 달 (밤에는 같이 어두워진다)
             pix = self.backs["space"]
-            cx = (W - pix.width()) / 2 + SPACE_MOON[0] * pix.width()
-            cy = -(pix.height() - H) * (1 - k) + SPACE_MOON[1] * pix.height()
+            left, top = (W - pix.width()) / 2, -(pix.height() - H) * (1 - k)
+            covers.append((left + SPACE_EARTH[0] * pix.width(), top + SPACE_EARTH[1] * pix.height(),
+                           SPACE_EARTH[2] * pix.width()))
+            cx = left + SPACE_MOON[0] * pix.width()
+            cy = top + SPACE_MOON[1] * pix.height()
             art = SPACE_MOON[2] * pix.width()
             if sim.moon is not None:   # 달 위에서는 하늘의 달을 지운다
                 g = QRadialGradient(QPointF(cx, cy), art * 1.7)
@@ -509,7 +521,7 @@ class Look:
             sky = self.sky_moon(sim, alt, art)
             if sky is not None:
                 self.paint_sky_moon(p, cx, cy, *sky)
-                disk = (cx, cy, sky[0])
+                covers.append((cx, cy, sky[0]))
         night = sim.dark()
         if night > 0.01:   # 밤: 하늘과 풍경을 어둡게
             p.fillRect(QRectF(0, 0, W, H), QColor(*NIGHT_TINT, round(205 * night)))
@@ -520,7 +532,7 @@ class Look:
             for x, y, size, phase in self.stars:
                 if not level and y > 0.4:
                     continue   # 밤에만 보이는 별은 하늘 위쪽에만 (건물·산에 겹치지 않게)
-                if disk is not None and (x * W - disk[0]) ** 2 + (y * H - disk[1]) ** 2 < disk[2] ** 2:
+                if any((x * W - a) ** 2 + (y * H - b) ** 2 < r * r for a, b, r in covers):
                     continue
                 a = stars * (0.5 + 0.5 * math.sin((sim.t * 2.2 if level else 0.0) + phase))
                 p.setBrush(QColor(255, 255, 240, round(220 * a)))
@@ -534,6 +546,93 @@ class Look:
         if name == "space" and 150000 < alt < 2000000:   # 지나가는 국제우주정거장
             self.paint_iss(p, ((sim.t / 30.0) % 1.4 - 0.2) * W, H * 0.22)
         p.setOpacity(1.0)
+
+    def night_earth(self):
+        """우주 배경 그림 크기의 밤쪽 지구 그림과 반짝일 불빛 [(그림 x, y, 위상, 반지름)]. 밤에는 구름까지 덮고, 불빛
+        무늬로 만든 대륙 (낮 그림의 육지는 바위 기둥 뒤·창 아래에 있어 거의 안 보인다) 을 창 양옆 지평선을 따라 두고
+        그 위에 도시 불빛을 찍는다. 지평선 쪽은 비스듬히 내려다봐서 촘촘하고 위아래로 납작하다."""
+        pix = self.backs.get("space")
+        if pix is None:
+            return None
+        size = QImageReader(str(ASSET_DIR / "bg" / "space.jpg")).size()   # 아래 길이는 원래 그림 px
+        aw, ah = size.width(), size.height()
+        cx, cy, r = SPACE_EARTH[0] * aw, SPACE_EARTH[1] * ah, SPACE_EARTH[2] * aw
+        rng = random.Random(5)
+        waves = [(rng.uniform(0.008, 0.02), rng.uniform(0, 6.3), rng.uniform(0, 6.3)) for _ in range(3)]
+
+        def horizon(x):
+            return cy - math.sqrt(max(0.0, r * r - (x - cx) ** 2))
+
+        def inside(x, y):   # 대기 띠 안쪽
+            return math.hypot(x - cx, y - cy) < r - 22
+
+        def land(x, y):   # 대륙 무늬 (0 위가 대륙, 클수록 안쪽)
+            flat = max(0.2, min(1.0, (y - horizon(x)) / 200))
+            return sum(math.sin(x * f + a) * math.sin((y - horizon(x)) / flat * f + b) for f, a, b in waves)
+
+        towns = []
+        for _ in range(6000):
+            x = rng.uniform(0, aw)
+            y = horizon(x) + (ah - horizon(x)) * rng.random() ** 1.8   # 지평선 쪽에 더 많이
+            if inside(x, y) and land(x, y) > 0.35:
+                towns.append((x, y))
+        lights = [(x, y, rng.uniform(0.3, 0.6)) for x, y in towns[:500]]   # 흩어진 작은 마을
+        for x, y in towns[:90]:   # 도시: 불빛이 모여 있다
+            flat = max(0.25, min(1.0, (y - horizon(x)) / 150))
+            for _ in range(rng.randint(4, 12)):
+                q = (x + rng.gauss(0, 5), y + rng.gauss(0, 3 * flat))
+                if inside(*q) and land(*q) > 0.1:
+                    lights.append((*q, rng.uniform(0.7, 1.0)))
+        k = pix.width() / aw   # 원래 그림 px → 창에 맞춰 늘린 배경 px
+        s = max(0.75, 0.9 * k)
+        image = QImage(pix.size(), QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        p = QPainter(image)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        center, rad = QPointF(cx * k, cy * k), r * k
+        g = QRadialGradient(center, rad)   # 구름까지 덮고 가장자리 대기 띠는 덜 덮는다
+        g.setColorAt(0.0, QColor(*NIGHT_TINT, 252))
+        g.setColorAt(1 - 24 / r, QColor(*NIGHT_TINT, 252))
+        g.setColorAt(1 - 8 / r, QColor(*NIGHT_TINT, 170))
+        g.setColorAt(1.0, QColor(*NIGHT_TINT, 0))
+        p.setBrush(QBrush(g))
+        p.drawEllipse(center, rad, rad)
+        step = 4   # 대륙은 작게 그려 부드럽게 늘린다
+        small = QImage(aw // step, ah // step, QImage.Format_ARGB32_Premultiplied)
+        small.fill(Qt.transparent)
+        for j in range(max(0, int((cy - r) / step)), small.height()):
+            for i in range(small.width()):
+                x, y = i * step, j * step
+                v = land(x, y) if inside(x, y) else 0.0
+                if v > 0:
+                    small.setPixelColor(i, j, QColor(*LAND_NIGHT, round(255 * min(1.0, v / 0.25))))
+        p.drawImage(QRectF(0, 0, image.width(), image.height()),
+                    small.scaled(image.width(), image.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+        for x, y, a in lights:
+            at = QPointF(x * k, y * k)
+            glow = QRadialGradient(at, 3 * s)
+            glow.setColorAt(0.0, QColor(*CITY, round(140 * a)))
+            glow.setColorAt(1.0, QColor(*CITY, 0))
+            p.setBrush(QBrush(glow))
+            p.drawEllipse(at, 3 * s, 3 * s)
+            p.setBrush(QColor(255, 236, 200, round(255 * a)))
+            p.drawEllipse(at, s * a, s * a)
+        p.end()
+        return QPixmap.fromImage(image), [(x * k, y * k, rng.uniform(0, 6.3), 5 * s) for x, y in towns[:90:3]]
+
+    def paint_earth_night(self, p, at, t):
+        """밤쪽 지구 그림 (배경 그림을 붙인 자리 at 에) 과 그 위에서 천천히 반짝이는 도시 불빛 몇 개."""
+        image, twinkle = self.earth
+        p.drawPixmap(at, image)
+        p.setPen(Qt.NoPen)
+        for x, y, phase, r in twinkle:
+            c = at + QPointF(x, y)
+            g = QRadialGradient(c, r)
+            g.setColorAt(0.0, QColor(255, 226, 170, round(200 * (0.5 + 0.5 * math.sin(t * 1.3 + phase)))))
+            g.setColorAt(1.0, QColor(*CITY, 0))
+            p.setBrush(QBrush(g))
+            p.drawEllipse(c, r, r)
 
     def sky_moon(self, sim, alt, art):
         """배경 그림 속 달 (반지름 art) 자리에 덧그릴 달 (반지름 px, 진하기) 또는 None: 주간 100% 로 갈수록 커지고
