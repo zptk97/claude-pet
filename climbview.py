@@ -4,9 +4,9 @@
 (tools/avatar_prep.py 로 만든다. 없으면 회색 공을 그린다).
 창 폭은 바위 기둥의 SCENE_W 배라 양옆으로 배경과 날씨가 보이고, 클릭은 바위 기둥과 높이 상자에서만 받는다
 (X11 입력 모양, 양옆은 아래 창으로 지나간다). 늘 60fps 로 그리고 숨기면 멈춘다 (계산도 멈춘다). 밤 (서울 해 지는
-시각, climbcore.night_level) 에는 하늘·바위·아바타를 어둡게 하고 별을 띄우고, 아바타가 헤드램프로 다음 홀드 쪽을 비춘다. 왼쪽 버튼으로 끌면
-펫처럼 줄 전체를 옮긴다. 바위 층은 바뀔 때만 다시 그리고, 카메라가 멈춰 있고 비·눈이 없으면 아바타 둘레와
-높이 상자만 다시 그린다 (창 관리자가 다시 합성할 넓이도 줄어든다).
+시각, climbcore.night_level) 에는 하늘·바위·아바타를 어둡게 하고 별을 띄우고, 아바타가 헤드램프로 다음 홀드 쪽을 비춘다
+(우주는 늘 햇빛이라 어둡게 하지 않는다). 왼쪽 버튼으로 끌면 펫처럼 줄 전체를 옮긴다. 바위 층은 바뀔 때만 다시 그리고,
+카메라가 멈춰 있고 비·눈이 없으면 아바타 둘레와 높이 상자만 다시 그린다 (창 관리자가 다시 합성할 넓이도 줄어든다).
 """
 import json
 import math
@@ -175,15 +175,9 @@ class Look:
                                                 ledge.bed + V(1.5, 1.2)], 0.3 * R)))
         for rock in sim.rocks:   # 떨어지는 돌 (돌이 있으면 창 전체를 다시 그리지만, 밤에 아바타 둘레만 어둡게 그릴 때 쓴다)
             region = region.united(QRegion(box([rock[0]], rock[4] * 1.1 * R + 2)))
-        if sim.lamp is not None and self.night_amount(sim) > 0.01:   # 헤드램프 빛 (몸에서 비추는 곳까지, 웅덩이만큼)
+        if sim.lamp is not None and sim.dark() > 0.01:   # 헤드램프 빛 (몸에서 비추는 곳까지, 웅덩이만큼)
             region = region.united(QRegion(box([sim.body, sim.lamp], (LAMP_POOL + 0.1) * R)))
         return region
-
-    def night_amount(self, sim):
-        """밤에 어둡게 할 정도 (0~1). 우주는 원래 어두워서 덜 어둡게 한다."""
-        if sim.night <= 0.01:
-            return 0.0
-        return sim.night * (1.0 if sim.altitude() < 100000 else 0.6)
 
     def view_cam(self, sim):
         """그릴 때 쓰는 카메라: 정수 픽셀에 맞춘다. Qt 는 그림 (바위 무늬·홀드·배경) 을 옮겨 붙일 때 자리를 정수로
@@ -209,7 +203,7 @@ class Look:
         moon = (round(sim.moon * self.R) if sim.moon is not None else None, sim.moon_flag is not None)
         carved = tuple(mark for mark in sim.carved if bottom_y - 1.5 < mark[0] < top_y + 1)
         return (round(cam * self.R), round(k * 4000), round(sim.gloom() * 60), snow, holds, bolts, ledge,
-                round(sim.t * 30) if moving else 0, round(self.night_amount(sim) * 60), moon, carved)
+                round(sim.t * 30) if moving else 0, round(sim.dark() * 60), moon, carved)
 
     def paint(self, painter, sim):
         cam = self.view_cam(sim)
@@ -221,7 +215,7 @@ class Look:
         painter.drawImage(0, 0, self.layer)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        night = self.night_amount(sim)
+        night = sim.dark()
         if night > 0.01 or sim.falling:   # 밤: 헤드램프가 비추는 벽, 어둡게 한 아바타, 램프 빛 / 벽의 끝: 가장자리에서 흐리게
             lamp = night > 0.01 and sim.lamp is not None
             if lamp:
@@ -416,7 +410,7 @@ class Look:
             clip = clip.united(top)   # 밤에 같이 어두워지고 헤드램프가 비춘다
             rock = rock.subtracted(top)
             self.clip = clip
-        night = self.night_amount(sim)
+        night = sim.dark()
         if night > 0.01:   # 밤: 헤드램프가 비출 밝은 바위를 남겨 두고, 바위도 어둡게 (하늘보다 덜, 홀드가 보이게)
             lp.end()
             self.lit = layer.copy()
@@ -516,7 +510,7 @@ class Look:
             if sky is not None:
                 self.paint_sky_moon(p, cx, cy, *sky)
                 disk = (cx, cy, sky[0])
-        night = self.night_amount(sim)
+        night = sim.dark()
         if night > 0.01:   # 밤: 하늘과 풍경을 어둡게
             p.fillRect(QRectF(0, 0, W, H), QColor(*NIGHT_TINT, round(205 * night)))
         level = 0.0 if alt < 12000 else 0.5 if alt < 100000 else 1.0

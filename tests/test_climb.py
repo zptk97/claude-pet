@@ -665,6 +665,15 @@ class NightTest(unittest.TestCase):
         self.assertFalse(sim.sleeping)
         self.assertIsNotNone(sim.lamp)
 
+    def test_space_is_sunlit(self):
+        for height, dark in ((500.0, 1.0), (95000.0, 0.5), (200000.0, 0.0)):
+            sim = Climber(3)
+            sim.tokens_on, sim.work, sim.night = False, 1, 1.0
+            sim.jump(height)
+            run(sim, 3.0)
+            self.assertAlmostEqual(sim.dark(), dark, delta=0.05)   # 90~100km 에서 서서히 낮처럼
+            self.assertEqual(sim.lamp is not None, dark > 0.05)
+
     def test_night_does_not_change_climbing(self):
         ends = []
         for night in (0.0, 1.0):

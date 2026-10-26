@@ -40,6 +40,7 @@ FILL_AHEAD = VIEW_TOP + 2.5  # 홀드를 미리 깔아 두는 높이 (화면 위
 
 SCENE_W = 1.8               # 창 폭 = 바위 기둥 폭의 몇 배 (양옆으로 배경과 날씨가 보인다)
 HIGH = 9500                 # 이 높이 (m) 위로는 비·눈이 없고 흐리지도 않다 (구름바다 위)
+SUNLIT = (90000, 100000)    # 이 두 높이 (m) 사이에서 밤에 어두워지는 게 서서히 없어진다 (배경이 우주로 넘어가는 곳. 우주는 늘 햇빛)
 SEOUL = (37.57, 126.98)     # 해 뜨고 지는 시각을 셀 곳 (위도, 경도)
 KST = timezone(timedelta(hours=9))   # 서울 시각
 DUSK = 0.5                  # 해가 지기 이만큼 (시간) 전부터 진 뒤 이만큼까지 어두워진다 (뜰 때는 거꾸로 밝아진다)
@@ -1278,6 +1279,11 @@ class Climber:
         alt = self.altitude()
         return self.weather if alt < HIGH else 0.0
 
+    def dark(self):
+        """밤에 아바타·바위·하늘을 어둡게 하는 정도 (0~1). 우주는 늘 햇빛이라 SUNLIT 에서 서서히 0 이 된다."""
+        lo, hi = SUNLIT
+        return self.night * (1.0 - smooth(max(0.0, min(1.0, (self.altitude() - lo) / (hi - lo)))))
+
     def closure(self):
         """눈꺼풀이 감긴 정도."""
         blink = math.sin(math.pi * self.blink_age / 0.16) if self.blink_age is not None else 0.0
@@ -1804,7 +1810,7 @@ class Climber:
         else:
             look = 0.0
         self.look_tilt += (look - self.look_tilt) * (1 - math.exp(-8 * dt))
-        if self.night > 0.05 and not self.sleeping and not self.falling:   # 헤드램프: 보는 곳 (없으면 앞 위쪽) 을 부드럽게 따라 비춘다
+        if self.dark() > 0.05 and not self.sleeping and not self.falling:   # 헤드램프: 보는 곳 (없으면 앞 위쪽) 을 부드럽게 따라 비춘다
             aim = self.look_at if self.look_at is not None else self.body + V(-self.face * 0.9, 1.4)
             self.lamp = aim if self.lamp is None else self.lamp + (aim - self.lamp) * (1 - math.exp(-6 * dt))
         else:
